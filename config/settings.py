@@ -67,11 +67,32 @@ DEFAULT_SYMBOLS: Final[tuple[str, ...]] = (
 
 
 class ExchangeSettings(BaseModel):
-    """Binance USDT-M futures connectivity parameters."""
+    """Binance USDT-M futures connectivity parameters.
+
+    The system opens **two independent connections**, because they have opposite
+    requirements:
+
+    * **Market data** - always Binance *mainnet*, always unauthenticated.  Every
+      candle, order book, funding rate and ticker the models ever see is real
+      production market data, in every mode including paper trading and
+      backtesting.  Testnet order books are synthetic and nearly empty; training
+      a model on them would teach it a market that does not exist.  This
+      connection never receives the API credentials at all.
+    * **Order execution** - carries the personal API key/secret, and is the only
+      connection :attr:`testnet` applies to.  Paper trading never uses it.
+    """
 
     api_key: str = Field(default="", description="Binance API key (futures enabled).")
     api_secret: str = Field(default="", description="Binance API secret.")
-    testnet: bool = Field(default=True, description="Route orders to the futures testnet.")
+
+    #: Route **orders** to the futures testnet.  Market data is unaffected and
+    #: always comes from mainnet.  Default is mainnet execution, because the
+    #: testnet's fills bear no relation to real liquidity - paper trading on
+    #: mainnet prices is the honest dry run, not testnet order placement.
+    testnet: bool = Field(
+        default=False, description="Send ORDERS to the futures testnet (data stays mainnet)."
+    )
+
     default_type: str = Field(default="future", description="ccxt defaultType option.")
     request_timeout_ms: int = Field(default=20_000, ge=1_000, le=120_000)
     enable_rate_limit: bool = Field(default=True)
@@ -82,6 +103,27 @@ class ExchangeSettings(BaseModel):
     backoff_jitter: float = Field(default=0.25, ge=0.0, le=1.0)
 
     max_concurrent_requests: int = Field(default=8, ge=1, le=64)
+
+    #: Interactive calls (universe discovery, credential checks) fail fast: an
+    #: operator staring at a spinner needs an answer, not a five-minute retry
+    #: chain.  Background work keeps the patient settings above.
+    interactive_max_retries: int = Field(default=2, ge=1, le=5)
+    interactive_timeout_ms: int = Field(default=15_000, ge=1_000, le=60_000)
+
+    @property
+    def has_credentials(self) -> bool:
+        """``True`` when both an API key and secret are configured."""
+        return bool(self.api_key.strip()) and bool(self.api_secret.strip())
+
+    @property
+    def masked_api_key(self) -> str:
+        """API key with the middle redacted, safe to show in the panel or logs."""
+        key: str = self.api_key.strip()
+        if not key:
+            return ""
+        if len(key) <= 12:
+            return f"{key[:2]}***{key[-2:]}"
+        return f"{key[:6]}...{key[-4:]}"
 
 
 class DataSettings(BaseModel):

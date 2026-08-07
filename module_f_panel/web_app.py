@@ -58,6 +58,9 @@ class SystemController(Protocol):
     ) -> dict[str, Any]:
         """Persist the operator's pair selection."""
 
+    async def verify_credentials(self) -> dict[str, Any]:
+        """Check the personal Binance API key with a real signed request."""
+
     async def setup_status(self) -> dict[str, Any]:
         """Progress of the data-collection and training pipeline."""
 
@@ -269,6 +272,22 @@ def build_app(controller: SystemController) -> FastAPI:
         except Exception as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
         return JSONResponse(result)
+
+    # ------------------------------------------------------------------
+    # Credentials API
+    # ------------------------------------------------------------------
+    @app.post("/api/credentials/verify", summary="Check the Binance API key")
+    async def api_verify_credentials(
+        request: Request,
+        payload: dict[str, Any] = Body(default_factory=dict),
+    ) -> JSONResponse:
+        """Verify the configured key with a signed request to Binance.
+
+        Returns the masked key, the environment it targets and the USDT balance
+        on success.  The secret is never echoed back.
+        """
+        authorise(request, payload)
+        return JSONResponse(await controller.verify_credentials())
 
     # ------------------------------------------------------------------
     # Setup API

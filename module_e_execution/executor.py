@@ -68,13 +68,28 @@ class LiveExecutor:
     def __init__(
         self,
         settings: Settings,
-        fetcher: BinanceDataFetcher,
+        market_fetcher: BinanceDataFetcher,
         database: DatabaseHandler,
         risk_guard: RiskGuard,
+        trade_fetcher: BinanceDataFetcher | None = None,
     ) -> None:
+        """Wire the executor to its two connections.
+
+        Args:
+            settings: Root configuration.
+            market_fetcher: Mainnet, unauthenticated - supplies prices.
+            database: Persistence.
+            risk_guard: Kill-switch supervisor.
+            trade_fetcher: Authenticated client that carries the orders.  When
+                omitted one is constructed, so the account is only ever touched
+                by a client built explicitly for that purpose.
+        """
         self._settings: Settings = settings
         self._config: ExecutionSettings = settings.execution
-        self._fetcher: BinanceDataFetcher = fetcher
+        self._fetcher: BinanceDataFetcher = market_fetcher
+        self._trade: BinanceDataFetcher = trade_fetcher or BinanceDataFetcher(
+            settings, role="execution"
+        )
         self._db: DatabaseHandler = database
         self._risk: RiskGuard = risk_guard
 
@@ -92,6 +107,23 @@ class LiveExecutor:
         if self._running:
             return
         await self._fetcher.load_markets()
+        await self._trade.load_markets()
+
+        if not self._settings.exchange.has_credentials:
+            raise ExecutionError(
+                "live execution requires EXCHANGE__API_KEY and EXCHANGE__API_SECRET"
+            )
+        verification: dict[str, Any] = await self._trade.verify_credentials()
+        if not verification["valid"]:
+            raise ExecutionError(
+                "API credentials rejected by Binance", reason=verification["error"]
+            )
+        _LOGGER.warning(
+            "LIVE execution armed on %s | key %s | USDT balance %.2f",
+            verification["environment"],
+            verification["masked_key"],
+            verification["balance"],
+        )
         self._running = True
         await self.reconcile()
         self._monitor_task = asyncio.create_task(self._monitor_loop(), name="position-monitor")
@@ -107,12 +139,18 @@ class LiveExecutor:
             except asyncio.CancelledError:
                 pass
             self._monitor_task = None
+        await self._trade.close()
         _LOGGER.info("Live executor stopped")
 
     @property
     def exchange(self) -> ccxt.binance:
-        """The shared ccxt client."""
-        return self._fetcher.exchange
+        """The **authenticated** client.  Every order in this file goes through it."""
+        return self._trade.exchange
+
+    @property
+    def trade_client(self) -> BinanceDataFetcher:
+        """The authenticated connection (exposed for credential checks)."""
+        return self._trade
 
     @property
     def positions(self) -> dict[str, Position]:

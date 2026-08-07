@@ -103,6 +103,9 @@ _DASHBOARD_CONTENT: Final[
   <div class="card"><div class="muted text-xs">OPEN POSITIONS</div>
     <div id="npos" class="text-2xl font-bold mt-1">-</div>
     <div id="streak" class="muted text-xs mt-1"></div></div>
+  <div class="card"><div class="muted text-xs">DATA / EXECUTION</div>
+    <div id="env" class="text-lg font-bold mt-1">-</div>
+    <div id="creds" class="muted text-xs mt-1"></div></div>
   <div class="card"><div class="muted text-xs">LAST CYCLE</div>
     <div id="cycle" class="text-lg font-bold mt-1">-</div>
     <div id="cycle-detail" class="muted text-xs mt-1"></div></div>
@@ -121,6 +124,8 @@ _DASHBOARD_CONTENT: Final[
       <button id="btn-stop" onclick="post('/api/trading/stop', {})"
               class="bg-amber-600 hover:bg-amber-500 rounded px-3 py-1 text-xs font-bold">STOP TRADING</button>
       <a href="/universe" class="bg-slate-700 hover:bg-slate-600 rounded px-3 py-1 text-xs font-bold">PAIRS</a>
+      <button onclick="post('/api/credentials/verify', {})"
+              class="bg-slate-700 hover:bg-slate-600 rounded px-3 py-1 text-xs font-bold">CHECK API KEY</button>
       <button onclick="post('/api/setup/start', {force_retrain:true})"
               class="bg-slate-700 hover:bg-slate-600 rounded px-3 py-1 text-xs font-bold">RETRAIN</button>
       <button onclick="post('/api/reset_risk_guard', {})"
@@ -266,6 +271,23 @@ async function refresh() {
   renderSetup(s);
   const guard = s.risk_guard || {};
   const acct = s.account || {};
+
+  const cr = s.credentials || {};
+  document.getElementById('env').innerHTML =
+    'MAINNET <span class="muted" style="font-size:12px">data</span> / ' +
+    (s.execution_environment === 'mainnet'
+      ? 'MAINNET <span class="muted" style="font-size:12px">exec</span>'
+      : '<span class="warn">TESTNET</span> <span class="muted" style="font-size:12px">exec</span>');
+  const credEl = document.getElementById('creds');
+  if (cr.valid) {
+    credEl.innerHTML = '<span class="pos">API key verified</span> ' + (cr.masked_key || '') +
+                       ' | ' + fmt(cr.balance, 2) + ' USDT';
+  } else if (cr.configured) {
+    credEl.innerHTML = '<span class="warn">API key set, unverified</span> ' + (cr.masked_key || '') +
+                       (cr.error ? ' &mdash; ' + cr.error : '');
+  } else {
+    credEl.innerHTML = '<span class="muted">no API key &mdash; paper only</span>';
+  }
   const g = document.getElementById('guard-state');
   g.textContent = guard.state || '-';
   g.style.color = GUARD_COLOR[guard.state] || '#e6ebf5';
@@ -470,23 +492,94 @@ function money(x) {
   return Number(x || 0).toFixed(0);
 }
 
+// Hard client-side deadline. Without one, a slow or blocked upstream leaves the
+// table saying "loading..." forever, with no way to tell a hang from a stall --
+// which is exactly the failure this replaces.
+const LOAD_TIMEOUT_MS = 45000;
+let loadTimer = null;
+
+function stopSpinner() {
+  if (loadTimer) { clearInterval(loadTimer); loadTimer = null; }
+}
+
+function showLoading(body) {
+  const started = Date.now();
+  stopSpinner();
+  const paint = () => {
+    const secs = Math.floor((Date.now() - started) / 1000);
+    body.innerHTML = '<tr><td colspan="12" class="muted">Contacting Binance mainnet... ' +
+      secs + 's<br/><span style="font-size:11px">One request for market metadata, one for ' +
+      'tickers. Giving up after ' + (LOAD_TIMEOUT_MS / 1000) + 's.</span></td></tr>';
+  };
+  paint();
+  loadTimer = setInterval(paint, 1000);
+}
+
+function showError(body, title, detail) {
+  stopSpinner();
+  body.innerHTML =
+    '<tr><td colspan="12">' +
+    '<div class="neg" style="font-weight:700">' + title + '</div>' +
+    '<div class="muted" style="margin-top:6px; white-space:normal">' + detail + '</div>' +
+    '<div style="margin-top:10px">' +
+    '<button onclick="loadUniverse(true)" class="bg-sky-700 hover:bg-sky-600 rounded px-3 py-1 ' +
+    'text-xs font-bold">RETRY</button></div>' +
+    '<div class="muted" style="margin-top:10px; font-size:11px; white-space:normal">' +
+    'Most likely this server cannot reach <b>fapi.binance.com</b> &mdash; Binance blocks a number ' +
+    'of regions and cloud IP ranges. Check from the box with ' +
+    '<code>curl -s https://fapi.binance.com/fapi/v1/ping</code>. The Live Log on the dashboard ' +
+    'carries the underlying error.</div></td></tr>';
+}
+
 async function loadUniverse(refresh) {
   const body = document.getElementById('universe-rows');
-  body.innerHTML = '<tr><td colspan="12" class="muted">loading from Binance...</td></tr>';
+  showLoading(body);
+
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), LOAD_TIMEOUT_MS);
+
   try {
-    const data = await (await fetch('/api/universe/available?refresh=' + (refresh ? '1' : '0'))).json();
+    const res = await fetch('/api/universe/available?refresh=' + (refresh ? '1' : '0'),
+                            {signal: controller.signal});
+    clearTimeout(deadline);
+
+    // A 503 still parses as JSON, so checking res.ok is what stops an error
+    // payload being rendered as an innocuous "nothing matched the filter".
+    if (!res.ok) {
+      let detail = 'HTTP ' + res.status;
+      try { const e = await res.json(); detail = e.detail || JSON.stringify(e); } catch (_) {}
+      showError(body, 'Binance request failed', detail);
+      return;
+    }
+
+    const data = await res.json();
+    stopSpinner();
     ROWS = data.rows || [];
     SELECTED = new Set(data.selected || []);
+
+    if (ROWS.length === 0) {
+      showError(body, 'Binance returned no perpetual pairs',
+                'The request succeeded but the market list came back empty.');
+      return;
+    }
+
     const c = data.criteria || {};
     document.getElementById('criteria').innerHTML =
       'Screens &mdash; min 24h volume: <b>' + money(c.min_quote_volume_24h) + ' USDT</b> &middot; ' +
       'max spread: <b>' + c.max_spread_bps + ' bps</b> &middot; ' +
       'min history: <b>' + c.min_history_days + ' days</b> &middot; ' +
       'small-account fit calibrated to <b>' + money(c.reference_equity) + ' USDT</b> equity &middot; ' +
-      '<b>' + data.eligible_count + '</b> of <b>' + data.total_count + '</b> pairs eligible';
+      '<b>' + data.eligible_count + '</b> of <b>' + data.total_count + '</b> pairs eligible ' +
+      '<span class="muted">(live from Binance mainnet)</span>';
     renderRows();
   } catch (err) {
-    body.innerHTML = '<tr><td colspan="12" class="neg">could not reach Binance: ' + err + '</td></tr>';
+    clearTimeout(deadline);
+    if (err.name === 'AbortError') {
+      showError(body, 'Timed out after ' + (LOAD_TIMEOUT_MS / 1000) + 's',
+                'Binance did not respond in time.');
+    } else {
+      showError(body, 'Could not load the pair list', String(err));
+    }
   }
 }
 

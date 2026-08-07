@@ -47,12 +47,34 @@ Modules communicate only through validated Pydantic schemas
 
 ---
 
+## Data source: always mainnet
+
+The system opens **two independent connections**, because they have opposite
+requirements:
+
+| Connection | Endpoint | Auth | Used by |
+|---|---|---|---|
+| **Market data** | Binance **mainnet**, always | none — never receives your keys | training, backtest, paper *and* live |
+| **Execution** | mainnet (or testnet if you ask) | your API key/secret | live order placement only |
+
+Every candle, order book, funding rate and ticker the models ever see is real
+production market data — in **every** mode, including paper trading. This is not
+configurable, and deliberately so: testnet order books are synthetic and nearly
+empty, so a model trained on them learns a market that does not exist.
+
+`EXCHANGE__TESTNET` therefore affects **orders only**. Paper trading is the real
+dry run: mainnet prices, mainnet spreads, mainnet funding — virtual money.
+
+Because the market-data client is built without credentials, a bug in the data
+path cannot reach your account.
+
 ## Quick start — one command
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env          # optional: thresholds, and API keys for live
+                              # (paper + training need NO keys at all)
 
 python main.py                # that's it
 ```
@@ -235,6 +257,7 @@ The panel serves `/` (dashboard), `/universe` (pair picker), `/audit` and
 | `POST /api/setup/start` | Re-run collection, `{"force_retrain": true}` to refit |
 | `POST /api/trading/start` | Arm `{"mode": "paper"｜"live"}` |
 | `POST /api/trading/stop` | Disarm (`{"flatten": true}` to close positions too) |
+| `POST /api/credentials/verify` | Validate the API key with a signed request |
 | `POST /api/kill_switch` | Trip RED, flatten everything |
 | `POST /api/reset_risk_guard` | Clear a RED latch |
 
@@ -266,10 +289,21 @@ Hold out a period the models never touched before you believe anything.
 - **Security.** The panel is not hardened for the public internet. Set
   `WEB__API_TOKEN` to protect the control endpoints, and put the port behind a
   firewall allow-list or an SSH tunnel.
-- **Going live.** Requires `EXCHANGE__TESTNET=false`, real API keys with futures
-  permission, and trained artifacts for all four heads (heuristic fallbacks are
-  refused). Start on the futures testnet, then paper, then live with the
-  smallest size that clears the exchange minimums.
+- **API keys.** Create at Binance → Account → API Management. Enable the
+  **Futures** permission (a spot-only key is rejected), leave withdrawals off,
+  and if you use an IP allow-list add this server's public IP. Set them as
+  `EXCHANGE__API_KEY` / `EXCHANGE__API_SECRET` in `.env`. Press **CHECK API KEY**
+  in the panel (or `POST /api/credentials/verify`) to validate them with a real
+  signed request — that is the only way to distinguish a wrong secret from a
+  spot-only key from an IP-allow-list miss. The secret is never logged or
+  returned; the key is shown masked.
+- **Going live.** Refused unless all four models are trained artifacts *and* the
+  credentials verify against Binance. Run paper on mainnet data first — it is a
+  genuine dry run — then go live with the smallest size that clears the
+  exchange minimums.
+- **If Binance is unreachable** (it blocks a number of regions and cloud IP
+  ranges), the panel still starts and says so rather than dying silently. Check
+  from the box with `curl -s https://fapi.binance.com/fapi/v1/ping`.
 - **Nothing trades on its own.** Trading is armed only from the panel (or
   `POST /api/trading/start`). Set `AUTOSTART_PAPER_TRADING=true` if you
   genuinely want paper trading to begin the moment setup finishes.

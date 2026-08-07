@@ -143,9 +143,16 @@ class UniverseManager:
         """
         age_ms: int = utc_now_ms() - self._cached_at_ms
         if self._cache and not force_refresh and age_ms < self._config.discovery_cache_seconds * 1_000:
+            _LOGGER.debug("Serving %d cached universe candidates", len(self._cache))
             return list(self._cache)
 
+        # Discovery is interactive: a human is watching a spinner, so each stage
+        # is timed and logged.  When this is slow, the log says which of the two
+        # requests is responsible instead of leaving it to guesswork.
+        started_ms: int = utc_now_ms()
         await self._fetcher.load_markets(reload=force_refresh)
+        markets_ms: int = utc_now_ms() - started_ms
+
         markets: dict[str, Any] = self._fetcher.exchange.markets or {}
         perpetuals: dict[str, Any] = {
             symbol: market
@@ -153,15 +160,29 @@ class UniverseManager:
             if self._is_tradeable_perpetual(market)
         }
         if not perpetuals:
-            raise DataFetchError("no USDT-M perpetual markets returned by the exchange")
+            raise DataFetchError(
+                "no USDT-M perpetual markets returned by the exchange",
+                markets_seen=len(markets),
+            )
 
+        tickers_started_ms: int = utc_now_ms()
         tickers: dict[str, dict[str, Any]] = await self._fetcher.fetch_raw_tickers(
             list(perpetuals)
         )
+        tickers_ms: int = utc_now_ms() - tickers_started_ms
+
+        if not tickers:
+            raise DataFetchError(
+                "Binance returned no ticker data - cannot screen the universe",
+                perpetuals=len(perpetuals),
+            )
+
         _LOGGER.info(
-            "Discovered %d USDT-M perpetuals (%d with live tickers)",
+            "Discovered %d USDT-M perpetuals, %d with tickers (markets %.1fs, tickers %.1fs)",
             len(perpetuals),
             len(tickers),
+            markets_ms / 1_000.0,
+            tickers_ms / 1_000.0,
         )
 
         candidates: list[SymbolCandidate] = []
@@ -178,8 +199,9 @@ class UniverseManager:
         self._cache = candidates
         self._cached_at_ms = utc_now_ms()
         _LOGGER.info(
-            "Screened %d candidates: %d eligible",
+            "Screened %d candidates in %.1fs: %d eligible",
             len(candidates),
+            (utc_now_ms() - started_ms) / 1_000.0,
             sum(1 for item in candidates if item.eligible),
         )
         return list(candidates)

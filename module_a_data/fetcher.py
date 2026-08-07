@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 from types import TracebackType
-from typing import Any, Final, Sequence
+from typing import Any, Final, Literal, Sequence
 
 import ccxt.async_support as ccxt
 
@@ -50,16 +50,40 @@ PERMANENT_ERRORS: Final[tuple[type[BaseException], ...]] = (
 )
 
 
-class BinanceDataFetcher:
-    """Async gateway to every Binance USDT-M market-data endpoint we consume.
+#: Which of the two connections an instance represents.
+FetcherRole = Literal["market_data", "execution"]
 
-    The instance owns a single ``ccxt.async_support.binance`` client; it must be
-    closed via :meth:`close` (or used as an async context manager) so the
-    underlying ``aiohttp`` session is released.
+
+class BinanceDataFetcher:
+    """Async gateway to Binance USDT-M.
+
+    Two roles, deliberately kept as separate instances:
+
+    ``market_data``
+        Mainnet, unauthenticated, never sandboxed.  Supplies every candle,
+        order book, funding rate and ticker in *all* modes - backtest, paper and
+        live - so the models are only ever trained and run on real production
+        market data.  The API credentials are never attached to this client, so
+        a bug in the data path cannot touch the account.
+
+    ``execution``
+        Carries the personal API key/secret and honours
+        ``exchange.testnet``.  Only the live executor constructs one.
+
+    The instance owns a single ``ccxt.async_support.binance`` client; close it
+    via :meth:`close` (or use it as an async context manager) so the underlying
+    ``aiohttp`` session is released.
     """
 
-    def __init__(self, settings: Settings, exchange: ccxt.binance | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        exchange: ccxt.binance | None = None,
+        *,
+        role: FetcherRole = "market_data",
+    ) -> None:
         self._settings: Settings = settings
+        self._role: FetcherRole = role
         self._timeframe: str = settings.data.timeframe
         self._timeframe_ms: int = settings.data.timeframe_ms
         self._semaphore: asyncio.Semaphore = asyncio.Semaphore(
@@ -74,11 +98,30 @@ class BinanceDataFetcher:
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+    @property
+    def role(self) -> FetcherRole:
+        """Which connection this instance represents."""
+        return self._role
+
+    @property
+    def is_authenticated(self) -> bool:
+        """``True`` when this client carries API credentials."""
+        return bool(getattr(self._exchange, "apiKey", None))
+
+    @property
+    def is_sandbox(self) -> bool:
+        """``True`` when this client is pointed at the futures testnet."""
+        return self._role == "execution" and self._settings.exchange.testnet
+
     def _build_exchange(self) -> ccxt.binance:
-        """Instantiate the ccxt client from settings."""
+        """Instantiate the ccxt client for this instance's role.
+
+        The market-data client is built without credentials and is never put
+        into sandbox mode: real market data is a hard requirement of the design,
+        not a configurable preference.
+        """
+        execution: bool = self._role == "execution"
         config: dict[str, Any] = {
-            "apiKey": self._settings.exchange.api_key or None,
-            "secret": self._settings.exchange.api_secret or None,
             "enableRateLimit": self._settings.exchange.enable_rate_limit,
             "timeout": self._settings.exchange.request_timeout_ms,
             "options": {
@@ -87,10 +130,20 @@ class BinanceDataFetcher:
                 "recvWindow": 10_000,
             },
         }
+        if execution:
+            config["apiKey"] = self._settings.exchange.api_key.strip() or None
+            config["secret"] = self._settings.exchange.api_secret.strip() or None
+
         exchange: ccxt.binance = ccxt.binance(config)
         self._restrict_to_linear_markets(exchange)
-        if self._settings.exchange.testnet:
+
+        if execution and self._settings.exchange.testnet:
             exchange.set_sandbox_mode(True)
+            _LOGGER.warning("Execution client is on the Binance futures TESTNET")
+        elif execution:
+            _LOGGER.info("Execution client is on Binance MAINNET (real funds)")
+        else:
+            _LOGGER.info("Market-data client is on Binance MAINNET (public, unauthenticated)")
         return exchange
 
     @staticmethod
@@ -200,6 +253,99 @@ class BinanceDataFetcher:
             raise DataFetchError(f"{label} rejected by exchange", reason=str(error)) from error
 
         self.consecutive_errors = 0
+        return result
+
+    async def _call_interactive(self, label: str, operation: Any) -> Any:
+        """Like :meth:`_call` but bounded to a few seconds.
+
+        Used by the pair-selection page and the credential check, where a human
+        is waiting.  The patient retry chain used for background ingestion can
+        take minutes to give up, which in a browser is indistinguishable from a
+        hang - so interactive paths fail fast and surface the real reason.
+        """
+        exchange_settings = self._settings.exchange
+        original_timeout: Any = self._exchange.timeout
+        self._exchange.timeout = exchange_settings.interactive_timeout_ms
+        try:
+            return await async_retry(
+                operation,
+                attempts=exchange_settings.interactive_max_retries,
+                base_seconds=0.5,
+                max_seconds=3.0,
+                jitter=0.2,
+                retry_on=TRANSIENT_ERRORS,
+                give_up_on=PERMANENT_ERRORS,
+                on_error=lambda attempt, error, delay: _LOGGER.warning(
+                    "%s failed (attempt %d): %s", label, attempt + 1, error
+                ),
+            )
+        except PERMANENT_ERRORS as error:  # type: ignore[misc]
+            raise DataFetchError(f"{label} rejected", reason=str(error)) from error
+        except TRANSIENT_ERRORS as error:  # type: ignore[misc]
+            raise DataFetchError(
+                f"{label} could not reach Binance", reason=str(error)
+            ) from error
+        except ccxt.ExchangeError as error:
+            raise DataFetchError(f"{label} failed", reason=str(error)) from error
+        finally:
+            self._exchange.timeout = original_timeout
+
+    async def verify_credentials(self) -> dict[str, Any]:
+        """Check the configured API key against the account endpoint.
+
+        Performs a real signed request, so it proves the key exists, the secret
+        matches, futures trading is permitted and the server clock is close
+        enough for the signature to validate.  Never raises and never returns the
+        secret - the key is masked before it leaves this method.
+
+        Returns:
+            ``{"configured", "valid", "masked_key", "environment", "balance",
+            "error"}``.
+        """
+        settings = self._settings.exchange
+        result: dict[str, Any] = {
+            "configured": settings.has_credentials,
+            "valid": False,
+            "masked_key": settings.masked_api_key,
+            "environment": "testnet" if self.is_sandbox else "mainnet",
+            "balance": 0.0,
+            "error": "",
+        }
+        if not settings.has_credentials:
+            result["error"] = "EXCHANGE__API_KEY / EXCHANGE__API_SECRET are not set"
+            return result
+
+        try:
+            await self.load_markets()
+            payload: dict[str, Any] = await self._call_interactive(
+                "verify_credentials", lambda: self._exchange.fetch_balance()
+            )
+        except DataFetchError as error:
+            reason: str = str(error).lower()
+            if "invalid api" in reason or "signature" in reason or "-2015" in reason:
+                result["error"] = (
+                    "Binance rejected the key. Check that it is a FUTURES-enabled key, "
+                    "that the secret matches, and that this server's IP is on the key's "
+                    "IP allow-list."
+                )
+            elif "timestamp" in reason or "recvwindow" in reason:
+                result["error"] = (
+                    "Signature timestamp rejected - this server's clock is out of sync. "
+                    "Run an NTP sync."
+                )
+            else:
+                result["error"] = str(error)
+            return result
+
+        usdt: dict[str, Any] = payload.get("USDT") or {}
+        result["valid"] = True
+        result["balance"] = safe_float(usdt.get("total"), 0.0)
+        _LOGGER.info(
+            "API credentials verified on %s (key %s, USDT balance %.2f)",
+            result["environment"],
+            result["masked_key"],
+            result["balance"],
+        )
         return result
 
     def _market_id(self, symbol: str) -> str:
@@ -532,15 +678,19 @@ class BinanceDataFetcher:
         market in a single weighted request.
         """
         await self.load_markets()
-        requested: list[str] | None = list(symbols) if symbols else None
-        payload: dict[str, Any] = await self._call(
+        # Always request the *whole* board and filter locally.  Handing ccxt a
+        # 500-symbol list makes it validate every one against the market table
+        # and can fan out into per-symbol requests on some builds; the unfiltered
+        # call is a single request with a fixed weight.
+        payload: dict[str, Any] = await self._call_interactive(
             "fetch_raw_tickers",
-            lambda: self._exchange.fetch_tickers(requested),
+            lambda: self._exchange.fetch_tickers(),
         )
+        wanted: set[str] | None = set(symbols) if symbols else None
         return {
             str(symbol): dict(ticker)
             for symbol, ticker in payload.items()
-            if isinstance(ticker, dict)
+            if isinstance(ticker, dict) and (wanted is None or symbol in wanted)
         }
 
     async def fetch_tickers(self, symbols: Sequence[str]) -> dict[str, float]:

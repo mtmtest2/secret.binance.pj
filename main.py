@@ -90,7 +90,7 @@ class TradingSystem:
 
         # --- Module A --------------------------------------------------
         self.database: DatabaseHandler = DatabaseHandler(settings)
-        self.fetcher: BinanceDataFetcher = BinanceDataFetcher(settings)
+        self.fetcher: BinanceDataFetcher = BinanceDataFetcher(settings, role="market_data")
         self.validator: QCValidator = QCValidator(settings)
         self.pipeline: DataPipeline = DataPipeline(
             settings, self.fetcher, self.validator, self.database
@@ -127,6 +127,20 @@ class TradingSystem:
         self._setup_task: asyncio.Task[None] | None = None
         self._setup_lock: asyncio.Lock = asyncio.Lock()
 
+        #: Set during startup; the panel surfaces this when Binance is unreachable.
+        self.market_data_ready: bool = False
+        self.market_data_error: str = ""
+
+        self.credentials: dict[str, Any] = {
+            "configured": settings.exchange.has_credentials,
+            "valid": False,
+            "masked_key": settings.exchange.masked_api_key,
+            "environment": "testnet" if settings.exchange.testnet else "mainnet",
+            "balance": 0.0,
+            "error": "" if settings.exchange.has_credentials else "API credentials not configured",
+            "checked": False,
+        }
+
         self.last_cycle_at: datetime | None = None
         self.last_cycle_duration_s: float = 0.0
         self.last_cycle_symbols_ok: int = 0
@@ -142,7 +156,11 @@ class TradingSystem:
         """Instantiate the execution engine for ``mode``."""
         if mode == "live":
             _LOGGER.warning("LIVE TRADING MODE - real funds are at risk")
+            # The executor builds its own authenticated client; `self.fetcher`
+            # stays public mainnet and only supplies prices.
             return LiveExecutor(self.settings, self.fetcher, self.database, self.risk_guard)
+        # Paper trading runs on the same mainnet market data as live - only the
+        # fills are simulated.
         return PaperTrader(self.settings, self.fetcher, self.database, self.risk_guard)
 
     # ------------------------------------------------------------------
@@ -155,14 +173,41 @@ class TradingSystem:
         the exchange is unreachable, so the operator can see *why*.  The slow
         work (backfill, training) happens afterwards in a background task.
         """
+        exchange_settings = self.settings.exchange
         _LOGGER.info("=" * 70)
         _LOGGER.info("AI Quant Trading System - Binance USDT-M Perpetuals (5m)")
+        _LOGGER.info("Market data : Binance MAINNET (public) - all modes, always")
+        _LOGGER.info(
+            "Execution   : %s | credentials %s",
+            "TESTNET" if exchange_settings.testnet else "MAINNET",
+            f"configured ({exchange_settings.masked_api_key})"
+            if exchange_settings.has_credentials
+            else "NOT set - live trading unavailable",
+        )
         _LOGGER.info("=" * 70)
 
         await self.database.initialize()
         await self.audit.start()
         await self.risk_guard.load()
-        await self.fetcher.load_markets()
+
+        # Reaching Binance is NOT a precondition for booting.  If the exchange is
+        # unreachable - a blocked region, a firewall, an outage - the operator
+        # needs the panel up to *see* that.  Dying here would leave them with a
+        # dead port and a stack trace scrolled off the terminal.
+        self.market_data_ready = False
+        self.market_data_error = ""
+        try:
+            await self.fetcher.load_markets()
+            self.market_data_ready = True
+        except QuantSystemError as error:
+            self.market_data_error = str(error)
+            _LOGGER.error("=" * 70)
+            _LOGGER.error("CANNOT REACH BINANCE MAINNET: %s", error)
+            _LOGGER.error("The panel will start, but the pair list and data collection")
+            _LOGGER.error("will fail until connectivity is fixed. Check from this host:")
+            _LOGGER.error("    curl -s https://fapi.binance.com/fapi/v1/ping")
+            _LOGGER.error("Binance blocks a number of regions and cloud IP ranges.")
+            _LOGGER.error("=" * 70)
 
         loaded: dict[str, bool] = self.ml.load_all()
         if not all(loaded.values()):
@@ -173,7 +218,16 @@ class TradingSystem:
 
         self.active_symbols = await self.universe.get_selection()
         self.risk_guard.register_halt_callback(self.engine.emergency_flatten)
-        await self.engine.start()
+        try:
+            await self.engine.start()
+        except QuantSystemError as error:
+            # A live engine refuses to start without valid credentials.  Fall back
+            # to paper so the operator can fix the key from a working panel.
+            _LOGGER.error("Execution engine failed to start (%s) - falling back to paper", error)
+            self.trading_mode = "paper"
+            self.engine = self._build_engine("paper")
+            self.risk_guard.register_halt_callback(self.engine.emergency_flatten)
+            await self.engine.start()
 
         if self.risk_guard.is_halted:
             _LOGGER.critical(
@@ -372,6 +426,13 @@ class TradingSystem:
             raise ValueError(
                 "live trading requires all four trained models; heuristic fallbacks are blocked"
             )
+        if mode == "live":
+            # Verify against the exchange rather than merely checking the key is
+            # non-empty: a wrong secret, a spot-only key or an IP allow-list miss
+            # all look identical until a signed request is actually attempted.
+            check: dict[str, Any] = await self.verify_credentials()
+            if not check["valid"]:
+                raise ValueError(f"API credentials unusable: {check['error']}")
         if not self.active_symbols:
             raise ValueError("no universe selected")
 
@@ -689,6 +750,13 @@ class TradingSystem:
                 "selected": bool(self.active_symbols),
             },
             "risk_guard": self.risk_guard.snapshot(),
+            "credentials": self.credentials,
+            "market_data_source": "binance-mainnet",
+            "market_data_ready": self.market_data_ready,
+            "market_data_error": self.market_data_error,
+            "execution_environment": (
+                "testnet" if self.settings.exchange.testnet else "mainnet"
+            ),
             "account": account.to_dict(),
             "positions": positions,
             "last_cycle_at": (
@@ -706,6 +774,15 @@ class TradingSystem:
                 "scheduler": "running" if self.scheduler.running else "stopped",
                 "audit_queue": str(self.audit.stats()["queued"]),
                 "audit_written": str(self.audit.stats()["written"]),
+                "market_data": (
+                    "mainnet OK" if self.market_data_ready else "UNREACHABLE"
+                ),
+                "execution_env": "testnet" if self.settings.exchange.testnet else "mainnet",
+                "api_credentials": (
+                    "verified" if self.credentials.get("valid")
+                    else "configured" if self.credentials.get("configured")
+                    else "missing"
+                ),
                 "universe_size": str(len(self.active_symbols)),
                 "universe_ok": str(self.last_cycle_symbols_ok),
             },
@@ -759,6 +836,39 @@ class TradingSystem:
         if start_setup:
             result["setup_started"] = self.launch_setup(force_retrain=result["changed"])
         return result
+
+    # --- Credentials --------------------------------------------------
+    async def verify_credentials(self) -> dict[str, Any]:
+        """Check the personal API key against Binance with a real signed request.
+
+        Uses a short-lived authenticated client so the key is never attached to
+        the long-running market-data connection.  The secret is never returned;
+        the key is masked.
+        """
+        exchange_settings = self.settings.exchange
+        if not exchange_settings.has_credentials:
+            self.credentials = {
+                "configured": False,
+                "valid": False,
+                "masked_key": "",
+                "environment": "testnet" if exchange_settings.testnet else "mainnet",
+                "balance": 0.0,
+                "error": "EXCHANGE__API_KEY / EXCHANGE__API_SECRET are not set in .env",
+                "checked": True,
+            }
+            return self.credentials
+
+        client = BinanceDataFetcher(self.settings, role="execution")
+        try:
+            result: dict[str, Any] = await client.verify_credentials()
+        finally:
+            await client.close()
+
+        result["checked"] = True
+        self.credentials = result
+        if not result["valid"]:
+            _LOGGER.error("API credential check failed: %s", result["error"])
+        return self.credentials
 
     # --- Setup --------------------------------------------------------
     async def setup_status(self) -> dict[str, Any]:
