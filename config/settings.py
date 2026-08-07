@@ -137,7 +137,9 @@ class DataSettings(BaseModel):
     timeframe_ms: int = Field(default=5 * 60 * 1_000)
 
     ohlcv_limit: int = Field(default=500, ge=50, le=1_500)
-    history_bootstrap_candles: int = Field(default=6_000, ge=500)
+    #: 52_560 x 5m ~= 183 days (~6 months) - the training set the model heads
+    #: and the universe's 6-month history requirement are calibrated against.
+    history_bootstrap_candles: int = Field(default=52_560, ge=500)
     orderbook_depth: int = Field(default=20, ge=5, le=100)
     orderbook_levels_for_imbalance: int = Field(default=10, ge=1, le=100)
 
@@ -162,12 +164,18 @@ class UniverseSettings(BaseModel):
     target_count: int = Field(default=30, ge=1, le=200)
     quote_currency: str = Field(default="USDT")
 
-    #: 24 h quote volume floor - the primary liquidity screen.
-    min_quote_volume_24h: float = Field(default=50_000_000.0, ge=0.0)
+    #: 24 h quote volume floor - the primary liquidity screen.  Relaxed from the
+    #: original 50M so mid-cap perpetuals are not screened out before the
+    #: history requirement below even gets a chance to look at them.
+    min_quote_volume_24h: float = Field(default=20_000_000.0, ge=0.0)
     #: Bid/ask spread ceiling in basis points, measured at discovery time.
-    max_spread_bps: float = Field(default=6.0, gt=0.0)
-    #: Days since listing.  Below this there is not enough 5m history to train.
-    min_history_days: int = Field(default=90, ge=1)
+    #: Relaxed from 6 bps - still tight enough to protect a 5m round trip.
+    max_spread_bps: float = Field(default=10.0, gt=0.0)
+    #: Days since listing.  This is a hard floor, not a relaxable screen: the
+    #: 6-month (~180 day) training/labeling pipeline needs that much history to
+    #: produce a usable model, so a coin listed more recently is never eligible
+    #: regardless of how liquid or tight-spread it is.
+    min_history_days: int = Field(default=180, ge=1)
 
     #: Account size the small-capital screens are calibrated against.
     reference_equity: float = Field(default=1_000.0, gt=0.0)
@@ -175,7 +183,8 @@ class UniverseSettings(BaseModel):
     #: position the risk model can open.  This is what rejects coins whose
     #: quantity granularity is too coarse for a small account (e.g. a 0.001 BTC
     #: step is ~100 USDT of notional, unusable when the smallest position is 10).
-    max_granularity_fraction: float = Field(default=0.25, gt=0.0, le=1.0)
+    #: Relaxed from 0.25 so a few more coarse-but-liquid symbols clear the screen.
+    max_granularity_fraction: float = Field(default=0.35, gt=0.0, le=1.0)
 
     #: Re-discovery interval; market metadata does not change minute to minute.
     discovery_cache_seconds: float = Field(default=900.0, gt=0.0)
@@ -242,7 +251,18 @@ class LabelSettings(BaseModel):
 
     tp_atr_multiple: float = Field(default=2.0, gt=0.0)
     sl_atr_multiple: float = Field(default=1.0, gt=0.0)
-    max_holding_bars: int = Field(default=48, ge=2)  # 48 * 5m == 4 h
+    #: Raised from 48 (4h) - a wider horizon lets slower-moving setups resolve
+    #: instead of expiring unclassified, and the 6-month dataset comfortably
+    #: supports it.
+    max_holding_bars: int = Field(default=288, ge=2)  # 288 * 5m == 24 h
+
+    #: When a single execution candle's high touches the take-profit level
+    #: *and* its low touches the stop-loss level, raw 5m OHLC alone cannot say
+    #: which happened first. When enabled, that specific candle's own
+    #: open/high/low/close is used to calibrate a drifted-Brownian-motion
+    #: first-passage probability (see ``TradeLabeler``) and the more likely
+    #: barrier wins, instead of always assuming the worst case (stop first).
+    refine_ambiguous_barriers: bool = Field(default=True)
 
     #: MAE (max adverse excursion) expressed as a fraction of the SL distance.
     low_risk_mae_ratio: float = Field(default=0.35, gt=0.0, lt=1.0)
@@ -276,7 +296,10 @@ class MLSettings(BaseModel):
     #: Purged, time-ordered validation split (fraction held out at the tail).
     validation_fraction: float = Field(default=0.2, gt=0.0, lt=0.9)
     #: Bars removed between train and validation blocks to kill label leakage.
-    purge_bars: int = Field(default=60, ge=0)
+    #: Must stay >= labels.max_holding_bars (288): every label looks that far
+    #: forward, so purging less than the horizon leaks future information
+    #: across the split. Raised from 60 to track the wider labeling window.
+    purge_bars: int = Field(default=300, ge=0)
     early_stopping_rounds: int = Field(default=50, ge=0)
 
     inference_workers: int = Field(default=2, ge=1, le=16)
@@ -285,11 +308,17 @@ class MLSettings(BaseModel):
 class DecisionSettings(BaseModel):
     """Decision Engine thresholds (Module D)."""
 
-    min_direction_confidence: float = Field(default=0.70, gt=0.0, lt=1.0)
-    #: Directional edge required over the opposing side.
-    min_direction_margin: float = Field(default=0.15, ge=0.0, lt=1.0)
-    max_no_trade_probability: float = Field(default=0.35, gt=0.0, le=1.0)
-    min_entry_probability: float = Field(default=0.55, gt=0.0, lt=1.0)
+    #: Relaxed from 0.70 - that threshold, stacked with R2/R3/R4/R5 below, was
+    #: strict enough that the system went hours without a single qualifying
+    #: signal. 0.55 still requires the winning side to hold a clear probability
+    #: majority; it is not a coin flip.
+    min_direction_confidence: float = Field(default=0.55, gt=0.0, lt=1.0)
+    #: Directional edge required over the opposing side. Relaxed from 0.15.
+    min_direction_margin: float = Field(default=0.08, ge=0.0, lt=1.0)
+    #: Relaxed from 0.35 in step with the confidence threshold above.
+    max_no_trade_probability: float = Field(default=0.45, gt=0.0, le=1.0)
+    #: Relaxed from 0.55.
+    min_entry_probability: float = Field(default=0.50, gt=0.0, lt=1.0)
 
     min_leverage: int = Field(default=1, ge=0, le=10)
     max_leverage: int = Field(default=10, ge=1, le=10)
@@ -297,7 +326,8 @@ class DecisionSettings(BaseModel):
     max_capital_allocation_pct: float = Field(default=0.20, gt=0.0, le=1.0)
 
     #: Reject when the model-implied reward/risk ratio drops below this.
-    min_reward_risk_ratio: float = Field(default=1.3, gt=0.0)
+    #: Relaxed from 1.3 - still profitable on average above a ~44% win rate.
+    min_reward_risk_ratio: float = Field(default=1.15, gt=0.0)
     #: Rolling GARCH volatility percentile above which trading is suspended.
     max_volatility_percentile: float = Field(default=0.97, gt=0.0, le=1.0)
 

@@ -123,6 +123,8 @@ class _SideSimulation:
         "optimal_tp_pct",
         "optimal_sl_pct",
         "optimal_trailing_pct",
+        "ambiguous_bars",
+        "refined_to_target",
     )
 
     def __init__(self, rows: int) -> None:
@@ -134,6 +136,9 @@ class _SideSimulation:
         self.optimal_tp_pct: np.ndarray = np.full(rows, np.nan, dtype=np.float64)
         self.optimal_sl_pct: np.ndarray = np.full(rows, np.nan, dtype=np.float64)
         self.optimal_trailing_pct: np.ndarray = np.full(rows, np.nan, dtype=np.float64)
+        #: Diagnostics for the intra-candle refinement (see ``_simulate_chunk``).
+        self.ambiguous_bars: int = 0
+        self.refined_to_target: int = 0
 
 
 class TradeLabeler:
@@ -177,7 +182,7 @@ class TradeLabeler:
                 horizon plus one bar.
             LabelingError: When required columns are absent.
         """
-        required: set[str] = {"high", "low", "close"}
+        required: set[str] = {"open", "high", "low", "close"}
         missing: set[str] = required - set(frame.columns)
         if missing:
             raise LabelingError("labeling requires OHLC columns", missing=sorted(missing))
@@ -191,6 +196,7 @@ class TradeLabeler:
             )
 
         result: pd.DataFrame = frame.copy()
+        open_: np.ndarray = frame["open"].to_numpy(dtype=np.float64)
         high: np.ndarray = frame["high"].to_numpy(dtype=np.float64)
         low: np.ndarray = frame["low"].to_numpy(dtype=np.float64)
         close: np.ndarray = frame["close"].to_numpy(dtype=np.float64)
@@ -198,11 +204,21 @@ class TradeLabeler:
         tp_distance, sl_distance = self._barrier_distances(frame, close)
 
         long_side: _SideSimulation = self._simulate(
-            high, low, close, tp_distance, sl_distance, horizon, is_long=True
+            open_, high, low, close, tp_distance, sl_distance, horizon, is_long=True
         )
         short_side: _SideSimulation = self._simulate(
-            high, low, close, tp_distance, sl_distance, horizon, is_long=False
+            open_, high, low, close, tp_distance, sl_distance, horizon, is_long=False
         )
+        if self._config.refine_ambiguous_barriers:
+            total_ambiguous: int = long_side.ambiguous_bars + short_side.ambiguous_bars
+            total_flipped: int = long_side.refined_to_target + short_side.refined_to_target
+            if total_ambiguous:
+                _LOGGER.info(
+                    "Intra-candle barrier refinement: %d/%d ambiguous same-bar "
+                    "TP/SL touches resolved to TP-first (was always stop-first)",
+                    total_flipped,
+                    total_ambiguous,
+                )
 
         volatility_percentile: np.ndarray = self._volatility_percentile(frame)
         labels, tiers, chosen_side = self._classify(long_side, short_side, volatility_percentile)
@@ -274,6 +290,7 @@ class TradeLabeler:
     # ------------------------------------------------------------------
     def _simulate(
         self,
+        open_: np.ndarray,
         high: np.ndarray,
         low: np.ndarray,
         close: np.ndarray,
@@ -299,6 +316,7 @@ class TradeLabeler:
             chunk_end: int = min(chunk_start + _CHUNK_ROWS, simulatable)
             self._simulate_chunk(
                 simulation,
+                open_,
                 high,
                 low,
                 close,
@@ -314,6 +332,7 @@ class TradeLabeler:
     def _simulate_chunk(
         self,
         simulation: _SideSimulation,
+        open_: np.ndarray,
         high: np.ndarray,
         low: np.ndarray,
         close: np.ndarray,
@@ -362,10 +381,25 @@ class TradeLabeler:
         first_tp: np.ndarray = np.argmax(tp_touched, axis=1)
         first_sl: np.ndarray = np.argmax(sl_touched, axis=1)
 
-        # Conservative tie-break: when both barriers are touched on the same
-        # candle we cannot know the intra-candle order, so the stop wins.
+        # Default, conservative tie-break: when both barriers are touched on
+        # the same candle we cannot know the intra-candle order from raw OHLC
+        # alone, so the stop wins unless the refinement below overturns it.
         stop_first: np.ndarray = sl_any & (~tp_any | (first_sl <= first_tp))
         target_first: np.ndarray = tp_any & ~stop_first
+
+        # True ambiguity is *only* the same-bar case (first_tp == first_sl):
+        # whenever the two first-touch indices differ, one barrier genuinely
+        # resolved on an earlier candle and there is nothing to refine.
+        rows_index: np.ndarray = np.arange(count)
+        tie: np.ndarray = tp_any & sl_any & (first_tp == first_sl)
+        if self._config.refine_ambiguous_barriers and np.any(tie):
+            flip_to_target: np.ndarray = self._refine_ambiguous_ties(
+                tie, rows_index, first_sl, chunk_start, open_, high, low, close, tp_price, sl_price
+            )
+            stop_first = stop_first & ~flip_to_target
+            target_first = tp_any & (target_first | flip_to_target)
+            simulation.ambiguous_bars += int(np.count_nonzero(tie))
+            simulation.refined_to_target += int(np.count_nonzero(flip_to_target))
 
         exit_index: np.ndarray = np.where(
             stop_first, first_sl, np.where(target_first, first_tp, horizon - 1)
@@ -375,7 +409,6 @@ class TradeLabeler:
         outcome[stop_first] = TradeOutcome.STOP_LOSS.value
         outcome[target_first] = TradeOutcome.TAKE_PROFIT.value
 
-        rows_index: np.ndarray = np.arange(count)
         worst_price: np.ndarray = running_adverse[rows_index, exit_index]
         best_price: np.ndarray = running_favorable[rows_index, exit_index]
 
@@ -433,6 +466,118 @@ class TradeLabeler:
         simulation.optimal_tp_pct[target] = optimal_tp
         simulation.optimal_sl_pct[target] = optimal_sl
         simulation.optimal_trailing_pct[target] = optimal_tp * 0.5
+
+    # ------------------------------------------------------------------
+    # Intra-candle barrier-order refinement
+    # ------------------------------------------------------------------
+    def _refine_ambiguous_ties(
+        self,
+        tie: np.ndarray,
+        rows_index: np.ndarray,
+        first_touch: np.ndarray,
+        chunk_start: int,
+        open_: np.ndarray,
+        high: np.ndarray,
+        low: np.ndarray,
+        close: np.ndarray,
+        tp_price: np.ndarray,
+        sl_price: np.ndarray,
+    ) -> np.ndarray:
+        """Resolve same-bar TP/SL touches using that candle's own OHLC.
+
+        5-minute bars only record four prices; when both barriers sit inside a
+        single bar's ``[low, high]`` range, the raw data cannot say which was
+        struck first - the price could have spiked to the take-profit then
+        reversed all the way to the stop, or the reverse.  Rather than always
+        assuming the worst case, the *exit* candle's own open/high/low/close
+        is used to calibrate a Brownian motion with drift ``ln(close/open)``
+        and volatility from the Parkinson high-low estimator
+        ``ln(high/low) / (2*sqrt(ln 2))``, and the classical two-barrier
+        first-passage formula gives the probability that the take-profit
+        level was crossed before the stop-loss level. Whichever is more
+        likely wins; ties (p == 0.5, e.g. a zero-range candle) keep the
+        conservative stop-first default.
+
+        Args:
+            tie: Boolean mask, rows where TP and SL first-touch on the same bar.
+            rows_index: ``arange(count)`` for this chunk.
+            first_touch: The shared first-touch bar offset (``first_tp == first_sl``
+                wherever ``tie`` is set).
+            chunk_start: Row offset of this chunk within the full series.
+            open_, high, low, close: Full-length OHLC arrays for the symbol.
+            tp_price, sl_price: Absolute barrier prices for this chunk's rows.
+
+        Returns:
+            Boolean mask (chunk-local) of rows where the refinement concluded
+            the take-profit was more likely struck first.
+        """
+        bar_index: np.ndarray = chunk_start + 1 + rows_index + first_touch
+        bar_open: np.ndarray = open_[bar_index]
+        bar_high: np.ndarray = high[bar_index]
+        bar_low: np.ndarray = low[bar_index]
+        bar_close: np.ndarray = close[bar_index]
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            sigma: np.ndarray = np.log(
+                np.maximum(bar_high, _EPSILON) / np.maximum(bar_low, _EPSILON)
+            ) / (2.0 * np.sqrt(np.log(2.0)))
+            mu: np.ndarray = np.log(
+                np.maximum(bar_close, _EPSILON) / np.maximum(bar_open, _EPSILON)
+            )
+            level_tp: np.ndarray = np.log(
+                np.maximum(tp_price, _EPSILON) / np.maximum(bar_open, _EPSILON)
+            )
+            level_sl: np.ndarray = np.log(
+                np.maximum(sl_price, _EPSILON) / np.maximum(bar_open, _EPSILON)
+            )
+
+        tp_is_upper: np.ndarray = level_tp >= level_sl
+        upper: np.ndarray = np.where(tp_is_upper, level_tp, level_sl)
+        lower: np.ndarray = np.where(tp_is_upper, level_sl, level_tp)
+        # The barrier order is only ambiguous, by construction, for bars whose
+        # own open sat between the two levels; clamp away any float noise at
+        # the boundary so the first-passage formula sees a valid interval.
+        upper = np.maximum(upper, _EPSILON)
+        lower = np.minimum(lower, -_EPSILON)
+
+        p_hit_upper_first: np.ndarray = self._first_passage_probability(mu, sigma, lower, upper)
+        p_tp_first: np.ndarray = np.where(tp_is_upper, p_hit_upper_first, 1.0 - p_hit_upper_first)
+
+        return tie & (p_tp_first > 0.5)
+
+    @staticmethod
+    def _first_passage_probability(
+        mu: np.ndarray, sigma: np.ndarray, a: np.ndarray, b: np.ndarray
+    ) -> np.ndarray:
+        """P(a drifted Brownian motion started at 0 exits ``(a, b)`` through ``b`` first).
+
+        Closed-form two-barrier first-passage result for ``X(t) = mu*t +
+        sigma*W(t)``, with ``a < 0 < b``.  Derived from the scale function
+        ``h(x) = exp(-theta*x)``, ``theta = 2*mu/sigma**2``, which is harmonic
+        for the process's generator, so optional stopping gives::
+
+            P(hit b before a) = (h(0) - h(a)) / (h(b) - h(a))
+
+        which reduces to the driftless straight-line case ``-a / (b - a)``
+        as ``mu -> 0``.  Exponents are clipped rather than the inputs, so the
+        formula still saturates to the correct 0/1 answer when volatility is
+        near zero and drift dominates.
+        """
+        driftless: np.ndarray = np.abs(mu) <= 1e-10
+        linear: np.ndarray = -a / np.maximum(b - a, 1e-12)
+
+        sigma_safe: np.ndarray = np.maximum(sigma, 1e-9)
+        theta: np.ndarray = 2.0 * mu / (sigma_safe ** 2)
+        theta_a: np.ndarray = np.clip(-theta * a, -50.0, 50.0)
+        theta_b: np.ndarray = np.clip(-theta * b, -50.0, 50.0)
+
+        numerator: np.ndarray = 1.0 - np.exp(theta_a)
+        denominator: np.ndarray = np.exp(theta_b) - np.exp(theta_a)
+        with np.errstate(invalid="ignore"):
+            drifted: np.ndarray = np.where(np.abs(denominator) > 1e-9, numerator / denominator, linear)
+
+        probability: np.ndarray = np.where(driftless, linear, drifted)
+        return np.clip(np.nan_to_num(probability, nan=0.5), 0.0, 1.0)
 
     # ------------------------------------------------------------------
     # Classification
