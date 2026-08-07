@@ -12,7 +12,7 @@ interface, an SSH tunnel or a firewall allow-list before exposing it.
 
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, Sequence, runtime_checkable
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -46,6 +46,29 @@ class SystemController(Protocol):
 
     async def recent_trades(self, limit: int, status_filter: str | None) -> list[dict[str, Any]]:
         """Recent trade rows."""
+
+    async def list_universe_candidates(self, refresh: bool) -> dict[str, Any]:
+        """Screened list of every USDT-M perpetual on Binance."""
+
+    async def suggest_universe(self, limit: int | None) -> dict[str, Any]:
+        """Top-scoring eligible symbols."""
+
+    async def save_universe(
+        self, symbols: Sequence[str], start_setup: bool, operator: str
+    ) -> dict[str, Any]:
+        """Persist the operator's pair selection."""
+
+    async def setup_status(self) -> dict[str, Any]:
+        """Progress of the data-collection and training pipeline."""
+
+    async def start_setup(self, force_retrain: bool) -> dict[str, Any]:
+        """Re-run collection and training."""
+
+    async def start_trading(self, mode: str) -> dict[str, Any]:
+        """Arm paper or live trading."""
+
+    async def stop_trading(self, flatten: bool) -> dict[str, Any]:
+        """Disarm trading."""
 
     async def set_trading_enabled(self, enabled: bool) -> dict[str, Any]:
         """Pause or resume signal generation."""
@@ -122,6 +145,15 @@ def build_app(controller: SystemController) -> FastAPI:
         """System status, active positions, model health and the live log."""
         return render("dashboard_content.html", "dashboard_scripts.html")
 
+    @app.get("/universe", response_class=HTMLResponse, summary="Select trading pairs")
+    async def universe_page() -> HTMLResponse:
+        """Live Binance perpetual list with the screens applied, ticked by the operator."""
+        return render(
+            "universe_content.html",
+            "universe_scripts.html",
+            target_count=settings.universe.target_count,
+        )
+
     @app.get("/audit", response_class=HTMLResponse, summary="Decision audit trail")
     async def audit_page() -> HTMLResponse:
         """Every decision the engine made, with the exact rule that fired."""
@@ -182,8 +214,115 @@ def build_app(controller: SystemController) -> FastAPI:
         return JSONResponse({"rows": LOG_BUFFER.snapshot(limit)})
 
     # ------------------------------------------------------------------
+    # Universe API
+    # ------------------------------------------------------------------
+    @app.get("/api/universe/available", summary="Screened perpetual futures pairs")
+    async def api_universe_available(
+        refresh: bool = Query(default=False, description="Bypass the discovery cache."),
+    ) -> JSONResponse:
+        """Every active USDT-M perpetual, annotated with the screening metrics."""
+        try:
+            return JSONResponse(await controller.list_universe_candidates(refresh))
+        except Exception as error:
+            _LOGGER.error("Universe discovery failed: %s", error)
+            raise HTTPException(
+                status_code=503, detail=f"could not reach the exchange: {error}"
+            ) from error
+
+    @app.get("/api/universe/suggest", summary="Auto-select the best-scoring pairs")
+    async def api_universe_suggest(
+        limit: int | None = Query(default=None, ge=1, le=200),
+    ) -> JSONResponse:
+        """Top eligible symbols by screening score; never returns an ineligible one."""
+        try:
+            return JSONResponse(await controller.suggest_universe(limit))
+        except Exception as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+
+    @app.get("/api/universe/selected", summary="Current saved universe")
+    async def api_universe_selected() -> JSONResponse:
+        """The pairs the system is configured to trade."""
+        snapshot: dict[str, Any] = await controller.status_snapshot()
+        return JSONResponse(snapshot.get("universe", {}))
+
+    @app.post("/api/universe/select", summary="Save the pair selection")
+    async def api_universe_select(
+        request: Request,
+        payload: dict[str, Any] = Body(default_factory=dict),
+    ) -> JSONResponse:
+        """Persist the ticked pairs and (by default) start data collection + training.
+
+        Body: ``{"symbols": ["BTC/USDT:USDT", ...], "start_setup": true}``.
+        """
+        authorise(request, payload)
+        raw: Any = payload.get("symbols")
+        if not isinstance(raw, list) or not raw:
+            raise HTTPException(status_code=400, detail="'symbols' must be a non-empty list")
+
+        start_setup: bool = bool(payload.get("start_setup", True))
+        try:
+            result: dict[str, Any] = await controller.save_universe(
+                [str(item) for item in raw], start_setup, "web-panel"
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except Exception as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        return JSONResponse(result)
+
+    # ------------------------------------------------------------------
+    # Setup API
+    # ------------------------------------------------------------------
+    @app.get("/api/setup/status", summary="Data collection & training progress")
+    async def api_setup_status() -> JSONResponse:
+        """Phase, current step, percentage and any setup error."""
+        return JSONResponse(await controller.setup_status())
+
+    @app.post("/api/setup/start", summary="Re-run collection and training")
+    async def api_setup_start(
+        request: Request,
+        payload: dict[str, Any] = Body(default_factory=dict),
+    ) -> JSONResponse:
+        """Backfill any missing candles and retrain.  ``force_retrain`` skips the
+        "models are already current" shortcut."""
+        authorise(request, payload)
+        force: bool = bool(payload.get("force_retrain", False))
+        return JSONResponse(await controller.start_setup(force))
+
+    # ------------------------------------------------------------------
     # Control API
     # ------------------------------------------------------------------
+    @app.post("/api/trading/start", summary="Arm paper or live trading")
+    async def api_trading_start(
+        request: Request,
+        payload: dict[str, Any] = Body(default_factory=dict),
+    ) -> JSONResponse:
+        """Arm trading.  Body: ``{"mode": "paper"|"live"}`` (default: paper).
+
+        Rejected unless setup finished, the Risk Guard is clear, and - for live -
+        all four models are genuinely trained artifacts.
+        """
+        authorise(request, payload)
+        mode: str = str(payload.get("mode", "paper")).lower()
+        try:
+            return JSONResponse(await controller.start_trading(mode))
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/api/trading/stop", summary="Disarm trading")
+    async def api_trading_stop(
+        request: Request,
+        payload: dict[str, Any] = Body(default_factory=dict),
+    ) -> JSONResponse:
+        """Stop opening new positions.
+
+        Open positions keep being managed to their own TP/SL unless
+        ``{"flatten": true}`` is passed.
+        """
+        authorise(request, payload)
+        return JSONResponse(await controller.stop_trading(bool(payload.get("flatten", False))))
+
+
     @app.post("/api/toggle_trading", summary="Pause/resume or switch execution mode")
     async def api_toggle_trading(
         request: Request,

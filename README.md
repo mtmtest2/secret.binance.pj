@@ -47,39 +47,90 @@ Modules communicate only through validated Pydantic schemas
 
 ---
 
-## Quick start
+## Quick start — one command
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env          # optional: thresholds, and API keys for live
 
-cp .env.example .env          # edit thresholds and (for live) API keys
-
-python main.py bootstrap      # backfill ~6000 5m candles per symbol
-python main.py train          # build the dataset and fit all four heads
-python main.py backtest       # replay history through the full pipeline
-python main.py run            # scheduler + web panel on 0.0.0.0:8000
+python main.py                # that's it
 ```
 
-Then open `http://<vps-ip>:8000/`.
+Open `http://<vps-ip>:8000/` and follow the panel:
+
+1. **Pick pairs.** The system parks in `AWAITING_UNIVERSE` and the *Pairs* page
+   lists every USDT-M perpetual **fetched live from the Binance API**, annotated
+   with 24 h volume, spread, exchange minimum, lot-step cost, listing age and a
+   screening verdict. Tick what you want (or press *Suggest top 30*) and save.
+2. **Watch setup.** Saving immediately starts data collection for exactly those
+   pairs, then trains the four models on them. The dashboard shows a live
+   progress bar through `COLLECTING_DATA → TRAINING → READY`.
+3. **Arm paper trading.** Press *START PAPER*. Nothing trades before you do.
+4. **Go live when ready.** Press *GO LIVE* — open paper positions are flattened
+   first, and live is refused unless all four models are genuinely trained.
+   *STOP TRADING* disarms at any time.
+
+Everything is re-runnable: restarting only backfills the missing tail and skips
+training when the models already match the saved universe.
+
+### Lifecycle
+
+```
+STARTING ──▶ AWAITING_UNIVERSE ──(you tick pairs)──▶ COLLECTING_DATA ──▶ TRAINING
+                                                                            │
+                     PAPER_TRADING ⇄ LIVE_TRADING ◀──(you arm it)──── READY ◀┘
+```
+
+### Other commands
 
 | Command | What it does |
 |---|---|
-| `run` | Scheduler + web panel (default) |
-| `bootstrap` | Backfill historical candles for the universe |
+| *(none)* / `run` | Panel + automatic setup + 5m scheduler |
+| `universe` | Print the screened pair list in the terminal |
+| `bootstrap` | Backfill historical candles only |
 | `train` | Build the training dataset and fit the four heads |
 | `backtest [--candles N] [--equity X]` | Event-driven replay with full metrics |
 | `cycle` | Run exactly one trading cycle, then exit |
 | `--mode paper\|live` | Override the execution mode |
 
+The one-shot commands use the universe saved from the panel; if none exists they
+auto-select the top screened pairs so the CLI is usable standalone.
+
 ---
 
 ## How it works
 
+### Universe selection
+
+The tradeable universe is discovered from Binance at runtime, not hard-coded.
+Four independent screens run over every active USDT-M perpetual, and the panel
+shows exactly which one a pair failed:
+
+| Screen | Default | Why |
+|---|---|---|
+| 24 h quote volume | ≥ 50 M USDT | Thin books turn a 10x position into its own adverse price move |
+| Bid/ask spread | ≤ 6 bps | Paid on every 5m round trip |
+| Listing age | ≥ 90 days | Below this there is not enough 5m history to train on |
+| **Small-account fit** | calibrated to `reference_equity` | See below |
+
+The last one is the screen most universes get wrong, and it is the reason this
+system does **not** simply pick the biggest coins. A pair is unusable on a small
+account when either the exchange's minimum notional exceeds the smallest
+position the risk model can open, or one lot-size step costs so much that sizing
+becomes hopelessly coarse. On a 1 000 USDT account whose smallest position is
+10 USDT, a 0.001 BTC step is ~95 USDT of notional — BTC simply cannot be sized
+correctly no matter how liquid it is, so it is flagged ineligible with that exact
+reason. You can still tick it deliberately; the system honours the choice and
+logs a warning.
+
+Changing the universe invalidates the models (they were fitted on a different
+cross-section), so saving a different selection forces a retrain.
+
 ### Module A — ingestion & quality control
 
 Fetches 5m OHLCV, L2 order-book snapshots, funding rate, open interest,
-long/short ratios and (where exposed) liquidation flow for ~30 liquid perps,
+long/short ratios and (where exposed) liquidation flow for the selected pairs,
 concurrently and under a bounded semaphore.
 
 The **QC gatekeeper** (`qc_validator.py`) runs four families of checks before
@@ -172,9 +223,20 @@ Every decision cycle is logged, **including every `NO_TRADE`**, with the feature
 snapshot, all four model outputs and the exact rule that fired. Writes are
 batched through an `asyncio.Queue`, so the trading loop never waits on SQLite.
 
-The panel serves `/` (dashboard), `/audit`, `/trades` plus a JSON API and the
-control endpoints `POST /api/toggle_trading`, `POST /api/kill_switch`,
-`POST /api/reset_risk_guard`.
+The panel serves `/` (dashboard), `/universe` (pair picker), `/audit` and
+`/trades`, plus a JSON API:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/universe/available` | Screened Binance perpetuals |
+| `GET /api/universe/suggest` | Top-scoring eligible pairs |
+| `POST /api/universe/select` | Save the selection and start setup |
+| `GET /api/setup/status` | Live collection/training progress |
+| `POST /api/setup/start` | Re-run collection, `{"force_retrain": true}` to refit |
+| `POST /api/trading/start` | Arm `{"mode": "paper"｜"live"}` |
+| `POST /api/trading/stop` | Disarm (`{"flatten": true}` to close positions too) |
+| `POST /api/kill_switch` | Trip RED, flatten everything |
+| `POST /api/reset_risk_guard` | Clear a RED latch |
 
 ---
 
@@ -205,9 +267,12 @@ Hold out a period the models never touched before you believe anything.
   `WEB__API_TOKEN` to protect the control endpoints, and put the port behind a
   firewall allow-list or an SSH tunnel.
 - **Going live.** Requires `EXCHANGE__TESTNET=false`, real API keys with futures
-  permission, and trained artifacts for all four heads. Start on the futures
-  testnet, then paper, then live with the smallest size that clears the
-  exchange minimums.
+  permission, and trained artifacts for all four heads (heuristic fallbacks are
+  refused). Start on the futures testnet, then paper, then live with the
+  smallest size that clears the exchange minimums.
+- **Nothing trades on its own.** Trading is armed only from the panel (or
+  `POST /api/trading/start`). Set `AUTOSTART_PAPER_TRADING=true` if you
+  genuinely want paper trading to begin the moment setup finishes.
 - **Leverage** is capped at 10x by schema validation, not just by configuration.
 - **Time** is UTC end to end; the scheduler fires a few seconds past each 5m
   boundary (`DATA__CYCLE_SECOND_OFFSET`) because firing at exactly `:00` races

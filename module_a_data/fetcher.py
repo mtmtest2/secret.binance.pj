@@ -521,6 +521,28 @@ class BinanceDataFetcher:
             raise DataFetchError("ticker returned a non-positive price", symbol=symbol)
         return price
 
+    async def fetch_raw_tickers(
+        self,
+        symbols: Sequence[str] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Batch-fetch complete ticker payloads (price, bid/ask, 24 h volume).
+
+        Used by universe discovery, which needs the spread and quote volume that
+        :meth:`fetch_tickers` discards.  Passing ``None`` fetches the whole
+        market in a single weighted request.
+        """
+        await self.load_markets()
+        requested: list[str] | None = list(symbols) if symbols else None
+        payload: dict[str, Any] = await self._call(
+            "fetch_raw_tickers",
+            lambda: self._exchange.fetch_tickers(requested),
+        )
+        return {
+            str(symbol): dict(ticker)
+            for symbol, ticker in payload.items()
+            if isinstance(ticker, dict)
+        }
+
     async def fetch_tickers(self, symbols: Sequence[str]) -> dict[str, float]:
         """Batch-fetch last prices for many symbols in a single request."""
         await self.load_markets()

@@ -87,6 +87,9 @@ class ExchangeSettings(BaseModel):
 class DataSettings(BaseModel):
     """Data-ingestion parameters for the 5-minute pipeline."""
 
+    #: Fallback universe used only until the operator saves a selection in the
+    #: web panel.  The live universe is discovered from Binance and stored in
+    #: the database - see :class:`UniverseSettings` and ``UniverseManager``.
     symbols: tuple[str, ...] = Field(default=DEFAULT_SYMBOLS)
     timeframe: Literal["5m"] = Field(default="5m")
     timeframe_ms: int = Field(default=5 * 60 * 1_000)
@@ -103,6 +106,43 @@ class DataSettings(BaseModel):
     #: exactly :00 races the exchange's own candle close and regularly yields a
     #: missing last bar, so a small offset is the operationally correct default.
     cycle_second_offset: int = Field(default=10, ge=0, le=59)
+
+
+class UniverseSettings(BaseModel):
+    """Screening rules for the tradeable symbol universe.
+
+    The universe is *discovered* from Binance rather than hard-coded: the panel
+    lists every USDT-M perpetual, annotated with the metrics below, and the
+    operator ticks the ones to trade.  These thresholds decide which rows are
+    marked eligible and which are pre-selected by the "suggest" button.
+    """
+
+    target_count: int = Field(default=30, ge=1, le=200)
+    quote_currency: str = Field(default="USDT")
+
+    #: 24 h quote volume floor - the primary liquidity screen.
+    min_quote_volume_24h: float = Field(default=50_000_000.0, ge=0.0)
+    #: Bid/ask spread ceiling in basis points, measured at discovery time.
+    max_spread_bps: float = Field(default=6.0, gt=0.0)
+    #: Days since listing.  Below this there is not enough 5m history to train.
+    min_history_days: int = Field(default=90, ge=1)
+
+    #: Account size the small-capital screens are calibrated against.
+    reference_equity: float = Field(default=1_000.0, gt=0.0)
+    #: One lot-size step must not cost more than this share of the smallest
+    #: position the risk model can open.  This is what rejects coins whose
+    #: quantity granularity is too coarse for a small account (e.g. a 0.001 BTC
+    #: step is ~100 USDT of notional, unusable when the smallest position is 10).
+    max_granularity_fraction: float = Field(default=0.25, gt=0.0, le=1.0)
+
+    #: Re-discovery interval; market metadata does not change minute to minute.
+    discovery_cache_seconds: float = Field(default=900.0, gt=0.0)
+
+    #: Relative weights of the ranking score (normalised internally).
+    weight_liquidity: float = Field(default=0.45, ge=0.0)
+    weight_spread: float = Field(default=0.25, ge=0.0)
+    weight_affordability: float = Field(default=0.20, ge=0.0)
+    weight_history: float = Field(default=0.10, ge=0.0)
 
 
 class QCSettings(BaseModel):
@@ -330,12 +370,26 @@ class Settings(BaseSettings):
     app_name: str = Field(default="ai-quant-binance-futures")
     trading_mode: TradingMode = Field(default="paper")
     trading_enabled: bool = Field(default=True)
+
+    #: One-run automation.  `python main.py` collects data and trains by itself;
+    #: trading is left OFF so the operator arms it deliberately from the panel.
+    auto_setup_on_start: bool = Field(
+        default=True, description="Run data collection + training automatically at startup."
+    )
+    auto_train: bool = Field(
+        default=True, description="Train missing/stale models as part of auto-setup."
+    )
+    autostart_paper_trading: bool = Field(
+        default=False, description="Arm paper trading as soon as setup finishes."
+    )
+
     log_level: str = Field(default="INFO")
     log_dir: Path = Field(default=PROJECT_ROOT / "logs")
     timezone: str = Field(default="UTC")
 
     exchange: ExchangeSettings = Field(default_factory=ExchangeSettings)
     data: DataSettings = Field(default_factory=DataSettings)
+    universe: UniverseSettings = Field(default_factory=UniverseSettings)
     qc: QCSettings = Field(default_factory=QCSettings)
     features: FeatureSettings = Field(default_factory=FeatureSettings)
     labels: LabelSettings = Field(default_factory=LabelSettings)

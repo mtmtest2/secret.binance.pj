@@ -12,7 +12,7 @@ interpolated data.  Trading on invented candles is worse than not trading.
 from __future__ import annotations
 
 import asyncio
-from typing import Final
+from typing import Callable, Final
 
 from config.settings import Settings
 from core.exceptions import DataFetchError, DataIntegrityError, DatabaseError
@@ -34,6 +34,9 @@ _LOGGER = get_logger(__name__)
 
 #: Extra candles fetched beyond the strict minimum, so rolling windows warm up.
 _LOOKBACK_SAFETY_BARS: Final[int] = 50
+
+#: ``(symbol, completed, total) -> None`` progress reporter for long backfills.
+ProgressCallback = Callable[[str, int, int], None]
 
 
 class DataPipeline:
@@ -60,16 +63,28 @@ class DataPipeline:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    async def bootstrap_history(self, symbols: list[str] | None = None) -> dict[str, int]:
+    async def bootstrap_history(
+        self,
+        symbols: list[str] | None = None,
+        progress: ProgressCallback | None = None,
+    ) -> dict[str, int]:
         """Backfill historical candles so the feature/label stack has depth.
 
         Only the *missing* tail is requested: if the database already holds data
         for a symbol, the fetch starts one bar after the newest stored candle.
+        That makes the call cheap to repeat and safe to run on every startup.
+
+        Args:
+            symbols: Universe to backfill (defaults to the configured fallback).
+            progress: Optional ``(symbol, done, total) -> None`` callback invoked
+                as each symbol completes, so the panel can render a progress bar.
 
         Returns:
             Mapping of symbol -> number of candles written.
         """
         universe: list[str] = symbols if symbols is not None else list(self._settings.data.symbols)
+        completed: int = 0
+        total: int = len(universe)
         target_bars: int = self._settings.data.history_bootstrap_candles
         timeframe_ms: int = self._settings.data.timeframe_ms
         end_ms: int = last_closed_candle_open_ms(timeframe_ms)
@@ -103,16 +118,27 @@ class DataPipeline:
                     written: int = await self._db.upsert_candles(candles)
                     return symbol, written
                 except (DataFetchError, DataIntegrityError, DatabaseError) as error:
+                    # One bad symbol must not abort the backfill of the other 29.
                     _LOGGER.error("Bootstrap failed for %s: %s", symbol, error)
                     return symbol, 0
+                finally:
+                    nonlocal completed
+                    completed += 1
+                    if progress is not None:
+                        try:
+                            progress(symbol, completed, total)
+                        except Exception as callback_error:  # pragma: no cover
+                            _LOGGER.debug("Progress callback failed: %s", callback_error)
 
         results: list[tuple[str, int]] = await asyncio.gather(
             *(_bootstrap_one(symbol) for symbol in universe)
         )
         written_by_symbol: dict[str, int] = dict(results)
-        total: int = sum(written_by_symbol.values())
+        total_written: int = sum(written_by_symbol.values())
         _LOGGER.info(
-            "Bootstrap complete: %d candles across %d symbols", total, len(written_by_symbol)
+            "Bootstrap complete: %d candles across %d symbols",
+            total_written,
+            len(written_by_symbol),
         )
         return written_by_symbol
 

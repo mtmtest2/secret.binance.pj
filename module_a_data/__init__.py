@@ -24,6 +24,7 @@ from module_a_data.models import (
 )
 from module_a_data.pipeline import DataPipeline
 from module_a_data.qc_validator import QCValidator
+from module_a_data.universe import SymbolCandidate, UniverseManager
 
 __all__: list[str] = [
     "BinanceDataFetcher",
@@ -37,4 +38,6 @@ __all__: list[str] = [
     "QCReport",
     "QCSeverity",
     "QCValidator",
+    "SymbolCandidate",
+    "UniverseManager",
 ]

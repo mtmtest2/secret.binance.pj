@@ -45,6 +45,7 @@ _BASE: Final[
       </div>
       <nav class="flex items-center gap-4 text-sm">
         <a href="/">Dashboard</a>
+        <a href="/universe">Pairs</a>
         <a href="/audit">Audit</a>
         <a href="/trades">Trades</a>
         <a href="/api/status">API</a>
@@ -69,7 +70,24 @@ _BASE: Final[
 _DASHBOARD_CONTENT: Final[
     str
 ] = """
+<section id="setup-panel" class="card" style="display:none;">
+  <div class="flex items-center justify-between flex-wrap gap-2">
+    <div class="font-bold">SYSTEM SETUP</div>
+    <div id="setup-phase" class="pill" style="background:#1f2937">-</div>
+  </div>
+  <div id="setup-step" class="text-sm mt-2">-</div>
+  <div id="setup-detail" class="muted text-xs mt-1"></div>
+  <div class="mt-3 bg-slate-800 rounded h-3 overflow-hidden">
+    <div id="setup-bar" class="h-3 bg-sky-500" style="width:0%; transition:width .4s;"></div>
+  </div>
+  <div id="setup-error" class="neg text-xs mt-2"></div>
+  <div id="setup-cta" class="text-xs mt-3"></div>
+</section>
+
 <section class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr));">
+  <div class="card"><div class="muted text-xs">PHASE</div>
+    <div id="phase" class="text-2xl font-bold mt-1">-</div>
+    <div id="universe-info" class="muted text-xs mt-1"></div></div>
   <div class="card"><div class="muted text-xs">RISK GUARD</div>
     <div id="guard-state" class="text-2xl font-bold mt-1">-</div>
     <div id="guard-reason" class="muted text-xs mt-1"></div></div>
@@ -96,14 +114,15 @@ _DASHBOARD_CONTENT: Final[
     <div class="flex items-center gap-2 flex-wrap">
       <input id="token" type="password" placeholder="API token (if set)"
              class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs"/>
-      <button onclick="post('/api/toggle_trading', {action:'pause'})"
-              class="bg-amber-600 hover:bg-amber-500 rounded px-3 py-1 text-xs font-bold">PAUSE</button>
-      <button onclick="post('/api/toggle_trading', {action:'resume'})"
-              class="bg-emerald-700 hover:bg-emerald-600 rounded px-3 py-1 text-xs font-bold">RESUME</button>
-      <button onclick="post('/api/toggle_trading', {mode:'paper'})"
-              class="bg-sky-700 hover:bg-sky-600 rounded px-3 py-1 text-xs font-bold">PAPER</button>
-      <button onclick="confirmLive()"
-              class="bg-indigo-700 hover:bg-indigo-600 rounded px-3 py-1 text-xs font-bold">LIVE</button>
+      <button id="btn-paper" onclick="startTrading('paper')"
+              class="bg-emerald-700 hover:bg-emerald-600 rounded px-3 py-1 text-xs font-bold">START PAPER</button>
+      <button id="btn-live" onclick="startTrading('live')"
+              class="bg-indigo-700 hover:bg-indigo-600 rounded px-3 py-1 text-xs font-bold">GO LIVE</button>
+      <button id="btn-stop" onclick="post('/api/trading/stop', {})"
+              class="bg-amber-600 hover:bg-amber-500 rounded px-3 py-1 text-xs font-bold">STOP TRADING</button>
+      <a href="/universe" class="bg-slate-700 hover:bg-slate-600 rounded px-3 py-1 text-xs font-bold">PAIRS</a>
+      <button onclick="post('/api/setup/start', {force_retrain:true})"
+              class="bg-slate-700 hover:bg-slate-600 rounded px-3 py-1 text-xs font-bold">RETRAIN</button>
       <button onclick="post('/api/reset_risk_guard', {})"
               class="bg-slate-700 hover:bg-slate-600 rounded px-3 py-1 text-xs font-bold">RESET GUARD</button>
       <button onclick="killSwitch()"
@@ -174,8 +193,67 @@ function killSwitch() {
     post('/api/kill_switch', {reason:'panel kill switch'});
   }
 }
-function confirmLive() {
-  if (confirm('Switch to LIVE trading with real funds?')) { post('/api/toggle_trading', {mode:'live'}); }
+
+function startTrading(mode) {
+  const warn = mode === 'live'
+    ? 'START LIVE TRADING WITH REAL FUNDS?\n\nAny open paper positions will be closed first.'
+    : 'Start paper trading with the virtual balance?';
+  if (confirm(warn)) { post('/api/trading/start', {mode: mode}); }
+}
+
+const PHASE_COLOR = {
+  STARTING:'#94a3b8', AWAITING_UNIVERSE:'#fbbf24', COLLECTING_DATA:'#38bdf8',
+  TRAINING:'#a78bfa', READY:'#34d399', PAPER_TRADING:'#34d399',
+  LIVE_TRADING:'#6366f1', SETUP_FAILED:'#f87171'
+};
+
+function renderSetup(s) {
+  const setup = s.setup || {};
+  const phase = s.phase || '-';
+  const panel = document.getElementById('setup-panel');
+  const showPanel = phase !== 'PAPER_TRADING' && phase !== 'LIVE_TRADING';
+  panel.style.display = showPanel ? 'block' : 'none';
+
+  const badge = document.getElementById('setup-phase');
+  badge.textContent = phase;
+  badge.style.background = PHASE_COLOR[phase] || '#1f2937';
+  badge.style.color = '#0b1020';
+
+  document.getElementById('setup-step').textContent = setup.step || '-';
+  document.getElementById('setup-detail').textContent = setup.detail || '';
+  document.getElementById('setup-bar').style.width = (setup.percent || 0) + '%';
+  document.getElementById('setup-error').textContent = setup.error || '';
+
+  const cta = document.getElementById('setup-cta');
+  if (phase === 'AWAITING_UNIVERSE') {
+    cta.innerHTML = '&rarr; <a href="/universe"><b>Choose the perpetual futures pairs to trade</b></a>, then save. ' +
+                    'Data collection and training start automatically.';
+  } else if (phase === 'SETUP_FAILED') {
+    cta.innerHTML = 'Setup failed. Fix the cause, then press <b>RETRAIN</b>, or reselect pairs at ' +
+                    '<a href="/universe">Pairs</a>.';
+  } else if (phase === 'READY') {
+    cta.innerHTML = 'Ready. Press <b>START PAPER</b> to trade with the virtual balance.';
+  } else {
+    cta.textContent = '';
+  }
+
+  const el = document.getElementById('phase');
+  el.textContent = phase;
+  el.style.color = PHASE_COLOR[phase] || '#e6ebf5';
+  const uni = s.universe || {};
+  document.getElementById('universe-info').textContent =
+    (uni.count || 0) + ' pair(s) selected' + (setup.symbols_total ? ' | ' + setup.symbols_done + '/' + setup.symbols_total + ' processed' : '');
+
+  const canArm = setup.can_arm_trading;
+  const trading = setup.is_trading;
+  document.getElementById('btn-paper').disabled = !canArm || (trading && s.trading_mode === 'paper');
+  document.getElementById('btn-live').disabled = !canArm || (trading && s.trading_mode === 'live');
+  document.getElementById('btn-stop').disabled = !trading;
+  ['btn-paper','btn-live','btn-stop'].forEach(id => {
+    const b = document.getElementById(id);
+    b.style.opacity = b.disabled ? '0.4' : '1';
+    b.style.cursor = b.disabled ? 'not-allowed' : 'pointer';
+  });
 }
 
 function row(cells) { return '<tr>' + cells.map(c => '<td>' + c + '</td>').join('') + '</tr>'; }
@@ -185,6 +263,7 @@ async function refresh() {
   try { s = await (await fetch('/api/status')).json(); }
   catch (err) { document.getElementById('guard-state').textContent = 'UNREACHABLE'; return; }
 
+  renderSetup(s);
   const guard = s.risk_guard || {};
   const acct = s.account || {};
   const g = document.getElementById('guard-state');
@@ -194,7 +273,7 @@ async function refresh() {
 
   document.getElementById('mode').textContent = (s.trading_mode || '-').toUpperCase();
   document.getElementById('trading-enabled').textContent =
-    s.trading_enabled ? 'trading enabled' : 'trading PAUSED';
+    s.trading_enabled ? 'ARMED' : 'disarmed';
   document.getElementById('equity').textContent = fmt(acct.equity);
   const up = document.getElementById('upnl');
   up.textContent = 'unrealised ' + fmt(acct.unrealized_pnl) + ' | balance ' + fmt(acct.balance);
@@ -325,6 +404,172 @@ setInterval(loadAudit, 15000);
 </script>
 """
 
+_UNIVERSE_CONTENT: Final[
+    str
+] = """
+<section class="card">
+  <div class="flex items-center justify-between flex-wrap gap-3">
+    <div>
+      <div class="font-bold text-lg">SELECT PERPETUAL FUTURES PAIRS</div>
+      <div class="muted text-xs mt-1">
+        Live from the Binance USDT-M API. Tick the pairs to trade, then save &mdash;
+        data collection and model training start automatically on your selection.
+      </div>
+    </div>
+    <div class="flex items-center gap-2 flex-wrap">
+      <input id="token" type="password" placeholder="API token (if set)"
+             class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs"/>
+      <button onclick="loadUniverse(true)"
+              class="bg-slate-700 hover:bg-slate-600 rounded px-3 py-1 text-xs font-bold">REFRESH</button>
+      <button onclick="suggest()"
+              class="bg-sky-700 hover:bg-sky-600 rounded px-3 py-1 text-xs font-bold">SUGGEST TOP {{ target_count }}</button>
+      <button onclick="saveUniverse()"
+              class="bg-emerald-700 hover:bg-emerald-600 rounded px-3 py-1 text-xs font-bold">SAVE &amp; START SETUP</button>
+    </div>
+  </div>
+  <div id="criteria" class="muted text-xs mt-3"></div>
+  <div id="save-result" class="text-xs mt-2"></div>
+</section>
+
+<section class="card">
+  <div class="flex items-center justify-between flex-wrap gap-3 mb-3">
+    <div class="flex items-center gap-4 text-xs">
+      <label class="flex items-center gap-1">
+        <input type="checkbox" id="only-eligible" checked onchange="renderRows()"/> eligible only
+      </label>
+      <input id="search" placeholder="filter symbol..." oninput="renderRows()"
+             class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs"/>
+      <span id="counts" class="muted"></span>
+    </div>
+    <div class="text-xs"><span id="selected-count" class="pos font-bold">0</span> selected</div>
+  </div>
+  <div class="scroll" style="max-height:65vh; overflow-y:auto;"><table>
+    <thead><tr>
+      <th><input type="checkbox" id="check-all" onchange="toggleAll(this.checked)"/></th>
+      <th>Symbol</th><th>Price</th><th>24h Volume</th><th>24h %</th><th>Spread</th>
+      <th>Min order</th><th>Lot step cost</th><th>Max lev</th><th>Listed</th>
+      <th>Score</th><th>Status</th>
+    </tr></thead>
+    <tbody id="universe-rows"><tr><td colspan="12" class="muted">loading from Binance...</td></tr></tbody>
+  </table></div>
+</section>
+"""
+
+_UNIVERSE_SCRIPTS: Final[
+    str
+] = """
+<script>
+let ROWS = [];
+let SELECTED = new Set();
+
+function token() { const el = document.getElementById('token'); return el ? el.value.trim() : ''; }
+function money(x) {
+  if (x >= 1e9) return (x / 1e9).toFixed(2) + 'B';
+  if (x >= 1e6) return (x / 1e6).toFixed(1) + 'M';
+  if (x >= 1e3) return (x / 1e3).toFixed(1) + 'K';
+  return Number(x || 0).toFixed(0);
+}
+
+async function loadUniverse(refresh) {
+  const body = document.getElementById('universe-rows');
+  body.innerHTML = '<tr><td colspan="12" class="muted">loading from Binance...</td></tr>';
+  try {
+    const data = await (await fetch('/api/universe/available?refresh=' + (refresh ? '1' : '0'))).json();
+    ROWS = data.rows || [];
+    SELECTED = new Set(data.selected || []);
+    const c = data.criteria || {};
+    document.getElementById('criteria').innerHTML =
+      'Screens &mdash; min 24h volume: <b>' + money(c.min_quote_volume_24h) + ' USDT</b> &middot; ' +
+      'max spread: <b>' + c.max_spread_bps + ' bps</b> &middot; ' +
+      'min history: <b>' + c.min_history_days + ' days</b> &middot; ' +
+      'small-account fit calibrated to <b>' + money(c.reference_equity) + ' USDT</b> equity &middot; ' +
+      '<b>' + data.eligible_count + '</b> of <b>' + data.total_count + '</b> pairs eligible';
+    renderRows();
+  } catch (err) {
+    body.innerHTML = '<tr><td colspan="12" class="neg">could not reach Binance: ' + err + '</td></tr>';
+  }
+}
+
+function visibleRows() {
+  const onlyEligible = document.getElementById('only-eligible').checked;
+  const term = document.getElementById('search').value.trim().toUpperCase();
+  return ROWS.filter(r => (!onlyEligible || r.eligible) && (!term || r.symbol.toUpperCase().includes(term)));
+}
+
+function renderRows() {
+  const rows = visibleRows();
+  document.getElementById('universe-rows').innerHTML = rows.length ? rows.map(r => {
+    const checked = SELECTED.has(r.symbol) ? 'checked' : '';
+    const status = r.eligible
+      ? '<span class="pill" style="background:#065f46">ELIGIBLE</span>'
+      : '<span class="warn" title="' + (r.reasons || []).join(' | ') + '">' +
+        (r.reasons || []).join('; ').slice(0, 70) + '</span>';
+    const chg = (r.price_change_pct_24h >= 0 ? 'pos' : 'neg');
+    return '<tr>' +
+      '<td><input type="checkbox" ' + checked + ' onchange="toggle(\'' + r.symbol + '\', this.checked)"/></td>' +
+      '<td><b>' + r.symbol + '</b></td>' +
+      '<td>' + fmt(r.price, 6) + '</td>' +
+      '<td>' + money(r.quote_volume_24h) + '</td>' +
+      '<td class="' + chg + '">' + fmt(r.price_change_pct_24h, 2) + '%</td>' +
+      '<td>' + fmt(r.spread_bps, 2) + ' bps</td>' +
+      '<td>' + fmt(r.min_notional, 2) + '</td>' +
+      '<td>' + fmt(r.granularity_usdt, 2) + '</td>' +
+      '<td>' + (r.max_leverage || '-') + 'x</td>' +
+      '<td>' + fmt(r.listed_days, 0) + 'd</td>' +
+      '<td>' + fmt(r.score, 3) + '</td>' +
+      '<td>' + status + '</td></tr>';
+  }).join('') : '<tr><td colspan="12" class="muted">nothing matches the filter</td></tr>';
+  updateCounts();
+}
+
+function toggle(symbol, on) { on ? SELECTED.add(symbol) : SELECTED.delete(symbol); updateCounts(); }
+function toggleAll(on) {
+  visibleRows().forEach(r => on ? SELECTED.add(r.symbol) : SELECTED.delete(r.symbol));
+  renderRows();
+}
+function updateCounts() {
+  document.getElementById('selected-count').textContent = SELECTED.size;
+  document.getElementById('counts').textContent = visibleRows().length + ' shown / ' + ROWS.length + ' total';
+}
+
+async function suggest() {
+  const data = await (await fetch('/api/universe/suggest')).json();
+  SELECTED = new Set(data.symbols || []);
+  renderRows();
+  const el = document.getElementById('save-result');
+  el.textContent = 'Pre-selected the ' + SELECTED.size + ' top-scoring eligible pairs. Review, then save.';
+  el.className = 'muted text-xs mt-2';
+}
+
+async function saveUniverse() {
+  const el = document.getElementById('save-result');
+  if (SELECTED.size === 0) {
+    el.textContent = 'Select at least one pair first.'; el.className = 'neg text-xs mt-2'; return;
+  }
+  if (!confirm('Save ' + SELECTED.size + ' pair(s)?\n\nData collection and model training will start now. Any armed trading will be stopped first.')) return;
+  el.textContent = 'saving...'; el.className = 'muted text-xs mt-2';
+  const res = await fetch('/api/universe/select', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'X-API-Token': token()},
+    body: JSON.stringify({symbols: Array.from(SELECTED), start_setup: true})
+  });
+  const data = await res.json();
+  if (res.ok) {
+    el.innerHTML = 'Saved <b>' + data.accepted + '</b> pair(s). Setup started &mdash; ' +
+                   '<a href="/">watch progress on the dashboard</a>.' +
+                   (Object.keys(data.rejected || {}).length
+                     ? '<br/><span class="warn">rejected: ' + JSON.stringify(data.rejected) + '</span>' : '');
+    el.className = 'pos text-xs mt-2';
+  } else {
+    el.textContent = 'ERROR: ' + (data.detail || JSON.stringify(data));
+    el.className = 'neg text-xs mt-2';
+  }
+}
+
+loadUniverse(false);
+</script>
+"""
+
 _TRADES_CONTENT: Final[
     str
 ] = """
@@ -379,6 +624,8 @@ TEMPLATES: Final[dict[str, str]] = {
     "dashboard_scripts.html": _DASHBOARD_SCRIPTS,
     "audit_content.html": _AUDIT_CONTENT,
     "audit_scripts.html": _AUDIT_SCRIPTS,
+    "universe_content.html": _UNIVERSE_CONTENT,
+    "universe_scripts.html": _UNIVERSE_SCRIPTS,
     "trades_content.html": _TRADES_CONTENT,
     "trades_scripts.html": _TRADES_SCRIPTS,
 }
