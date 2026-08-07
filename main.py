@@ -100,7 +100,7 @@ class TradingSystem:
         # --- Module B --------------------------------------------------
         self.features: FeatureService = FeatureService(settings)
         self.processor: DatasetProcessor = DatasetProcessor(
-            settings, self.database, self.features
+            settings, self.database, self.features, fetcher=self.fetcher
         )
 
         # --- Modules C & D ---------------------------------------------

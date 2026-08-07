@@ -248,14 +248,20 @@ class DatabaseHandler:
         limit: int | None = None,
         start_ms: int | None = None,
         end_ms: int | None = None,
+        timeframe: str | None = None,
     ) -> pd.DataFrame:
         """Load candles as a UTC-indexed OHLCV frame ready for Module B.
 
         The ``limit`` is applied to a *descending* query and the result is
         re-sorted ascending, so "the most recent N candles" is an index seek
         rather than a table scan.
+
+        Args:
+            timeframe: Defaults to the configured trading timeframe (``"5m"``).
+                Pass e.g. ``"1m"`` to read the labeler's cached intra-candle
+                refinement data instead.
         """
-        timeframe: str = self._settings.data.timeframe
+        timeframe = timeframe if timeframe is not None else self._settings.data.timeframe
         query: Select[Any] = select(
             OHLCVRow.timestamp,
             OHLCVRow.open,

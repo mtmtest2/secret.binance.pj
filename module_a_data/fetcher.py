@@ -365,13 +365,17 @@ class BinanceDataFetcher:
         symbol: str,
         limit: int | None = None,
         since_ms: int | None = None,
+        timeframe: str | None = None,
     ) -> list[OHLCVCandle]:
-        """Fetch a single page of 5-minute candles.
+        """Fetch a single page of candles.
 
         Args:
             symbol: ccxt unified symbol, e.g. ``"BTC/USDT:USDT"``.
             limit: Number of candles requested (defaults to ``data.ohlcv_limit``).
             since_ms: Optional inclusive lower bound (candle open time, ms).
+            timeframe: Override the instance's configured timeframe (``"5m"``)
+                for this call, e.g. ``"1m"`` for the labeler's intra-candle
+                refinement. Defaults to the instance's timeframe.
 
         Returns:
             Validated candles sorted ascending by open time.  The still-forming
@@ -380,12 +384,14 @@ class BinanceDataFetcher:
         """
         await self.load_markets()
         page_limit: int = limit if limit is not None else self._settings.data.ohlcv_limit
+        tf: str = timeframe if timeframe is not None else self._timeframe
+        tf_ms: int = self._timeframe_ms_for(tf)
 
         raw: Sequence[Sequence[Any]] = await self._call(
-            f"fetch_ohlcv[{symbol}]",
+            f"fetch_ohlcv[{symbol}:{tf}]",
             lambda: self._exchange.fetch_ohlcv(
                 symbol,
-                timeframe=self._timeframe,
+                timeframe=tf,
                 since=since_ms,
                 limit=page_limit,
             ),
@@ -395,14 +401,14 @@ class BinanceDataFetcher:
         candles: list[OHLCVCandle] = []
         for row in raw:
             try:
-                candle: OHLCVCandle = OHLCVCandle.from_ccxt(row, symbol, self._timeframe)
+                candle: OHLCVCandle = OHLCVCandle.from_ccxt(row, symbol, tf)
             except (ValueError, TypeError) as error:
                 # A structurally broken row is dropped here; the QC validator will
                 # observe the resulting gap and trigger a targeted heal.
                 _LOGGER.warning("Dropping malformed candle for %s: %s", symbol, error)
                 continue
             if self._settings.data.drop_unclosed_candle:
-                if candle.timestamp + self._timeframe_ms > cutoff_ms:
+                if candle.timestamp + tf_ms > cutoff_ms:
                     continue
             candles.append(candle)
 
@@ -415,6 +421,7 @@ class BinanceDataFetcher:
         start_ms: int,
         end_ms: int,
         page_limit: int | None = None,
+        timeframe: str | None = None,
     ) -> list[OHLCVCandle]:
         """Fetch every closed candle in ``[start_ms, end_ms]`` using pagination.
 
@@ -422,18 +429,24 @@ class BinanceDataFetcher:
         are walked forward page by page.  The loop is defensive against an
         exchange that returns an empty or non-advancing page (it breaks instead
         of spinning forever).
+
+        Args:
+            timeframe: Override the instance's configured timeframe for this
+                call (see :meth:`fetch_ohlcv`).
         """
         await self.load_markets()
         limit: int = page_limit if page_limit is not None else self._settings.data.ohlcv_limit
+        tf: str = timeframe if timeframe is not None else self._timeframe
+        tf_ms: int = self._timeframe_ms_for(tf)
         collected: dict[int, OHLCVCandle] = {}
         cursor: int = start_ms
         guard: int = 0
-        max_pages: int = max(1, (end_ms - start_ms) // (self._timeframe_ms * limit) + 4)
+        max_pages: int = max(1, (end_ms - start_ms) // (tf_ms * limit) + 4)
 
         while cursor <= end_ms and guard < max_pages:
             guard += 1
             page: list[OHLCVCandle] = await self.fetch_ohlcv(
-                symbol, limit=limit, since_ms=cursor
+                symbol, limit=limit, since_ms=cursor, timeframe=tf
             )
             if not page:
                 break
@@ -444,13 +457,24 @@ class BinanceDataFetcher:
                     collected[candle.timestamp] = candle
                     fresh += 1
 
-            next_cursor: int = page[-1].timestamp + self._timeframe_ms
+            next_cursor: int = page[-1].timestamp + tf_ms
             if next_cursor <= cursor and fresh == 0:
                 # The exchange is not advancing; stop rather than loop forever.
                 break
             cursor = next_cursor
 
         return [collected[key] for key in sorted(collected)]
+
+    def _timeframe_ms_for(self, timeframe: str) -> int:
+        """Resolve a timeframe string to its duration in milliseconds.
+
+        Uses the instance's own precomputed value for its configured
+        timeframe (avoids a redundant parse on the hot path); any other
+        timeframe is resolved through ccxt's parser.
+        """
+        if timeframe == self._timeframe:
+            return self._timeframe_ms
+        return int(self._exchange.parse_timeframe(timeframe) * 1000)
 
     # ------------------------------------------------------------------
     # Order book

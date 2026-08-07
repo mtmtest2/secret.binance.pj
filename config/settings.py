@@ -258,10 +258,12 @@ class LabelSettings(BaseModel):
 
     #: When a single execution candle's high touches the take-profit level
     #: *and* its low touches the stop-loss level, raw 5m OHLC alone cannot say
-    #: which happened first. When enabled, that specific candle's own
-    #: open/high/low/close is used to calibrate a drifted-Brownian-motion
-    #: first-passage probability (see ``TradeLabeler``) and the more likely
-    #: barrier wins, instead of always assuming the worst case (stop first).
+    #: which happened first. When enabled, the labeler asks for that candle's
+    #: real 1-minute sub-candles (fetched by ``DatasetProcessor``, see
+    #: ``TradeLabeler.generate``) and walks them in time order to find out
+    #: which barrier was actually struck first, instead of always assuming
+    #: the worst case (stop first). Candles left unresolved because no
+    #: 1-minute data was available yet keep that conservative default.
     refine_ambiguous_barriers: bool = Field(default=True)
 
     #: MAE (max adverse excursion) expressed as a fraction of the SL distance.
