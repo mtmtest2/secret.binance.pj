@@ -7,7 +7,7 @@ Repository ...... secret.binance.pj  (mtmtest2/secret.binance.pj)
 Branch analysed .. claude/reverse-engineering-analysis-wxv4bv
 Commit .......... 0f48a74 "Fix JS escaping in panel templates so /universe renders"
 Language ........ Python 3.11+
-Total source .... 38 files, ~15,061 lines (incl. README, .env.example, .gitignore)
+Total source .... 39 files, ~15,061 lines (incl. README, .env.example, .gitignore)
 Document purpose  Complete reverse-engineered technical description of the
                   system as it exists in code. Descriptive only - this document
                   states what the code does, not what it should do.
