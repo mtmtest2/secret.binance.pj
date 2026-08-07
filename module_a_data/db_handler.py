@@ -58,6 +58,17 @@ _OHLCV_COLUMNS: Final[tuple[str, ...]] = (
     "volume",
 )
 
+#: SQLite rejects a single statement with more than ~32766 bound parameters
+#: (its documented default since 3.32, though some distro builds compile a
+#: higher ceiling). A multi-row ``INSERT ... VALUES (...), (...), ...`` inlines
+#: every row's parameters into one statement, so a large bootstrap batch (each
+#: candle binds 8 columns) can blow past that limit - which surfaces as a
+#: generic "too many SQL variables" ``DatabaseError``. Chunk defensively at a
+#: value safe even on the smallest documented ceiling.
+_SQLITE_MAX_VARIABLES: Final[int] = 30_000
+_OHLCV_COLUMNS_PER_ROW: Final[int] = 8  # symbol, timeframe, timestamp, o/h/l/c, volume
+_OHLCV_UPSERT_CHUNK_ROWS: Final[int] = _SQLITE_MAX_VARIABLES // _OHLCV_COLUMNS_PER_ROW
+
 
 class DatabaseHandler:
     """Owns the async engine and exposes every persistence operation."""
@@ -138,6 +149,13 @@ class DatabaseHandler:
     async def upsert_candles(self, candles: Sequence[OHLCVCandle]) -> int:
         """Bulk-upsert validated candles.
 
+        Chunked at ``_OHLCV_UPSERT_CHUNK_ROWS`` rows per statement: a single
+        ``INSERT ... VALUES (...), (...), ...`` inlines every row's bind
+        parameters, and a large bootstrap batch (thousands of candles, 8
+        columns each) can exceed SQLite's per-statement variable limit -
+        chunking keeps every individual statement well under it regardless of
+        how many candles are upserted in one call.
+
         Returns:
             The number of rows submitted (SQLite does not report affected rows
             reliably for multi-row upserts).
@@ -159,22 +177,27 @@ class DatabaseHandler:
             for candle in candles
         ]
 
-        statement = sqlite_insert(OHLCVRow).values(payload)
-        statement = statement.on_conflict_do_update(
-            index_elements=[OHLCVRow.symbol, OHLCVRow.timeframe, OHLCVRow.timestamp],
-            set_={
-                "open": statement.excluded.open,
-                "high": statement.excluded.high,
-                "low": statement.excluded.low,
-                "close": statement.excluded.close,
-                "volume": statement.excluded.volume,
-            },
-        )
-
         try:
             async with self._factory()() as session:
                 async with session.begin():
-                    await session.execute(statement)
+                    for chunk_start in range(0, len(payload), _OHLCV_UPSERT_CHUNK_ROWS):
+                        chunk: list[dict[str, Any]] = payload[
+                            chunk_start : chunk_start + _OHLCV_UPSERT_CHUNK_ROWS
+                        ]
+                        statement = sqlite_insert(OHLCVRow).values(chunk)
+                        statement = statement.on_conflict_do_update(
+                            index_elements=[
+                                OHLCVRow.symbol, OHLCVRow.timeframe, OHLCVRow.timestamp
+                            ],
+                            set_={
+                                "open": statement.excluded.open,
+                                "high": statement.excluded.high,
+                                "low": statement.excluded.low,
+                                "close": statement.excluded.close,
+                                "volume": statement.excluded.volume,
+                            },
+                        )
+                        await session.execute(statement)
         except SQLAlchemyError as error:
             raise DatabaseError("candle upsert failed", rows=len(payload)) from error
         return len(payload)
