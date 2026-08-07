@@ -21,16 +21,29 @@ import numpy as np
 import pandas as pd
 
 from config.settings import Settings
-from core.exceptions import FeatureEngineeringError, InsufficientDataError
+from core.exceptions import DataFetchError, FeatureEngineeringError, InsufficientDataError
 from core.logger import get_logger
 from module_a_data.db_handler import DatabaseHandler
+from module_a_data.fetcher import BinanceDataFetcher
+from module_a_data.models import OHLCVCandle
 from module_b_features.features import FEATURE_COLUMNS, FeatureService
-from module_b_features.labeler import LABEL_ORDER, TradeLabeler
+from module_b_features.labeler import LABEL_ORDER, IntrabarLookup, SubCandle, TradeLabeler
 
 _LOGGER = get_logger(__name__)
 
 #: Columns carried alongside the features for bookkeeping / backtesting.
 _META_COLUMNS: Final[tuple[str, ...]] = ("timestamp", "open", "high", "low", "close", "volume")
+
+#: Timeframe fetched for the labeler's intra-candle barrier-order refinement.
+_INTRABAR_TIMEFRAME: Final[str] = "1m"
+_INTRABAR_TIMEFRAME_MS: Final[int] = 60_000
+#: Width of one 5m candle being resolved, in milliseconds.
+_LABEL_CANDLE_MS: Final[int] = 5 * 60_000
+#: Ambiguous 5m candles closer together than this are fetched as a single
+#: contiguous 1-minute range instead of one request each - ambiguity tends to
+#: cluster in volatile stretches, so this keeps the request count low without
+#: pulling in large spans of 1-minute data nobody needs.
+_INTRABAR_MERGE_GAP_MS: Final[int] = 2 * 60 * 60 * 1_000
 
 
 @dataclass(slots=True)
@@ -109,11 +122,15 @@ class DatasetProcessor:
         database: DatabaseHandler,
         feature_service: FeatureService | None = None,
         labeler: TradeLabeler | None = None,
+        fetcher: BinanceDataFetcher | None = None,
     ) -> None:
         self._settings: Settings = settings
         self._db: DatabaseHandler = database
         self._features: FeatureService = feature_service or FeatureService(settings)
         self._labeler: TradeLabeler = labeler or TradeLabeler(settings)
+        #: Optional: without it, ambiguous same-bar TP/SL touches simply keep
+        #: the labeler's conservative stop-first fallback (see `_build_labeled_symbol`).
+        self._fetcher: BinanceDataFetcher | None = fetcher
 
     @property
     def feature_service(self) -> FeatureService:
@@ -176,6 +193,13 @@ class DatasetProcessor:
 
             featured: pd.DataFrame = await self._features.build(ohlcv, futures, book)
             labeled: pd.DataFrame = await asyncio.to_thread(self._labeler.generate, featured)
+
+            ambiguous_ts: list[int] = list(labeled.attrs.get("ambiguous_candle_timestamps", []))
+            if ambiguous_ts and self._fetcher is not None:
+                intrabar: IntrabarLookup = await self._fetch_intrabar_candles(symbol, ambiguous_ts)
+                if intrabar:
+                    labeled = await asyncio.to_thread(self._labeler.generate, featured, intrabar)
+
             labeled["symbol"] = symbol
             return labeled
         except (InsufficientDataError, FeatureEngineeringError) as error:
@@ -184,6 +208,124 @@ class DatasetProcessor:
         except Exception as error:  # pragma: no cover - defensive per-symbol isolation
             _LOGGER.error("Unexpected failure building %s: %s", symbol, error, exc_info=True)
             return None
+
+    # ------------------------------------------------------------------
+    # Intra-candle (1-minute) data for the labeler's barrier-order refinement
+    # ------------------------------------------------------------------
+    async def _fetch_intrabar_candles(
+        self,
+        symbol: str,
+        candle_timestamps: Sequence[int],
+    ) -> IntrabarLookup:
+        """Read (or fetch) the 1-minute sub-candles for a set of ambiguous 5m bars.
+
+        Nearby candles are merged into contiguous ranges (see
+        ``_merge_intrabar_windows``) so this costs a handful of paginated
+        requests rather than one per ambiguous candle. Each range is served
+        from the local cache when a previous run already stored it; a cache
+        miss falls back to a live fetch, which is itself best-effort - a
+        failed window is skipped, leaving those candles on the labeler's
+        conservative stop-first fallback rather than aborting training.
+        """
+        if self._fetcher is None or not candle_timestamps:
+            return {}
+
+        windows: list[tuple[int, int]] = self._merge_intrabar_windows(
+            sorted(set(int(value) for value in candle_timestamps))
+        )
+
+        collected: list[OHLCVCandle] = []
+        for start_ms, end_ms_exclusive in windows:
+            expected_rows: int = (end_ms_exclusive - start_ms) // _INTRABAR_TIMEFRAME_MS
+            cached: pd.DataFrame = await self._db.load_ohlcv_dataframe(
+                symbol,
+                start_ms=start_ms,
+                end_ms=end_ms_exclusive - 1,
+                timeframe=_INTRABAR_TIMEFRAME,
+            )
+            if len(cached) >= expected_rows > 0:
+                collected.extend(
+                    OHLCVCandle(
+                        symbol=symbol,
+                        timeframe=_INTRABAR_TIMEFRAME,
+                        timestamp=int(row.timestamp),
+                        open=float(row.open),
+                        high=float(row.high),
+                        low=float(row.low),
+                        close=float(row.close),
+                        volume=float(row.volume),
+                    )
+                    for row in cached.itertuples()
+                )
+                continue
+
+            try:
+                fetched: list[OHLCVCandle] = await self._fetcher.fetch_ohlcv_range(
+                    symbol,
+                    start_ms=start_ms,
+                    end_ms=end_ms_exclusive - 1,
+                    timeframe=_INTRABAR_TIMEFRAME,
+                )
+            except DataFetchError as error:
+                _LOGGER.warning(
+                    "1-minute intrabar fetch failed for %s [%d, %d): %s",
+                    symbol, start_ms, end_ms_exclusive, error,
+                )
+                continue
+
+            if fetched:
+                await self._db.upsert_candles(fetched)
+                collected.extend(fetched)
+
+        return self._bucket_by_5m_window(collected, set(candle_timestamps))
+
+    @staticmethod
+    def _merge_intrabar_windows(candle_timestamps: list[int]) -> list[tuple[int, int]]:
+        """Merge ambiguous 5m candle timestamps into contiguous fetch ranges.
+
+        Returns ``(start_ms, end_ms_exclusive)`` pairs, each covering every
+        1-minute sub-candle of the 5m bars it spans.
+        """
+        if not candle_timestamps:
+            return []
+
+        merged: list[tuple[int, int]] = []
+        window_start: int = candle_timestamps[0]
+        window_end: int = candle_timestamps[0] + _LABEL_CANDLE_MS
+        for timestamp in candle_timestamps[1:]:
+            if timestamp - window_end > _INTRABAR_MERGE_GAP_MS:
+                merged.append((window_start, window_end))
+                window_start = timestamp
+            window_end = timestamp + _LABEL_CANDLE_MS
+        merged.append((window_start, window_end))
+        return merged
+
+    @staticmethod
+    def _bucket_by_5m_window(
+        candles: list[OHLCVCandle],
+        wanted: set[int],
+    ) -> dict[int, list[SubCandle]]:
+        """Group 1-minute candles under the 5m bar they belong to.
+
+        Only buckets actually present in ``wanted`` are returned - a merged
+        fetch range can carry extra 1-minute candles that no ambiguous bar
+        asked for, and those are dropped here rather than handed to the
+        labeler as if they resolved something.
+        """
+        buckets: dict[int, list[tuple[int, float, float, float, float]]] = {}
+        for candle in candles:
+            bucket_start: int = (candle.timestamp // _LABEL_CANDLE_MS) * _LABEL_CANDLE_MS
+            if bucket_start not in wanted:
+                continue
+            buckets.setdefault(bucket_start, []).append(
+                (candle.timestamp, candle.open, candle.high, candle.low, candle.close)
+            )
+
+        result: dict[int, list[SubCandle]] = {}
+        for bucket_start, rows in buckets.items():
+            rows.sort(key=lambda row: row[0])
+            result[bucket_start] = [(o, h, l, c) for _, o, h, l, c in rows]
+        return result
 
     def _to_dataset(self, pooled: pd.DataFrame, symbols: tuple[str, ...]) -> ProcessedDataset:
         """Clean the pooled frame and split it into per-model targets."""

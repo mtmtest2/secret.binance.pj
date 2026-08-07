@@ -16,10 +16,17 @@ hypothetical **short**, each with volatility-scaled barriers::
 and scans forward at most ``max_holding_bars`` candles for the first barrier
 touch.  Three conservative modelling choices keep the labels honest:
 
-1. **Worst-case intra-candle ordering.**  5-minute OHLC data cannot tell us
-   whether the high or the low came first.  When a single candle touches both
-   barriers we assume the **stop** was hit first.  Any other assumption
-   manufactures phantom winners.
+1. **Intra-candle ordering.**  5-minute OHLC data alone cannot tell us whether
+   the high or the low came first within a bar.  When a single candle touches
+   both barriers, the labeler asks the caller for that candle's own
+   **1-minute sub-candles** (``IntrabarLookup``, see :meth:`TradeLabeler.generate`)
+   and walks them in time order to find out which barrier was actually struck
+   first - real data, not a guess.  Whenever that data was not supplied (or a
+   bar remains ambiguous even at 1-minute resolution), the labeler falls back
+   to the conservative assumption that the **stop** was hit first; any other
+   fallback would manufacture phantom winners.  ``generate()`` reports every
+   candle it had to fall back on via ``result.attrs["ambiguous_candle_timestamps"]``
+   so the caller can fetch the missing 1-minute data and re-run labeling.
 2. **Barrier fills, not close fills.**  A resolved trade exits exactly at its
    barrier price; only expired trades mark to the horizon close.
 3. **Heat is measured, not ignored.**  The maximum adverse excursion (MAE) along
@@ -39,7 +46,7 @@ not an edge worth learning.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Final
+from typing import Final, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -53,6 +60,12 @@ _LOGGER = get_logger(__name__)
 _EPSILON: Final[float] = 1e-12
 #: Rows processed per vectorised chunk, bounding peak memory on long histories.
 _CHUNK_ROWS: Final[int] = 20_000
+
+#: One 1-minute sub-candle as ``(open, high, low, close)``, supplied by the
+#: caller for the intra-candle barrier-order refinement (see ``TradeLabeler``).
+SubCandle = tuple[float, float, float, float]
+#: 5m-candle-open-timestamp (ms) -> its 1-minute sub-candles, ascending in time.
+IntrabarLookup = Mapping[int, Sequence[SubCandle]]
 
 
 class LabelClass(str, Enum):
@@ -123,6 +136,9 @@ class _SideSimulation:
         "optimal_tp_pct",
         "optimal_sl_pct",
         "optimal_trailing_pct",
+        "tie",
+        "exit_bar_index",
+        "pending_intrabar",
     )
 
     def __init__(self, rows: int) -> None:
@@ -134,6 +150,15 @@ class _SideSimulation:
         self.optimal_tp_pct: np.ndarray = np.full(rows, np.nan, dtype=np.float64)
         self.optimal_sl_pct: np.ndarray = np.full(rows, np.nan, dtype=np.float64)
         self.optimal_trailing_pct: np.ndarray = np.full(rows, np.nan, dtype=np.float64)
+        #: ``True`` where this side's exit bar touched *both* barriers, so raw
+        #: OHLC alone could not order them (see ``_resolve_ties_with_intrabar``).
+        self.tie: np.ndarray = np.zeros(rows, dtype=bool)
+        #: Global row index of the (would-be) exit bar for tie rows, ``-1``
+        #: elsewhere. Used to look up that candle's 1-minute sub-candles.
+        self.exit_bar_index: np.ndarray = np.full(rows, -1, dtype=np.int64)
+        #: Tie rows still resolved via the conservative fallback because no
+        #: (or insufficiently precise) 1-minute data was supplied.
+        self.pending_intrabar: np.ndarray = np.zeros(rows, dtype=bool)
 
 
 class TradeLabeler:
@@ -146,13 +171,24 @@ class TradeLabeler:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def generate(self, frame: pd.DataFrame) -> pd.DataFrame:
+    def generate(
+        self,
+        frame: pd.DataFrame,
+        intrabar: IntrabarLookup | None = None,
+    ) -> pd.DataFrame:
         """Attach every training target to a feature frame.
 
         Args:
             frame: Feature frame from :class:`FeatureEngineer` - must contain
-                ``high``, ``low``, ``close`` and ``atr`` (``garch_volatility`` is
-                used when ATR has not warmed up).
+                ``timestamp``, ``high``, ``low``, ``close`` and ``atr``
+                (``garch_volatility`` is used when ATR has not warmed up).
+            intrabar: Optional ``{5m candle open timestamp (ms): [(open, high,
+                low, close), ...]}`` map of 1-minute sub-candles, ascending in
+                time, used to resolve same-bar TP/SL ambiguity precisely (see
+                the module docstring). Candles absent from this mapping fall
+                back to the conservative stop-first assumption and are listed
+                in the returned frame's ``result.attrs["ambiguous_candle_timestamps"]``
+                so the caller can fetch them and call ``generate`` again.
 
         Returns:
             A copy of ``frame`` with the following columns added:
@@ -172,12 +208,17 @@ class TradeLabeler:
             ``label_is_valid``            ``False`` for the un-simulatable tail
             ============================  ==========================================
 
+            Also sets ``result.attrs["ambiguous_candle_timestamps"]``: the sorted
+            list of 5m candle open timestamps (ms) whose barrier order is still
+            resolved via the conservative fallback because ``intrabar`` did not
+            cover them (or was ``None``).
+
         Raises:
             InsufficientDataError: When the frame is shorter than the holding
                 horizon plus one bar.
             LabelingError: When required columns are absent.
         """
-        required: set[str] = {"high", "low", "close"}
+        required: set[str] = {"timestamp", "high", "low", "close"}
         missing: set[str] = required - set(frame.columns)
         if missing:
             raise LabelingError("labeling requires OHLC columns", missing=sorted(missing))
@@ -191,6 +232,7 @@ class TradeLabeler:
             )
 
         result: pd.DataFrame = frame.copy()
+        timestamps: np.ndarray = frame["timestamp"].to_numpy(dtype=np.int64)
         high: np.ndarray = frame["high"].to_numpy(dtype=np.float64)
         low: np.ndarray = frame["low"].to_numpy(dtype=np.float64)
         close: np.ndarray = frame["close"].to_numpy(dtype=np.float64)
@@ -198,11 +240,36 @@ class TradeLabeler:
         tp_distance, sl_distance = self._barrier_distances(frame, close)
 
         long_side: _SideSimulation = self._simulate(
-            high, low, close, tp_distance, sl_distance, horizon, is_long=True
+            high, low, close, timestamps, tp_distance, sl_distance, horizon,
+            is_long=True, intrabar=intrabar,
         )
         short_side: _SideSimulation = self._simulate(
-            high, low, close, tp_distance, sl_distance, horizon, is_long=False
+            high, low, close, timestamps, tp_distance, sl_distance, horizon,
+            is_long=False, intrabar=intrabar,
         )
+
+        ambiguous_timestamps: list[int] = []
+        if self._config.refine_ambiguous_barriers:
+            total_tie: int = int(np.count_nonzero(long_side.tie)) + int(
+                np.count_nonzero(short_side.tie)
+            )
+            total_pending: int = int(np.count_nonzero(long_side.pending_intrabar)) + int(
+                np.count_nonzero(short_side.pending_intrabar)
+            )
+            if total_tie:
+                _LOGGER.info(
+                    "Intra-candle barrier refinement: %d/%d ambiguous same-bar "
+                    "TP/SL touches resolved with 1-minute data (%d still on the "
+                    "conservative stop-first fallback)",
+                    total_tie - total_pending,
+                    total_tie,
+                    total_pending,
+                )
+            needed: set[int] = set()
+            for side in (long_side, short_side):
+                pending_index: np.ndarray = side.exit_bar_index[side.pending_intrabar]
+                needed.update(int(value) for value in timestamps[pending_index])
+            ambiguous_timestamps = sorted(needed)
 
         volatility_percentile: np.ndarray = self._volatility_percentile(frame)
         labels, tiers, chosen_side = self._classify(long_side, short_side, volatility_percentile)
@@ -233,6 +300,7 @@ class TradeLabeler:
             result.loc[result["label_is_valid"], "label"].value_counts().to_dict()
         )
         _LOGGER.info("Label distribution: %s", distribution)
+        result.attrs["ambiguous_candle_timestamps"] = ambiguous_timestamps
         return result
 
     # ------------------------------------------------------------------
@@ -277,10 +345,12 @@ class TradeLabeler:
         high: np.ndarray,
         low: np.ndarray,
         close: np.ndarray,
+        timestamps: np.ndarray,
         tp_distance: np.ndarray,
         sl_distance: np.ndarray,
         horizon: int,
         is_long: bool,
+        intrabar: IntrabarLookup | None,
     ) -> _SideSimulation:
         """Vectorised triple-barrier scan for one side.
 
@@ -302,12 +372,14 @@ class TradeLabeler:
                 high,
                 low,
                 close,
+                timestamps,
                 tp_distance,
                 sl_distance,
                 horizon,
                 is_long,
                 chunk_start,
                 chunk_end,
+                intrabar,
             )
         return simulation
 
@@ -317,12 +389,14 @@ class TradeLabeler:
         high: np.ndarray,
         low: np.ndarray,
         close: np.ndarray,
+        timestamps: np.ndarray,
         tp_distance: np.ndarray,
         sl_distance: np.ndarray,
         horizon: int,
         is_long: bool,
         chunk_start: int,
         chunk_end: int,
+        intrabar: IntrabarLookup | None,
     ) -> None:
         """Resolve one chunk of entries; writes straight into ``simulation``."""
         count: int = chunk_end - chunk_start
@@ -362,10 +436,28 @@ class TradeLabeler:
         first_tp: np.ndarray = np.argmax(tp_touched, axis=1)
         first_sl: np.ndarray = np.argmax(sl_touched, axis=1)
 
-        # Conservative tie-break: when both barriers are touched on the same
-        # candle we cannot know the intra-candle order, so the stop wins.
+        # Default, conservative tie-break: when both barriers are touched on
+        # the same candle we cannot know the intra-candle order from raw OHLC
+        # alone, so the stop wins unless the refinement below overturns it.
         stop_first: np.ndarray = sl_any & (~tp_any | (first_sl <= first_tp))
         target_first: np.ndarray = tp_any & ~stop_first
+
+        # True ambiguity is *only* the same-bar case (first_tp == first_sl):
+        # whenever the two first-touch indices differ, one barrier genuinely
+        # resolved on an earlier candle and there is nothing to refine.
+        rows_index: np.ndarray = np.arange(count)
+        tie: np.ndarray = tp_any & sl_any & (first_tp == first_sl)
+        exit_bar_index: np.ndarray = chunk_start + 1 + rows_index + first_sl
+        pending: np.ndarray = np.zeros(count, dtype=bool)
+        if self._config.refine_ambiguous_barriers and np.any(tie):
+            flip_to_target, pending = self._resolve_ties_with_intrabar(
+                tie, exit_bar_index, timestamps, tp_price, sl_price, is_long, intrabar
+            )
+            stop_first = stop_first & ~flip_to_target
+            target_first = tp_any & (target_first | flip_to_target)
+            simulation.tie[chunk_start:chunk_end] = tie
+            simulation.exit_bar_index[chunk_start:chunk_end] = exit_bar_index
+            simulation.pending_intrabar[chunk_start:chunk_end] = pending
 
         exit_index: np.ndarray = np.where(
             stop_first, first_sl, np.where(target_first, first_tp, horizon - 1)
@@ -375,7 +467,6 @@ class TradeLabeler:
         outcome[stop_first] = TradeOutcome.STOP_LOSS.value
         outcome[target_first] = TradeOutcome.TAKE_PROFIT.value
 
-        rows_index: np.ndarray = np.arange(count)
         worst_price: np.ndarray = running_adverse[rows_index, exit_index]
         best_price: np.ndarray = running_favorable[rows_index, exit_index]
 
@@ -433,6 +524,98 @@ class TradeLabeler:
         simulation.optimal_tp_pct[target] = optimal_tp
         simulation.optimal_sl_pct[target] = optimal_sl
         simulation.optimal_trailing_pct[target] = optimal_tp * 0.5
+
+    # ------------------------------------------------------------------
+    # Intra-candle barrier-order refinement
+    # ------------------------------------------------------------------
+    def _resolve_ties_with_intrabar(
+        self,
+        tie: np.ndarray,
+        exit_bar_index: np.ndarray,
+        timestamps: np.ndarray,
+        tp_price: np.ndarray,
+        sl_price: np.ndarray,
+        is_long: bool,
+        intrabar: IntrabarLookup | None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Resolve same-bar TP/SL touches using that candle's real 1-minute path.
+
+        5-minute bars only record four prices; when both barriers sit inside a
+        single bar's ``[low, high]`` range, the raw data cannot say which was
+        struck first.  Rather than guessing, this looks up the exit candle's
+        own 1-minute sub-candles (supplied by the caller in ``intrabar``, keyed
+        by the 5m candle's open timestamp) and walks them in time order to see
+        which barrier price was actually crossed first.
+
+        Args:
+            tie: Boolean mask, rows where TP and SL first-touch on the same bar.
+            exit_bar_index: Global row index of that bar, one per row.
+            timestamps: Full-length candle-open-timestamp array (ms).
+            tp_price, sl_price: Absolute barrier prices for this chunk's rows.
+            is_long: Which side is being resolved.
+            intrabar: ``{5m timestamp: [(open, high, low, close), ...]}`` or
+                ``None`` when no 1-minute data has been fetched yet.
+
+        Returns:
+            ``(flip_to_target, still_pending)``, both chunk-local boolean masks.
+            ``flip_to_target`` marks rows where the sub-candles showed TP struck
+            first.  ``still_pending`` marks tie rows that kept the conservative
+            stop-first default because no data was available for that candle,
+            or the sub-candles were themselves still ambiguous down to the
+            minute - these are reported back to the caller so it can fetch the
+            missing window and try again.
+        """
+        flip_to_target: np.ndarray = np.zeros(tie.shape, dtype=bool)
+        still_pending: np.ndarray = np.zeros(tie.shape, dtype=bool)
+        if not np.any(tie):
+            return flip_to_target, still_pending
+
+        for position in np.nonzero(tie)[0]:
+            bar_timestamp: int = int(timestamps[exit_bar_index[position]])
+            sub_candles: Sequence[SubCandle] | None = (
+                intrabar.get(bar_timestamp) if intrabar is not None else None
+            )
+            if not sub_candles:
+                still_pending[position] = True
+                continue
+
+            winner: str | None = self._first_touch_from_subcandles(
+                sub_candles, float(tp_price[position]), float(sl_price[position]), is_long
+            )
+            if winner == "tp":
+                flip_to_target[position] = True
+            elif winner is None:
+                # The 1-minute candles didn't disambiguate either (e.g. both
+                # barriers sit inside one of them) - stay conservative, and
+                # there is nothing coarser left to fetch, so this is *not*
+                # reported as still-pending.
+                continue
+
+        return flip_to_target, still_pending
+
+    @staticmethod
+    def _first_touch_from_subcandles(
+        sub_candles: Sequence[SubCandle],
+        tp_price: float,
+        sl_price: float,
+        is_long: bool,
+    ) -> str | None:
+        """Walk 1-minute sub-candles in time order to find the first barrier hit.
+
+        Returns ``"tp"``, ``"sl"``, or ``None`` when neither was touched in the
+        supplied candles or a single sub-candle touches both (still ambiguous,
+        just five times less often than at 5m resolution).
+        """
+        for _open, high, low, close in sub_candles:
+            tp_hit: bool = high >= tp_price if is_long else low <= tp_price
+            sl_hit: bool = low <= sl_price if is_long else high >= sl_price
+            if tp_hit and sl_hit:
+                return None
+            if tp_hit:
+                return "tp"
+            if sl_hit:
+                return "sl"
+        return None
 
     # ------------------------------------------------------------------
     # Classification

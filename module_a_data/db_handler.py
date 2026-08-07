@@ -21,10 +21,10 @@ from types import TracebackType
 from typing import Any, Final, Sequence
 
 import pandas as pd
-from sqlalchemy import Select, delete, desc, func, select
+from sqlalchemy import Select, delete, desc, event, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Result
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import (
 from config.settings import Settings
 from core.exceptions import DatabaseError
 from core.logger import get_logger
+from core.utils import async_retry
 from module_a_data.db_models import (
     AuditLogRow,
     Base,
@@ -57,6 +58,28 @@ _OHLCV_COLUMNS: Final[tuple[str, ...]] = (
     "close",
     "volume",
 )
+
+#: SQLite rejects a single statement with more than ~32766 bound parameters
+#: (its documented default since 3.32, though some distro builds compile a
+#: higher ceiling). A multi-row ``INSERT ... VALUES (...), (...), ...`` inlines
+#: every row's parameters into one statement, so a large bootstrap batch (each
+#: candle binds 8 columns) can blow past that limit - which surfaces as a
+#: generic "too many SQL variables" ``DatabaseError``. Chunk defensively at a
+#: value safe even on the smallest documented ceiling.
+_SQLITE_MAX_VARIABLES: Final[int] = 30_000
+_OHLCV_COLUMNS_PER_ROW: Final[int] = 8  # symbol, timeframe, timestamp, o/h/l/c, volume
+_OHLCV_UPSERT_CHUNK_ROWS: Final[int] = _SQLITE_MAX_VARIABLES // _OHLCV_COLUMNS_PER_ROW
+
+#: SQLite allows exactly one writer at a time; a multi-symbol bootstrap can
+#: have several coroutines (bounded by ``exchange.max_concurrent_requests``)
+#: each trying to write thousands of rows around the same moment. Each chunk
+#: therefore commits in its own short transaction (below) rather than one
+#: transaction spanning the whole symbol, so no single writer can monopolise
+#: the write lock for long - and a chunk that still loses the race to another
+#: writer is retried a few times instead of failing the whole symbol.
+_UPSERT_RETRY_ATTEMPTS: Final[int] = 6
+_UPSERT_RETRY_BASE_SECONDS: Final[float] = 0.2
+_UPSERT_RETRY_MAX_SECONDS: Final[float] = 3.0
 
 
 class DatabaseHandler:
@@ -88,17 +111,32 @@ class DatabaseHandler:
             class_=AsyncSession,
         )
 
+        # PRAGMAs are per-*connection* SQLite session state, not database-file
+        # settings (journal_mode is the one exception - it sticks to the file).
+        # Running them once via engine.begin() only reaches the single
+        # connection that call happens to check out; every other connection
+        # the pool opens later (inevitable under concurrent writers, e.g. a
+        # multi-symbol bootstrap) would silently fall back to aiosqlite's own
+        # defaults - notably busy_timeout=5000, half of what most deployments
+        # configure, which turns ordinary write contention into "database is
+        # locked" errors instead of a bounded wait. A ``connect`` event applies
+        # them to every connection the pool ever opens.
+        busy_timeout_ms: int = self._settings.db.busy_timeout_ms
+        journal_mode: str = self._settings.db.journal_mode
+
+        @event.listens_for(self._engine.sync_engine, "connect")
+        def _apply_sqlite_pragmas(dbapi_connection: Any, connection_record: Any) -> None:
+            cursor = dbapi_connection.cursor()
+            try:
+                cursor.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+                cursor.execute("PRAGMA synchronous=NORMAL")
+                cursor.execute("PRAGMA foreign_keys=ON")
+                cursor.execute(f"PRAGMA journal_mode={journal_mode}")
+            finally:
+                cursor.close()
+
         try:
             async with self._engine.begin() as connection:
-                # WAL lets the web panel read while the trading loop writes.
-                await connection.exec_driver_sql(
-                    f"PRAGMA journal_mode={self._settings.db.journal_mode};"
-                )
-                await connection.exec_driver_sql("PRAGMA synchronous=NORMAL;")
-                await connection.exec_driver_sql("PRAGMA foreign_keys=ON;")
-                await connection.exec_driver_sql(
-                    f"PRAGMA busy_timeout={self._settings.db.busy_timeout_ms};"
-                )
                 await connection.run_sync(Base.metadata.create_all)
         except SQLAlchemyError as error:
             raise DatabaseError("failed to initialise the database", reason=str(error)) from error
@@ -138,6 +176,16 @@ class DatabaseHandler:
     async def upsert_candles(self, candles: Sequence[OHLCVCandle]) -> int:
         """Bulk-upsert validated candles.
 
+        Chunked at ``_OHLCV_UPSERT_CHUNK_ROWS`` rows per statement: a single
+        ``INSERT ... VALUES (...), (...), ...`` inlines every row's bind
+        parameters, and a large bootstrap batch (thousands of candles, 8
+        columns each) can exceed SQLite's per-statement variable limit.  Each
+        chunk also commits in its own short transaction and is retried a few
+        times on ``OperationalError`` ("database is locked"): a multi-symbol
+        bootstrap runs several of these concurrently, and SQLite only allows
+        one writer at a time, so one chunk losing that race is expected and
+        should not fail the whole symbol.
+
         Returns:
             The number of rows submitted (SQLite does not report affected rows
             reliably for multi-row upserts).
@@ -159,24 +207,44 @@ class DatabaseHandler:
             for candle in candles
         ]
 
-        statement = sqlite_insert(OHLCVRow).values(payload)
-        statement = statement.on_conflict_do_update(
-            index_elements=[OHLCVRow.symbol, OHLCVRow.timeframe, OHLCVRow.timestamp],
-            set_={
-                "open": statement.excluded.open,
-                "high": statement.excluded.high,
-                "low": statement.excluded.low,
-                "close": statement.excluded.close,
-                "volume": statement.excluded.volume,
-            },
-        )
+        async def _write_chunk(chunk: list[dict[str, Any]]) -> None:
+            async def _attempt() -> None:
+                async with self._factory()() as session:
+                    async with session.begin():
+                        statement = sqlite_insert(OHLCVRow).values(chunk)
+                        statement = statement.on_conflict_do_update(
+                            index_elements=[
+                                OHLCVRow.symbol, OHLCVRow.timeframe, OHLCVRow.timestamp
+                            ],
+                            set_={
+                                "open": statement.excluded.open,
+                                "high": statement.excluded.high,
+                                "low": statement.excluded.low,
+                                "close": statement.excluded.close,
+                                "volume": statement.excluded.volume,
+                            },
+                        )
+                        await session.execute(statement)
+
+            await async_retry(
+                _attempt,
+                attempts=_UPSERT_RETRY_ATTEMPTS,
+                base_seconds=_UPSERT_RETRY_BASE_SECONDS,
+                max_seconds=_UPSERT_RETRY_MAX_SECONDS,
+                retry_on=(OperationalError,),
+                on_error=lambda attempt, error, delay: _LOGGER.debug(
+                    "Candle upsert chunk contended (attempt %d): %s - retrying in %.2fs",
+                    attempt + 1, error, delay,
+                ),
+            )
 
         try:
-            async with self._factory()() as session:
-                async with session.begin():
-                    await session.execute(statement)
+            for chunk_start in range(0, len(payload), _OHLCV_UPSERT_CHUNK_ROWS):
+                await _write_chunk(payload[chunk_start : chunk_start + _OHLCV_UPSERT_CHUNK_ROWS])
         except SQLAlchemyError as error:
-            raise DatabaseError("candle upsert failed", rows=len(payload)) from error
+            raise DatabaseError(
+                "candle upsert failed", rows=len(payload), reason=str(error)
+            ) from error
         return len(payload)
 
     async def upsert_order_book(self, snapshot: OrderBookSnapshot) -> None:
@@ -248,14 +316,20 @@ class DatabaseHandler:
         limit: int | None = None,
         start_ms: int | None = None,
         end_ms: int | None = None,
+        timeframe: str | None = None,
     ) -> pd.DataFrame:
         """Load candles as a UTC-indexed OHLCV frame ready for Module B.
 
         The ``limit`` is applied to a *descending* query and the result is
         re-sorted ascending, so "the most recent N candles" is an index seek
         rather than a table scan.
+
+        Args:
+            timeframe: Defaults to the configured trading timeframe (``"5m"``).
+                Pass e.g. ``"1m"`` to read the labeler's cached intra-candle
+                refinement data instead.
         """
-        timeframe: str = self._settings.data.timeframe
+        timeframe = timeframe if timeframe is not None else self._settings.data.timeframe
         query: Select[Any] = select(
             OHLCVRow.timestamp,
             OHLCVRow.open,
