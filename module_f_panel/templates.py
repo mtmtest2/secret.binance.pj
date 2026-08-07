@@ -4,6 +4,12 @@ The panel is deliberately a single dependency-free bundle: Tailwind arrives from
 a CDN, but a compact inline stylesheet keeps the page fully legible when the VPS
 has no outbound internet access.  No build step, no static-file directory, no
 node_modules - just ``uvicorn`` on ``IP:8000``.
+
+Every template below is a **raw** string.  The bodies are mostly JavaScript, and
+JS escapes have to reach the browser intact: in a normal Python string ``\\'``
+collapses to ``'`` and ``\\n`` becomes a real newline, either of which truncates
+the surrounding JS literal and takes the whole page down with a SyntaxError.
+Keep the ``r`` prefix when adding a template.
 """
 
 from __future__ import annotations
@@ -12,7 +18,7 @@ from typing import Final
 
 _BASE: Final[
     str
-] = """
+] = r"""
 <!DOCTYPE html>
 <html lang="en" class="dark">
 <head>
@@ -69,7 +75,7 @@ _BASE: Final[
 
 _DASHBOARD_CONTENT: Final[
     str
-] = """
+] = r"""
 <section id="setup-panel" class="card" style="display:none;">
   <div class="flex items-center justify-between flex-wrap gap-2">
     <div class="font-bold">SYSTEM SETUP</div>
@@ -172,7 +178,7 @@ _DASHBOARD_CONTENT: Final[
 
 _DASHBOARD_SCRIPTS: Final[
     str
-] = """
+] = r"""
 <script>
 const GUARD_COLOR = {GREEN:'#34d399', YELLOW:'#fbbf24', RED:'#f87171'};
 
@@ -348,7 +354,7 @@ async function refresh() {
   try {
     const logs = await (await fetch('/api/logs?limit=120')).json();
     document.getElementById('logs').textContent =
-      (logs.rows || []).map(l => l.timestamp + '  ' + l.level.padEnd(8) + ' ' + l.message).join('\\n');
+      (logs.rows || []).map(l => l.timestamp + '  ' + l.level.padEnd(8) + ' ' + l.message).join('\n');
   } catch (err) { /* logs are non-critical */ }
 }
 
@@ -359,7 +365,7 @@ setInterval(refresh, 5000);
 
 _AUDIT_CONTENT: Final[
     str
-] = """
+] = r"""
 <section class="card">
   <div class="flex items-center justify-between flex-wrap gap-3 mb-3">
     <div class="font-bold">AUDIT TRAIL &mdash; every decision, including NO_TRADE</div>
@@ -391,7 +397,7 @@ _AUDIT_CONTENT: Final[
 
 _AUDIT_SCRIPTS: Final[
     str
-] = """
+] = r"""
 <script>
 function row(cells) { return '<tr>' + cells.map(c => '<td>' + c + '</td>').join('') + '</tr>'; }
 
@@ -428,7 +434,7 @@ setInterval(loadAudit, 15000);
 
 _UNIVERSE_CONTENT: Final[
     str
-] = """
+] = r"""
 <section class="card">
   <div class="flex items-center justify-between flex-wrap gap-3">
     <div>
@@ -479,7 +485,7 @@ _UNIVERSE_CONTENT: Final[
 
 _UNIVERSE_SCRIPTS: Final[
     str
-] = """
+] = r"""
 <script>
 let ROWS = [];
 let SELECTED = new Set();
@@ -665,7 +671,7 @@ loadUniverse(false);
 
 _TRADES_CONTENT: Final[
     str
-] = """
+] = r"""
 <section class="card">
   <div class="font-bold mb-3">TRADE HISTORY</div>
   <div class="scroll"><table>
@@ -680,7 +686,7 @@ _TRADES_CONTENT: Final[
 
 _TRADES_SCRIPTS: Final[
     str
-] = """
+] = r"""
 <script>
 function row(cells) { return '<tr>' + cells.map(c => '<td>' + c + '</td>').join('') + '</tr>'; }
 
