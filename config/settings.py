@@ -369,8 +369,6 @@ class Settings(BaseSettings):
 
     app_name: str = Field(default="ai-quant-binance-futures")
     trading_mode: TradingMode = Field(default="paper")
-    trading_enabled: bool = Field(default=True)
-
     #: One-run automation.  `python main.py` collects data and trains by itself;
     #: trading is left OFF so the operator arms it deliberately from the panel.
     auto_setup_on_start: bool = Field(
