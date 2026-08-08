@@ -94,8 +94,8 @@ class DataSettings(BaseModel):
     timeframe: Literal["5m"] = Field(default="5m")
     timeframe_ms: int = Field(default=5 * 60 * 1_000)
 
-    ohlcv_limit: int = Field(default=500, ge=50, le=1_500)
-    history_bootstrap_candles: int = Field(default=6_000, ge=500)
+    ohlcv_limit: int = Field(default=1_500, ge=50, le=1_500)
+    history_bootstrap_candles: int = Field(default=105_120, ge=500)
     orderbook_depth: int = Field(default=20, ge=5, le=100)
     orderbook_levels_for_imbalance: int = Field(default=10, ge=1, le=100)
 
@@ -125,7 +125,7 @@ class UniverseSettings(BaseModel):
     #: Bid/ask spread ceiling in basis points, measured at discovery time.
     max_spread_bps: float = Field(default=6.0, gt=0.0)
     #: Days since listing.  Below this there is not enough 5m history to train.
-    min_history_days: int = Field(default=90, ge=1)
+    min_history_days: int = Field(default=365, ge=1)
 
     #: Account size the small-capital screens are calibrated against.
     reference_equity: float = Field(default=1_000.0, gt=0.0)
