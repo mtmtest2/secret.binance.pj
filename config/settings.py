@@ -137,9 +137,9 @@ class DataSettings(BaseModel):
     timeframe_ms: int = Field(default=5 * 60 * 1_000)
 
     ohlcv_limit: int = Field(default=500, ge=50, le=1_500)
-    #: 52_560 x 5m ~= 183 days (~6 months) - the training set the model heads
-    #: and the universe's 6-month history requirement are calibrated against.
-    history_bootstrap_candles: int = Field(default=52_560, ge=500)
+    #: 105_120 x 5m ~= 365 days (1 year) - the training set the model heads
+    #: and the universe's 1-year history requirement are calibrated against.
+    history_bootstrap_candles: int = Field(default=105_120, ge=500)
     orderbook_depth: int = Field(default=20, ge=5, le=100)
     orderbook_levels_for_imbalance: int = Field(default=10, ge=1, le=100)
 
@@ -164,18 +164,19 @@ class UniverseSettings(BaseModel):
     target_count: int = Field(default=30, ge=1, le=200)
     quote_currency: str = Field(default="USDT")
 
-    #: 24 h quote volume floor - the primary liquidity screen.  Relaxed from the
-    #: original 50M so mid-cap perpetuals are not screened out before the
-    #: history requirement below even gets a chance to look at them.
-    min_quote_volume_24h: float = Field(default=20_000_000.0, ge=0.0)
+    #: 24 h quote volume floor - the primary liquidity screen.  Relaxed further
+    #: (from 20M) to offset the stricter 1-year history requirement below and
+    #: keep enough eligible pairs for training.
+    min_quote_volume_24h: float = Field(default=10_000_000.0, ge=0.0)
     #: Bid/ask spread ceiling in basis points, measured at discovery time.
-    #: Relaxed from 6 bps - still tight enough to protect a 5m round trip.
-    max_spread_bps: float = Field(default=10.0, gt=0.0)
+    #: Relaxed from 10 bps for the same reason - still tight enough to protect
+    #: a 5m round trip.
+    max_spread_bps: float = Field(default=15.0, gt=0.0)
     #: Days since listing.  This is a hard floor, not a relaxable screen: the
-    #: 6-month (~180 day) training/labeling pipeline needs that much history to
+    #: 1-year (~365 day) training/labeling pipeline needs that much history to
     #: produce a usable model, so a coin listed more recently is never eligible
     #: regardless of how liquid or tight-spread it is.
-    min_history_days: int = Field(default=180, ge=1)
+    min_history_days: int = Field(default=365, ge=1)
 
     #: Account size the small-capital screens are calibrated against.
     reference_equity: float = Field(default=1_000.0, gt=0.0)
@@ -249,10 +250,17 @@ class FeatureSettings(BaseModel):
 class LabelSettings(BaseModel):
     """Forward-looking, risk-tiered label generation (Module B)."""
 
-    tp_atr_multiple: float = Field(default=2.0, gt=0.0)
-    sl_atr_multiple: float = Field(default=1.0, gt=0.0)
+    #: Raised from 2.0 - a 2:1 R/R on the 5m timeframe was frequently stopped
+    #: out by noise, producing too many NO_TRADE_OR_FAIL labels. Widened
+    #: alongside sl_atr_multiple below so both barriers sit further from
+    #: price, giving trades room to breathe rather than just raising the bar.
+    tp_atr_multiple: float = Field(default=2.5, gt=0.0)
+    #: Raised from 1.0 to 1.4 to balance the wider take-profit above (still a
+    #: ~1.79:1 R/R) - keeping SL at 1.0 would have made stop-outs from noise
+    #: worse, not better, since the trade takes longer to reach a farther TP.
+    sl_atr_multiple: float = Field(default=1.4, gt=0.0)
     #: Raised from 48 (4h) - a wider horizon lets slower-moving setups resolve
-    #: instead of expiring unclassified, and the 6-month dataset comfortably
+    #: instead of expiring unclassified, and the 1-year dataset comfortably
     #: supports it.
     max_holding_bars: int = Field(default=288, ge=2)  # 288 * 5m == 24 h
 
@@ -286,9 +294,12 @@ class MLSettings(BaseModel):
     booster: Literal["lightgbm", "xgboost"] = Field(default="lightgbm")
     random_state: int = Field(default=42)
 
-    n_estimators: int = Field(default=400, ge=10)
-    learning_rate: float = Field(default=0.05, gt=0.0, le=1.0)
-    max_depth: int = Field(default=6, ge=1, le=32)
+    #: Raised from 400/0.05/6 - the 1-year dataset holds far more complex
+    #: patterns than the previous 6-month window, so the boosters get more,
+    #: shallower-learning-rate rounds and extra tree depth to capture them.
+    n_estimators: int = Field(default=1_000, ge=10)
+    learning_rate: float = Field(default=0.02, gt=0.0, le=1.0)
+    max_depth: int = Field(default=8, ge=1, le=32)
     num_leaves: int = Field(default=63, ge=2)
     subsample: float = Field(default=0.85, gt=0.0, le=1.0)
     colsample_bytree: float = Field(default=0.85, gt=0.0, le=1.0)
