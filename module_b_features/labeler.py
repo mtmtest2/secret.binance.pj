@@ -31,16 +31,19 @@ touch.  Three conservative modelling choices keep the labels honest:
    barrier price; only expired trades mark to the horizon close.
 3. **Heat is measured, not ignored.**  The maximum adverse excursion (MAE) along
    the path is recorded and expressed as a fraction of the stop distance.  A
-   winner that spent the trade sitting at 90 % of its stop is *not* the same
-   trade as one that never went offside, and the risk tier says so.
+   winner whose path spent most of its time near the stop (and/or fired during
+   an extreme-volatility regime) only worked because the market was violent,
+   not because of a real edge, so it is folded back into ``NO_TRADE_OR_FAIL``
+   (see ``discard_very_high_risk`` on :class:`~config.settings.LabelSettings`)
+   instead of being counted as a win.
 
-Risk tiering
-------------
-The tier combines path risk (MAE ratio) with the volatility regime at entry
-(rolling GARCH percentile).  Extreme volatility escalates the tier by one step
-and caps it at ``VERY_HIGH``, which - by configuration - is folded into
-``NO_TRADE_OR_FAIL``: a trade that only worked because the market was violent is
-not an edge worth learning.
+Output classes
+---------------
+The Direction model is deliberately kept to three classes - ``LONG_SUCCESS``,
+``SHORT_SUCCESS`` and ``NO_TRADE_OR_FAIL`` - rather than further split by path
+risk.  MAE ratio and the volatility regime still gate *whether* a trade counts
+as a win at all (see above); they no longer produce a separate LOW/HIGH_RISK
+label for the model to learn.
 """
 
 from __future__ import annotations
@@ -69,23 +72,16 @@ IntrabarLookup = Mapping[int, Sequence[SubCandle]]
 
 
 class LabelClass(str, Enum):
-    """The multi-class target consumed by the Market Direction model."""
+    """The 3-class target consumed by the Market Direction model.
 
-    LONG_SUCCESS_LOW_RISK = "LONG_SUCCESS_LOW_RISK"
-    LONG_SUCCESS_HIGH_RISK = "LONG_SUCCESS_HIGH_RISK"
-    SHORT_SUCCESS_LOW_RISK = "SHORT_SUCCESS_LOW_RISK"
-    SHORT_SUCCESS_HIGH_RISK = "SHORT_SUCCESS_HIGH_RISK"
+    Deliberately kept flat - no LOW/HIGH_RISK split - so the model learns a
+    single, undiluted notion of "this setup worked" per direction instead of
+    four overlapping success classes.
+    """
+
+    LONG_SUCCESS = "LONG_SUCCESS"
+    SHORT_SUCCESS = "SHORT_SUCCESS"
     NO_TRADE_OR_FAIL = "NO_TRADE_OR_FAIL"
-
-
-class RiskTier(str, Enum):
-    """Path-risk classification of a simulated trade."""
-
-    LOW = "LOW"
-    MEDIUM = "MEDIUM"
-    HIGH = "HIGH"
-    VERY_HIGH = "VERY_HIGH"
-    NONE = "NONE"
 
 
 class TradeOutcome(str, Enum):
@@ -99,29 +95,16 @@ class TradeOutcome(str, Enum):
 
 #: Stable class ordering shared by the labeler and the Direction model.
 LABEL_ORDER: Final[tuple[str, ...]] = (
-    LabelClass.LONG_SUCCESS_LOW_RISK.value,
-    LabelClass.LONG_SUCCESS_HIGH_RISK.value,
-    LabelClass.SHORT_SUCCESS_LOW_RISK.value,
-    LabelClass.SHORT_SUCCESS_HIGH_RISK.value,
+    LabelClass.LONG_SUCCESS.value,
+    LabelClass.SHORT_SUCCESS.value,
     LabelClass.NO_TRADE_OR_FAIL.value,
 )
 
 LABEL_TO_INDEX: Final[dict[str, int]] = {name: index for index, name in enumerate(LABEL_ORDER)}
 
 #: Which labels represent a tradeable long / short opportunity.
-LONG_LABELS: Final[frozenset[str]] = frozenset(
-    {LabelClass.LONG_SUCCESS_LOW_RISK.value, LabelClass.LONG_SUCCESS_HIGH_RISK.value}
-)
-SHORT_LABELS: Final[frozenset[str]] = frozenset(
-    {LabelClass.SHORT_SUCCESS_LOW_RISK.value, LabelClass.SHORT_SUCCESS_HIGH_RISK.value}
-)
-
-_TIER_ORDER: Final[tuple[str, ...]] = (
-    RiskTier.LOW.value,
-    RiskTier.MEDIUM.value,
-    RiskTier.HIGH.value,
-    RiskTier.VERY_HIGH.value,
-)
+LONG_LABELS: Final[frozenset[str]] = frozenset({LabelClass.LONG_SUCCESS.value})
+SHORT_LABELS: Final[frozenset[str]] = frozenset({LabelClass.SHORT_SUCCESS.value})
 
 
 class _SideSimulation:
@@ -194,9 +177,8 @@ class TradeLabeler:
             A copy of ``frame`` with the following columns added:
 
             ============================  ==========================================
-            ``label``                     Multi-class target (Direction model)
+            ``label``                     3-class target (Direction model)
             ``label_index``               Integer encoding of ``label``
-            ``risk_tier``                 ``LOW`` / ``MEDIUM`` / ``HIGH`` / ``VERY_HIGH``
             ``entry_quality``             Binary target for the Entry model
             ``target_tp_pct``             Regression target for the Exit model
             ``target_sl_pct``             Regression target for the Exit model
@@ -272,13 +254,12 @@ class TradeLabeler:
             ambiguous_timestamps = sorted(needed)
 
         volatility_percentile: np.ndarray = self._volatility_percentile(frame)
-        labels, tiers, chosen_side = self._classify(long_side, short_side, volatility_percentile)
+        labels, chosen_side = self._classify(long_side, short_side, volatility_percentile)
 
         result["label"] = labels
         result["label_index"] = [LABEL_TO_INDEX.get(name, LABEL_TO_INDEX[
             LabelClass.NO_TRADE_OR_FAIL.value
         ]) for name in labels]
-        result["risk_tier"] = tiers
         result["label_is_valid"] = long_side.outcome != TradeOutcome.UNRESOLVED.value
 
         result["long_outcome"] = long_side.outcome
@@ -293,7 +274,7 @@ class TradeLabeler:
         result["short_bars_to_exit"] = short_side.bars_to_exit
 
         result = self._attach_model_targets(
-            result, long_side, short_side, chosen_side, tiers, volatility_percentile
+            result, long_side, short_side, chosen_side, volatility_percentile
         )
 
         distribution: dict[str, int] = (
@@ -633,8 +614,8 @@ class TradeLabeler:
         long_side: _SideSimulation,
         short_side: _SideSimulation,
         volatility_percentile: np.ndarray,
-    ) -> tuple[list[str], list[str], np.ndarray]:
-        """Fuse both simulated sides into a single label and risk tier.
+    ) -> tuple[list[str], np.ndarray]:
+        """Fuse both simulated sides into a single 3-class label.
 
         Selection rules, applied in order:
 
@@ -642,13 +623,14 @@ class TradeLabeler:
         2. If both sides qualify (a whipsaw that ran both ways inside the
            horizon), the side that resolved *first* wins; ties are broken by the
            lower MAE ratio, i.e. the less painful path.
-        3. The winner's tier is derived from its MAE ratio, then escalated by the
-           volatility regime.  A ``VERY_HIGH`` tier collapses to
-           ``NO_TRADE_OR_FAIL`` when ``discard_very_high_risk`` is set.
+        3. A winner is discarded back to ``NO_TRADE_OR_FAIL`` when its path heat
+           and the entry volatility regime mark it as very-high-risk (see
+           :meth:`_is_very_high_risk`) - a trade that only worked because the
+           market was violent is not an edge worth learning, but this no longer
+           produces a separate output class.
         """
         rows: int = long_side.outcome.size
         labels: list[str] = []
-        tiers: list[str] = []
         chosen: np.ndarray = np.zeros(rows, dtype=np.int8)  # +1 long, -1 short, 0 none
 
         long_win: np.ndarray = long_side.outcome == TradeOutcome.TAKE_PROFIT.value
@@ -658,7 +640,6 @@ class TradeLabeler:
         for index in range(rows):
             if unresolved[index]:
                 labels.append(LabelClass.NO_TRADE_OR_FAIL.value)
-                tiers.append(RiskTier.NONE.value)
                 continue
 
             take_long: bool = bool(long_win[index])
@@ -678,48 +659,36 @@ class TradeLabeler:
 
             if not take_long and not take_short:
                 labels.append(LabelClass.NO_TRADE_OR_FAIL.value)
-                tiers.append(RiskTier.NONE.value)
                 continue
 
             side: _SideSimulation = long_side if take_long else short_side
-            tier: str = self._risk_tier(
+            if self._config.discard_very_high_risk and self._is_very_high_risk(
                 float(side.mae_ratio[index]), float(volatility_percentile[index])
-            )
-
-            if tier == RiskTier.VERY_HIGH.value and self._config.discard_very_high_risk:
+            ):
                 labels.append(LabelClass.NO_TRADE_OR_FAIL.value)
-                tiers.append(tier)
                 continue
 
-            is_low_risk: bool = tier in (RiskTier.LOW.value, RiskTier.MEDIUM.value)
             if take_long:
-                labels.append(
-                    LabelClass.LONG_SUCCESS_LOW_RISK.value
-                    if is_low_risk
-                    else LabelClass.LONG_SUCCESS_HIGH_RISK.value
-                )
+                labels.append(LabelClass.LONG_SUCCESS.value)
                 chosen[index] = 1
             else:
-                labels.append(
-                    LabelClass.SHORT_SUCCESS_LOW_RISK.value
-                    if is_low_risk
-                    else LabelClass.SHORT_SUCCESS_HIGH_RISK.value
-                )
+                labels.append(LabelClass.SHORT_SUCCESS.value)
                 chosen[index] = -1
-            tiers.append(tier)
 
-        return labels, tiers, chosen
+        return labels, chosen
 
-    def _risk_tier(self, mae_ratio: float, volatility_percentile: float) -> str:
-        """Map path heat plus the entry volatility regime onto a risk tier.
+    def _is_very_high_risk(self, mae_ratio: float, volatility_percentile: float) -> bool:
+        """Whether path heat plus the entry volatility regime make a win too risky to trust.
 
         ``mae_ratio`` is the maximum adverse excursion expressed as a fraction of
         the stop distance: 0.0 means the trade never went offside, 1.0 means it
-        touched the stop.  Volatility escalates the tier because the same heat is
-        far more dangerous when the next candle can be three times as large.
+        touched the stop.  Volatility escalates the assessment because the same
+        heat is far more dangerous when the next candle can be three times as
+        large.  This mirrors the old 4-tier (LOW/MEDIUM/HIGH/VERY_HIGH) escalation
+        logic, collapsed to the single boolean the 3-class label needs.
         """
         if not np.isfinite(mae_ratio):
-            return RiskTier.VERY_HIGH.value
+            return True
 
         config: LabelSettings = self._config
         if mae_ratio <= config.low_risk_mae_ratio:
@@ -736,7 +705,7 @@ class TradeLabeler:
         elif volatility_percentile >= config.high_volatility_percentile:
             base = min(3, base + 1)
 
-        return _TIER_ORDER[base]
+        return base == 3
 
     # ------------------------------------------------------------------
     # Per-model targets
@@ -747,7 +716,6 @@ class TradeLabeler:
         long_side: _SideSimulation,
         short_side: _SideSimulation,
         chosen_side: np.ndarray,
-        tiers: list[str],
         volatility_percentile: np.ndarray,
     ) -> pd.DataFrame:
         """Derive the Entry, Exit and Risk model targets from the chosen side.
@@ -798,5 +766,4 @@ class TradeLabeler:
         frame["target_risk_score"] = risk_score
         frame["selected_side"] = chosen_side
         frame["selected_mae_ratio"] = mae_ratio
-        frame["risk_tier"] = tiers
         return frame

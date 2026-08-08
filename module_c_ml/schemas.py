@@ -122,19 +122,6 @@ class DirectionPrediction(BaseModel):
         """Edge of the winning direction over the opposing one."""
         return abs(self.long_probability - self.short_probability)
 
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def implied_risk_tier(self) -> str:
-        """Risk tier implied by the highest-probability *specific* class."""
-        if not self.probabilities:
-            return "UNKNOWN"
-        top_class: str = max(self.probabilities, key=lambda key: self.probabilities[key])
-        if "LOW_RISK" in top_class:
-            return "LOW"
-        if "HIGH_RISK" in top_class:
-            return "HIGH"
-        return "NONE"
-
 
 class EntryPrediction(BaseModel):
     """Model 2 output: is *this* candle close the right moment to act?"""

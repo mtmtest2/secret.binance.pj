@@ -39,6 +39,14 @@ from core.exceptions import FeatureEngineeringError, InsufficientDataError
 from core.logger import get_logger
 from module_b_features import indicators as ind
 
+# hmmlearn emits this warning whenever a trailing refit window happens to
+# starve one regime of transitions - expected and harmless at the default,
+# deliberately reactive `hmm_window` (1000 bars). Silenced here rather than
+# by widening the window, which would trade away the 5m model's responsiveness.
+warnings.filterwarnings(
+    "ignore", message="Some rows of transmat_ have zero sum.*", category=RuntimeWarning, module="hmmlearn"
+)
+
 _LOGGER = get_logger(__name__)
 
 _EPSILON: Final[float] = 1e-12

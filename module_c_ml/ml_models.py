@@ -225,7 +225,7 @@ class BaseModelHead(ABC):
             min_child_samples=config.min_child_samples,
             objective="multiclass" if num_class > 2 else "binary",
             num_class=num_class if num_class > 2 else 1,
-            class_weight="balanced",
+            class_weight=config.class_weight,
             random_state=config.random_state,
             n_jobs=self._n_jobs(),
             verbose=-1,
@@ -354,9 +354,10 @@ class BaseModelHead(ABC):
 class DirectionModel(BaseModelHead):
     """Model 1 - multi-class market direction.
 
-    Predicts the probability distribution over the five label classes produced by
-    :class:`~module_b_features.labeler.TradeLabeler`, which the schema then
-    aggregates into LONG / SHORT / NO_TRADE mass.
+    Predicts the probability distribution over the three label classes produced
+    by :class:`~module_b_features.labeler.TradeLabeler`
+    (``LONG_SUCCESS`` / ``SHORT_SUCCESS`` / ``NO_TRADE_OR_FAIL``), which the
+    schema then aggregates into LONG / SHORT / NO_TRADE mass.
     """
 
     name = "direction_model"
@@ -478,10 +479,8 @@ class DirectionModel(BaseModelHead):
 
         return DirectionPrediction(
             probabilities={
-                LabelClass.LONG_SUCCESS_LOW_RISK.value: long_mass * 0.6,
-                LabelClass.LONG_SUCCESS_HIGH_RISK.value: long_mass * 0.4,
-                LabelClass.SHORT_SUCCESS_LOW_RISK.value: short_mass * 0.6,
-                LabelClass.SHORT_SUCCESS_HIGH_RISK.value: short_mass * 0.4,
+                LabelClass.LONG_SUCCESS.value: long_mass,
+                LabelClass.SHORT_SUCCESS.value: short_mass,
                 LabelClass.NO_TRADE_OR_FAIL.value: max(1e-6, 1.0 - long_mass - short_mass),
             },
             source=ModelSource.HEURISTIC,
@@ -818,14 +817,12 @@ class RiskModel(BaseModelHead):
         self,
         features: pd.DataFrame,
         direction_confidence: float,
-        risk_tier: str = "UNKNOWN",
     ) -> RiskAllocation:
         """Size the trade, or abort it.
 
         Args:
             features: One feature row.
             direction_confidence: Winning probability mass from Model 1.
-            risk_tier: Tier implied by the direction model's top class.
 
         Returns:
             A :class:`RiskAllocation`; ``leverage == 0`` means "do not trade".
@@ -850,7 +847,6 @@ class RiskModel(BaseModelHead):
                 leverage=0,
                 capital_allocation_pct=0.0,
                 risk_score=score,
-                risk_tier=risk_tier,
                 abort_reason=(
                     f"volatility percentile {volatility_rank:.2f} >= "
                     f"{decision.max_volatility_percentile:.2f}"
@@ -862,7 +858,6 @@ class RiskModel(BaseModelHead):
                 leverage=0,
                 capital_allocation_pct=0.0,
                 risk_score=score,
-                risk_tier=risk_tier,
                 abort_reason=(
                     f"direction confidence {direction_confidence:.3f} < "
                     f"{decision.min_direction_confidence:.3f}"
@@ -878,9 +873,8 @@ class RiskModel(BaseModelHead):
             (direction_confidence - decision.min_direction_confidence) / confidence_span, 0.0, 1.0
         )
         volatility_factor: float = 1.0 - clamp(volatility_rank, 0.0, 1.0) ** 2
-        tier_factor: float = {"LOW": 1.0, "MEDIUM": 0.75, "HIGH": 0.5}.get(risk_tier, 0.6)
 
-        composite: float = score * (0.35 + 0.65 * confidence_factor) * volatility_factor * tier_factor
+        composite: float = score * (0.35 + 0.65 * confidence_factor) * volatility_factor
         leverage_cap: int = min(decision.max_leverage, risk.max_leverage)
         leverage: int = int(np.floor(composite * leverage_cap))
 
@@ -889,7 +883,6 @@ class RiskModel(BaseModelHead):
                 leverage=0,
                 capital_allocation_pct=0.0,
                 risk_score=score,
-                risk_tier=risk_tier,
                 abort_reason=(
                     f"sized leverage {leverage}x below the minimum "
                     f"{decision.min_leverage}x (composite={composite:.3f})"
@@ -910,7 +903,6 @@ class RiskModel(BaseModelHead):
             leverage=leverage,
             capital_allocation_pct=allocation,
             risk_score=score,
-            risk_tier=risk_tier,
             abort_reason="",
             source=source,
         )
@@ -1020,7 +1012,6 @@ class MLSubsystem:
         risk: RiskAllocation = self.risk.predict(
             features,
             direction_confidence=direction.confidence,
-            risk_tier=direction.implied_risk_tier,
         )
 
         return ModelInferenceResult(

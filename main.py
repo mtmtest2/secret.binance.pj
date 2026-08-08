@@ -40,10 +40,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import signal
 import sys
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Final, Sequence
 
 import uvicorn
@@ -215,6 +217,7 @@ class TradingSystem:
                 "Model artifacts missing (%s) - they will be trained during setup",
                 ", ".join(name for name, ok in loaded.items() if not ok),
             )
+        self._load_training_metrics()
 
         self.active_symbols = await self.universe.get_selection()
         self.risk_guard.register_halt_callback(self.engine.emergency_flatten)
@@ -385,15 +388,45 @@ class TradingSystem:
             raise QuantSystemError(f"model training failed for: {', '.join(failed)}")
 
         self.progress.training_summary = {
+            "trained_at": utc_now().isoformat(timespec="seconds"),
+            "symbols": symbols,
             "rows": len(dataset),
             "distribution": dataset.class_distribution(),
             "metrics": report,
         }
+        self._save_training_metrics(self.progress.training_summary)
         await self.database.set_state(
             "trained_universe",
             {"symbols": symbols, "trained_ms": utc_now_ms(), "rows": len(dataset)},
         )
         _LOGGER.info("Training complete: %s", report)
+
+    def _training_metrics_path(self) -> Path:
+        """Where the latest training-metrics summary is persisted for the panel."""
+        return self.settings.ml.model_dir.parent / "metrics.json"
+
+    def _save_training_metrics(self, summary: dict[str, Any]) -> None:
+        """Persist the latest training summary to ``artifacts/metrics.json``.
+
+        The Web Dashboard already reads ``self.progress.training_summary`` for
+        the live process, but that state is lost on restart; writing it here
+        too means a panel opened right after a restart - before the next
+        retrain - still shows the last real training run instead of nothing.
+        """
+        try:
+            self._training_metrics_path().write_text(json.dumps(summary, indent=2, default=str))
+        except OSError as error:
+            _LOGGER.warning("Could not write training metrics artifact: %s", error)
+
+    def _load_training_metrics(self) -> None:
+        """Restore the last training-metrics summary, if one was ever saved."""
+        path: Path = self._training_metrics_path()
+        if not path.exists():
+            return
+        try:
+            self.progress.training_summary = json.loads(path.read_text())
+        except (OSError, ValueError) as error:
+            _LOGGER.warning("Could not read training metrics artifact: %s", error)
 
     async def _trained_universe(self) -> list[str]:
         """Universe the current artifacts were trained on (empty when unknown)."""
@@ -883,6 +916,10 @@ class TradingSystem:
         """Re-run collection and (optionally forced) training."""
         started: bool = self.launch_setup(force_retrain=force_retrain)
         return {"started": started, "phase": self.phase.value, "force_retrain": force_retrain}
+
+    async def training_metrics(self) -> dict[str, Any]:
+        """The most recent training run's per-head metrics, for the dashboard card."""
+        return dict(self.progress.training_summary)
 
     # --- Trading control ----------------------------------------------
     async def set_trading_enabled(self, enabled: bool) -> dict[str, Any]:

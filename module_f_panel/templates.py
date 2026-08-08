@@ -162,6 +162,18 @@ _DASHBOARD_CONTENT: Final[
 </section>
 
 <section class="card">
+  <div class="flex items-center justify-between flex-wrap gap-2">
+    <div class="font-bold">LATEST TRAINING METRICS</div>
+    <div id="training-meta" class="muted text-xs"></div>
+  </div>
+  <div id="training-metrics-empty" class="muted text-xs mt-2">No training run recorded yet.</div>
+  <div class="scroll mt-2"><table id="training-metrics-table" style="display:none;">
+    <thead><tr><th>Model</th><th>Metric</th><th>Value</th></tr></thead>
+    <tbody id="training-metrics-rows"></tbody>
+  </table></div>
+</section>
+
+<section class="card">
   <div class="font-bold mb-2">LATEST DECISIONS</div>
   <div class="scroll"><table>
     <thead><tr><th>Time</th><th>Symbol</th><th>Verdict</th><th>Rule</th>
@@ -356,6 +368,52 @@ async function refresh() {
     document.getElementById('logs').textContent =
       (logs.rows || []).map(l => l.timestamp + '  ' + l.level.padEnd(8) + ' ' + l.message).join('\n');
   } catch (err) { /* logs are non-critical */ }
+
+  try {
+    const summary = await (await fetch('/api/training/metrics')).json();
+    renderTrainingMetrics(summary);
+  } catch (err) { /* training metrics are non-critical */ }
+}
+
+function renderTrainingMetrics(summary) {
+  summary = summary || {};
+  const metrics = summary.metrics || {};
+  const heads = Object.keys(metrics);
+  const table = document.getElementById('training-metrics-table');
+  const empty = document.getElementById('training-metrics-empty');
+  const meta = document.getElementById('training-meta');
+
+  if (!heads.length) {
+    table.style.display = 'none';
+    empty.style.display = 'block';
+    meta.textContent = '';
+    return;
+  }
+
+  table.style.display = '';
+  empty.style.display = 'none';
+  const distribution = summary.distribution ? JSON.stringify(summary.distribution) : '';
+  meta.textContent =
+    (summary.rows || 0) + ' rows' +
+    (summary.trained_at ? ' | trained ' + summary.trained_at : '') +
+    (distribution ? ' | ' + distribution : '');
+
+  const rows = [];
+  heads.forEach(head => {
+    const headMetrics = metrics[head] || {};
+    const keys = Object.keys(headMetrics);
+    if (!keys.length) {
+      rows.push(row(['<b>' + head.toUpperCase() + '</b>', '<span class="muted">-</span>', '-']));
+      return;
+    }
+    keys.forEach((key, idx) => {
+      const value = headMetrics[key];
+      const display = typeof value === 'number' ? fmt(value, 4) : String(value);
+      const label = key === 'error' ? '<span class="neg">' + key + '</span>' : key;
+      rows.push(row([idx === 0 ? '<b>' + head.toUpperCase() + '</b>' : '', label, display]));
+    });
+  });
+  document.getElementById('training-metrics-rows').innerHTML = rows.join('');
 }
 
 refresh();

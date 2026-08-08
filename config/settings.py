@@ -264,10 +264,10 @@ class LabelSettings(BaseModel):
     #: ~1.79:1 R/R) - keeping SL at 1.0 would have made stop-outs from noise
     #: worse, not better, since the trade takes longer to reach a farther TP.
     sl_atr_multiple: float = Field(default=1.4, gt=0.0)
-    #: Raised from 48 (4h) - a wider horizon lets slower-moving setups resolve
-    #: instead of expiring unclassified, and the 1-year dataset comfortably
-    #: supports it.
-    max_holding_bars: int = Field(default=288, ge=2)  # 288 * 5m == 24 h
+    #: Lowered from 288 (24h) back to 48 (4h) - the model should only learn
+    #: explosive, immediate momentum setups on the 5m timeframe rather than
+    #: slow-moving trades that take most of a day to resolve.
+    max_holding_bars: int = Field(default=48, ge=2)  # 48 * 5m == 4 h
 
     #: When a single execution candle's high touches the take-profit level
     #: *and* its low touches the stop-loss level, raw 5m OHLC alone cannot say
@@ -314,13 +314,23 @@ class MLSettings(BaseModel):
     #: Purged, time-ordered validation split (fraction held out at the tail).
     validation_fraction: float = Field(default=0.2, gt=0.0, lt=0.9)
     #: Bars removed between train and validation blocks to kill label leakage.
-    #: Must stay >= labels.max_holding_bars (288): every label looks that far
-    #: forward, so purging less than the horizon leaks future information
-    #: across the split. Raised from 60 to track the wider labeling window.
+    #: Must stay >= labels.max_holding_bars (now 48, see LabelSettings): every
+    #: label looks that far forward, so purging less than the horizon leaks
+    #: future information across the split. Left at 300 (comfortably above the
+    #: 4h horizon) rather than shrunk in lockstep, since over-purging merely
+    #: costs a bit of training data rather than risking leakage.
     purge_bars: int = Field(default=300, ge=0)
     early_stopping_rounds: int = Field(default=50, ge=0)
 
     inference_workers: int = Field(default=2, ge=1, le=16)
+
+    #: LightGBM/XGBoost class-weighting strategy for the multi-class Direction
+    #: model. ``None`` lets the booster learn the classes' natural prior
+    #: instead of artificially up-weighting the rare LONG/SHORT_SUCCESS rows -
+    #: on mostly-noise 5m crypto data, "balanced" weighting was pushing the
+    #: model to call a trade far too often. Set to ``"balanced"`` to restore
+    #: the old behaviour.
+    class_weight: str | None = Field(default=None)
 
 
 class DecisionSettings(BaseModel):
@@ -349,7 +359,6 @@ class DecisionSettings(BaseModel):
     #: Rolling GARCH volatility percentile above which trading is suspended.
     max_volatility_percentile: float = Field(default=0.97, gt=0.0, le=1.0)
 
-    accepted_risk_tiers: tuple[str, ...] = Field(default=("LOW", "MEDIUM", "HIGH"))
     blocked_hmm_regimes: tuple[int, ...] = Field(default=())
 
     max_concurrent_positions: int = Field(default=5, ge=1, le=50)

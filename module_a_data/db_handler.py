@@ -8,6 +8,21 @@ Design notes
   CONFLICT DO UPDATE`` so re-running a cycle (or replaying a healed block) can
   never create duplicates - the ``(symbol, timeframe, timestamp)`` uniqueness
   constraint is the source of truth.
+* **Single-writer queue.**  SQLite allows exactly one writer at a time.  A
+  multi-symbol bootstrap fetches and validates many symbols concurrently
+  (bounded by ``exchange.max_concurrent_requests``), and letting each of those
+  coroutines open its own write transaction meant they all raced for the same
+  file lock - a storm of ``OperationalError`` ("database is locked") that
+  retries eventually rode out, at the cost of a serious bootstrap slowdown.
+  Market-data writes (:meth:`upsert_candles`, :meth:`upsert_order_book`,
+  :meth:`upsert_futures_metrics`) no longer touch the database directly: they
+  build their UPSERT statement and hand it to an internal ``asyncio.Queue``,
+  awaiting a future that resolves once the write actually lands.  A single
+  dedicated background task (:meth:`_writer_loop`) drains that queue and is
+  the *only* coroutine that ever opens a write transaction, so lock contention
+  between this process's own writers is eliminated by construction rather than
+  merely retried.  :meth:`close` drains the queue before disposing of the
+  engine, so a shutdown never drops a pending write.
 * **Read path optimised for Module B.**  :meth:`load_ohlcv_dataframe` returns a
   ``DatetimeIndex``-ed frame straight from SQL with a ``LIMIT`` applied on the
   *descending* ordering, so pulling "the last 3000 candles" never scans the
@@ -16,12 +31,14 @@ Design notes
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from types import TracebackType
 from typing import Any, Final, Sequence
 
 import pandas as pd
-from sqlalchemy import Select, delete, desc, event, func, select
+from sqlalchemy import ClauseElement, Select, delete, desc, event, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Result
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
@@ -70,16 +87,22 @@ _SQLITE_MAX_VARIABLES: Final[int] = 30_000
 _OHLCV_COLUMNS_PER_ROW: Final[int] = 8  # symbol, timeframe, timestamp, o/h/l/c, volume
 _OHLCV_UPSERT_CHUNK_ROWS: Final[int] = _SQLITE_MAX_VARIABLES // _OHLCV_COLUMNS_PER_ROW
 
-#: SQLite allows exactly one writer at a time; a multi-symbol bootstrap can
-#: have several coroutines (bounded by ``exchange.max_concurrent_requests``)
-#: each trying to write thousands of rows around the same moment. Each chunk
-#: therefore commits in its own short transaction (below) rather than one
-#: transaction spanning the whole symbol, so no single writer can monopolise
-#: the write lock for long - and a chunk that still loses the race to another
-#: writer is retried a few times instead of failing the whole symbol.
+#: Retry budget for one write-queue job. With a single dedicated writer this
+#: is defence-in-depth rather than the primary fix - it now only has to cover
+#: transient contention from outside this process (a WAL checkpoint racing an
+#: external reader), not this process's own writers competing with each other.
 _UPSERT_RETRY_ATTEMPTS: Final[int] = 6
 _UPSERT_RETRY_BASE_SECONDS: Final[float] = 0.2
 _UPSERT_RETRY_MAX_SECONDS: Final[float] = 3.0
+
+
+@dataclass(slots=True)
+class _WriteJob:
+    """One pending bulk UPSERT, queued for the single background writer."""
+
+    statement: ClauseElement
+    future: "asyncio.Future[None]"
+    description: str = field(default="write")
 
 
 class DatabaseHandler:
@@ -89,6 +112,9 @@ class DatabaseHandler:
         self._settings: Settings = settings
         self._engine: AsyncEngine | None = None
         self._session_factory: async_sessionmaker[AsyncSession] | None = None
+        #: Single-writer queue for market-data UPSERTs - see the module docstring.
+        self._write_queue: asyncio.Queue[_WriteJob] = asyncio.Queue()
+        self._writer_task: asyncio.Task[None] | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -141,16 +167,35 @@ class DatabaseHandler:
         except SQLAlchemyError as error:
             raise DatabaseError("failed to initialise the database", reason=str(error)) from error
 
+        self._writer_task = asyncio.create_task(self._writer_loop(), name="db-write-queue")
         _LOGGER.info("Database ready at %s", self._settings.db.path)
 
     async def close(self) -> None:
-        """Dispose of the engine and its connection pool."""
+        """Drain the write queue, stop the writer, then dispose of the engine.
+
+        Waiting on :meth:`asyncio.Queue.join` before cancelling the writer task
+        guarantees every write that was ever accepted (including the last one
+        submitted right before shutdown) is committed before the connection
+        pool goes away - a bootstrap or cycle that queued writes and then hit
+        Ctrl-C must not silently lose the tail of them.
+        """
         if self._engine is None:
             return
+        if self._writer_task is not None:
+            await self._write_queue.join()
+            self._writer_task.cancel()
+            try:
+                await self._writer_task
+            except asyncio.CancelledError:
+                pass
+            self._writer_task = None
         await self._engine.dispose()
         self._engine = None
         self._session_factory = None
         _LOGGER.info("Database connections closed")
+
+    # Alias: some callers prefer the more explicit verb for a queue drain.
+    stop = close
 
     async def __aenter__(self) -> "DatabaseHandler":
         await self.initialize()
@@ -171,20 +216,84 @@ class DatabaseHandler:
         return self._session_factory
 
     # ------------------------------------------------------------------
+    # Single-writer queue
+    # ------------------------------------------------------------------
+    async def _enqueue_write(self, statement: ClauseElement, description: str) -> "asyncio.Future[None]":
+        """Hand a bulk UPSERT statement to the dedicated background writer.
+
+        Returns a future that resolves once the write has actually been
+        committed (or raises whatever the writer raised), so callers keep the
+        same error-handling contract as a direct ``session.execute`` even
+        though the SQL now runs on :meth:`_writer_loop` instead of the
+        caller's own coroutine.
+        """
+        if self._writer_task is None:
+            raise DatabaseError("DatabaseHandler.initialize() has not been awaited")
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        await self._write_queue.put(_WriteJob(statement=statement, future=future, description=description))
+        return future
+
+    async def _writer_loop(self) -> None:
+        """The single coroutine allowed to open a write transaction.
+
+        Runs for the handler's whole lifetime, pulling one job at a time off
+        the queue and executing its bulk UPSERT.  Because this is the only
+        writer, jobs never compete with each other for SQLite's file lock -
+        the "database is locked" storm a concurrent bootstrap used to produce
+        simply cannot happen between this process's own writes any more.
+        """
+        while True:
+            job: _WriteJob = await self._write_queue.get()
+            try:
+                await self._execute_write_job(job)
+                if not job.future.done():
+                    job.future.set_result(None)
+            except Exception as error:  # noqa: BLE001 - propagated to the awaiting caller
+                if not job.future.done():
+                    job.future.set_exception(error)
+                else:
+                    _LOGGER.error("Write-queue job '%s' failed after its future was resolved: %s", job.description, error)
+            finally:
+                self._write_queue.task_done()
+
+    async def _execute_write_job(self, job: _WriteJob) -> None:
+        """Execute one queued statement in its own short transaction, with retry.
+
+        The retry here now only has to absorb contention from *outside* this
+        process (another tool reading the file mid-checkpoint, for instance) -
+        with a single writer, every job this process itself enqueues is
+        already fully serialised.
+        """
+
+        async def _attempt() -> None:
+            async with self._factory()() as session:
+                async with session.begin():
+                    await session.execute(job.statement)
+
+        await async_retry(
+            _attempt,
+            attempts=_UPSERT_RETRY_ATTEMPTS,
+            base_seconds=_UPSERT_RETRY_BASE_SECONDS,
+            max_seconds=_UPSERT_RETRY_MAX_SECONDS,
+            retry_on=(OperationalError,),
+            on_error=lambda attempt, error, delay: _LOGGER.debug(
+                "Write-queue job '%s' contended (attempt %d): %s - retrying in %.2fs",
+                job.description, attempt + 1, error, delay,
+            ),
+        )
+
+    # ------------------------------------------------------------------
     # Market-data writes
     # ------------------------------------------------------------------
     async def upsert_candles(self, candles: Sequence[OHLCVCandle]) -> int:
-        """Bulk-upsert validated candles.
+        """Bulk-upsert validated candles via the single-writer queue.
 
         Chunked at ``_OHLCV_UPSERT_CHUNK_ROWS`` rows per statement: a single
         ``INSERT ... VALUES (...), (...), ...`` inlines every row's bind
         parameters, and a large bootstrap batch (thousands of candles, 8
-        columns each) can exceed SQLite's per-statement variable limit.  Each
-        chunk also commits in its own short transaction and is retried a few
-        times on ``OperationalError`` ("database is locked"): a multi-symbol
-        bootstrap runs several of these concurrently, and SQLite only allows
-        one writer at a time, so one chunk losing that race is expected and
-        should not fail the whole symbol.
+        columns each) can exceed SQLite's per-statement variable limit. Each
+        chunk becomes one queued bulk-UPSERT job; this call returns once every
+        chunk it submitted has actually been committed by the writer.
 
         Returns:
             The number of rows submitted (SQLite does not report affected rows
@@ -207,40 +316,24 @@ class DatabaseHandler:
             for candle in candles
         ]
 
-        async def _write_chunk(chunk: list[dict[str, Any]]) -> None:
-            async def _attempt() -> None:
-                async with self._factory()() as session:
-                    async with session.begin():
-                        statement = sqlite_insert(OHLCVRow).values(chunk)
-                        statement = statement.on_conflict_do_update(
-                            index_elements=[
-                                OHLCVRow.symbol, OHLCVRow.timeframe, OHLCVRow.timestamp
-                            ],
-                            set_={
-                                "open": statement.excluded.open,
-                                "high": statement.excluded.high,
-                                "low": statement.excluded.low,
-                                "close": statement.excluded.close,
-                                "volume": statement.excluded.volume,
-                            },
-                        )
-                        await session.execute(statement)
-
-            await async_retry(
-                _attempt,
-                attempts=_UPSERT_RETRY_ATTEMPTS,
-                base_seconds=_UPSERT_RETRY_BASE_SECONDS,
-                max_seconds=_UPSERT_RETRY_MAX_SECONDS,
-                retry_on=(OperationalError,),
-                on_error=lambda attempt, error, delay: _LOGGER.debug(
-                    "Candle upsert chunk contended (attempt %d): %s - retrying in %.2fs",
-                    attempt + 1, error, delay,
-                ),
+        futures: list[asyncio.Future[None]] = []
+        for chunk_start in range(0, len(payload), _OHLCV_UPSERT_CHUNK_ROWS):
+            chunk: list[dict[str, Any]] = payload[chunk_start : chunk_start + _OHLCV_UPSERT_CHUNK_ROWS]
+            statement = sqlite_insert(OHLCVRow).values(chunk)
+            statement = statement.on_conflict_do_update(
+                index_elements=[OHLCVRow.symbol, OHLCVRow.timeframe, OHLCVRow.timestamp],
+                set_={
+                    "open": statement.excluded.open,
+                    "high": statement.excluded.high,
+                    "low": statement.excluded.low,
+                    "close": statement.excluded.close,
+                    "volume": statement.excluded.volume,
+                },
             )
+            futures.append(await self._enqueue_write(statement, description=f"upsert_candles[{len(chunk)}]"))
 
         try:
-            for chunk_start in range(0, len(payload), _OHLCV_UPSERT_CHUNK_ROWS):
-                await _write_chunk(payload[chunk_start : chunk_start + _OHLCV_UPSERT_CHUNK_ROWS])
+            await asyncio.gather(*futures)
         except SQLAlchemyError as error:
             raise DatabaseError(
                 "candle upsert failed", rows=len(payload), reason=str(error)
@@ -268,9 +361,8 @@ class DatabaseHandler:
             set_={key: statement.excluded[key] for key in values if key not in ("symbol", "timestamp")},
         )
         try:
-            async with self._factory()() as session:
-                async with session.begin():
-                    await session.execute(statement)
+            future = await self._enqueue_write(statement, description=f"upsert_order_book[{snapshot.symbol}]")
+            await future
         except SQLAlchemyError as error:
             raise DatabaseError("order book upsert failed", symbol=snapshot.symbol) from error
 
@@ -301,9 +393,8 @@ class DatabaseHandler:
             },
         )
         try:
-            async with self._factory()() as session:
-                async with session.begin():
-                    await session.execute(statement)
+            future = await self._enqueue_write(statement, description=f"upsert_futures_metrics[{metrics.symbol}]")
+            await future
         except SQLAlchemyError as error:
             raise DatabaseError("futures metrics upsert failed", symbol=metrics.symbol) from error
 

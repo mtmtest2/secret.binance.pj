@@ -67,6 +67,9 @@ class SystemController(Protocol):
     async def start_setup(self, force_retrain: bool) -> dict[str, Any]:
         """Re-run collection and training."""
 
+    async def training_metrics(self) -> dict[str, Any]:
+        """The most recent training run's per-head metrics."""
+
     async def start_trading(self, mode: str) -> dict[str, Any]:
         """Arm paper or live trading."""
 
@@ -307,6 +310,12 @@ def build_app(controller: SystemController) -> FastAPI:
         authorise(request, payload)
         force: bool = bool(payload.get("force_retrain", False))
         return JSONResponse(await controller.start_setup(force))
+
+    @app.get("/api/training/metrics", summary="Latest training-run metrics")
+    async def api_training_metrics() -> JSONResponse:
+        """Per-head validation metrics (accuracy, precision, MAE, R2, ...) from
+        the most recent training run, so they survive past the terminal log."""
+        return JSONResponse(await controller.training_metrics())
 
     # ------------------------------------------------------------------
     # Control API

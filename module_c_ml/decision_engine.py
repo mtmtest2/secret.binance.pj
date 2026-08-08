@@ -16,14 +16,13 @@ Rule cascade
 ``R4``    Entry model says "now" rather than "wait".
 ``R5``    Exit geometry is sane and clears the reward/risk floor.
 ``R6``    Risk model returned non-zero leverage.
-``R7``    Risk tier is on the accepted list.
 ``R8``    Regime is not on the blocked list.
 ``R9``    Model provenance is acceptable for the current trading mode.
 ========  ==========================================================
 
-Only when all ten pass is a :class:`TradeSignal` constructed - and even then the
-Pydantic validator re-checks the barrier geometry before it can leave this
-module.
+Only when every rule passes is a :class:`TradeSignal` constructed - and even
+then the Pydantic validator re-checks the barrier geometry before it can leave
+this module.
 """
 
 from __future__ import annotations
@@ -64,7 +63,6 @@ class Rule:
     ENTRY_REJECTED: Final[str] = "R4_ENTRY_MODEL_SAYS_WAIT"
     REWARD_RISK: Final[str] = "R5_REWARD_RISK_BELOW_FLOOR"
     RISK_ABORT: Final[str] = "R6_RISK_MODEL_ABORT"
-    RISK_TIER: Final[str] = "R7_RISK_TIER_NOT_ACCEPTED"
     REGIME_BLOCKED: Final[str] = "R8_REGIME_BLOCKED"
     UNTRAINED_MODELS: Final[str] = "R9_UNTRAINED_MODELS_IN_LIVE_MODE"
     SIGNAL_INVALID: Final[str] = "R10_SIGNAL_CONSTRUCTION_FAILED"
@@ -265,23 +263,6 @@ class DecisionEngine:
                 checks,
             )
 
-        # --- R7: risk tier ----------------------------------------------------
-        tier: str = risk.risk_tier or direction.implied_risk_tier
-        tier_accepted: bool = tier in self._config.accepted_risk_tiers
-        self._record(
-            checks,
-            Rule.RISK_TIER,
-            tier_accepted,
-            f"tier={tier} accepted={list(self._config.accepted_risk_tiers)}",
-        )
-        if not tier_accepted:
-            return self._reject(
-                inference,
-                Rule.RISK_TIER,
-                f"Rejected: risk tier {tier} is not in the accepted set",
-                checks,
-            )
-
         # --- R8: regime block-list --------------------------------------------
         regime: int = int(inference.feature_snapshot.get("hmm_regime", -1))
         regime_blocked: bool = regime in self._config.blocked_hmm_regimes
@@ -320,7 +301,7 @@ class DecisionEngine:
 
         # --- Signal construction -------------------------------------------------
         signal: TradeSignal | None = self._build_signal(
-            inference, action, exit_params, risk, state, directional_confidence, tier
+            inference, action, exit_params, risk, state, directional_confidence, risk.risk_tier
         )
         if signal is None:
             return self._reject(
@@ -332,7 +313,7 @@ class DecisionEngine:
 
         self._record(checks, Rule.EXECUTE, True, f"signal={signal.decision_id}")
         _LOGGER.info(
-            "EXECUTE %s %s @ %.6f | %dx | TP %.4f SL %.4f | conf %.1f%% | tier %s",
+            "EXECUTE %s %s @ %.6f | %dx | TP %.4f SL %.4f | conf %.1f%%",
             action.value,
             inference.symbol,
             signal.reference_price,
@@ -340,7 +321,6 @@ class DecisionEngine:
             signal.take_profit,
             signal.stop_loss,
             directional_confidence * 100.0,
-            tier,
         )
         return DecisionResult(
             decision_id=signal.decision_id,
@@ -349,7 +329,7 @@ class DecisionEngine:
             rule_triggered=Rule.EXECUTE,
             reason=(
                 f"Trade Executed: {action.value} at {directional_confidence:.1%} confidence, "
-                f"{signal.leverage}x leverage, R:R {signal.reward_risk_ratio:.2f}, tier {tier}"
+                f"{signal.leverage}x leverage, R:R {signal.reward_risk_ratio:.2f}"
             ),
             signal=signal,
             inference=inference,
