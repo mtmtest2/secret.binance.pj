@@ -196,7 +196,7 @@ function killSwitch() {
 
 function startTrading(mode) {
   const warn = mode === 'live'
-    ? 'START LIVE TRADING WITH REAL FUNDS?\n\nAny open paper positions will be closed first.'
+    ? 'START LIVE TRADING WITH REAL FUNDS?\\n\\nAny open paper positions will be closed first.'
     : 'Start paper trading with the virtual balance?';
   if (confirm(warn)) { post('/api/trading/start', {mode: mode}); }
 }
@@ -506,7 +506,7 @@ function renderRows() {
         (r.reasons || []).join('; ').slice(0, 70) + '</span>';
     const chg = (r.price_change_pct_24h >= 0 ? 'pos' : 'neg');
     return '<tr>' +
-      '<td><input type="checkbox" ' + checked + ' onchange="toggle(\'' + r.symbol + '\', this.checked)"/></td>' +
+      '<td><input type="checkbox" ' + checked + ' onchange="toggle(\\'' + r.symbol + '\\', this.checked)"/></td>' +
       '<td><b>' + r.symbol + '</b></td>' +
       '<td>' + fmt(r.price, 6) + '</td>' +
       '<td>' + money(r.quote_volume_24h) + '</td>' +
@@ -546,7 +546,7 @@ async function saveUniverse() {
   if (SELECTED.size === 0) {
     el.textContent = 'Select at least one pair first.'; el.className = 'neg text-xs mt-2'; return;
   }
-  if (!confirm('Save ' + SELECTED.size + ' pair(s)?\n\nData collection and model training will start now. Any armed trading will be stopped first.')) return;
+  if (!confirm('Save ' + SELECTED.size + ' pair(s)?\\n\\nData collection and model training will start now. Any armed trading will be stopped first.')) return;
   el.textContent = 'saving...'; el.className = 'muted text-xs mt-2';
   const res = await fetch('/api/universe/select', {
     method: 'POST',
