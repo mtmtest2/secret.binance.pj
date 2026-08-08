@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import warnings
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, Final, Sequence
 
@@ -68,6 +69,36 @@ class HMMRegime(IntEnum):
     HIGH_VOLATILITY = 2
     SIDEWAYS = 3
     UNKNOWN = -1
+
+
+@dataclass(slots=True)
+class MarketContext:
+    """Market-wide data computed once and shared across every symbol in a batch.
+
+    Built by :class:`~module_b_features.processor.DatasetProcessor` (which has
+    database access; this module deliberately does not) and threaded into
+    :meth:`FeatureEngineer.build` so the cross-market and cross-sectional
+    feature blocks below are not each recomputing the same universe-wide
+    statistics once per symbol.
+
+    Attributes:
+        reference_ohlcv: ``{symbol: OHLCV frame}`` for
+            ``features.reference_symbols`` (BTC/ETH by default) - source for
+            the beta/correlation/relative-strength block.
+        cross_sectional_mean_return / cross_sectional_std_return /
+            cross_sectional_symbol_count: Timestamp-indexed ``Series`` giving
+            the universe's per-bar 1-bar log-return mean, std and symbol
+            count, used to z-score each symbol's own move against its peers
+            at the same instant. All-or-nothing per timestamp: wherever the
+            count is missing or below
+            ``features.cross_sectional_min_symbols``, the z-score feature
+            degrades to neutral (0.0) rather than amplifying a thin sample.
+    """
+
+    reference_ohlcv: dict[str, pd.DataFrame] = field(default_factory=dict)
+    cross_sectional_mean_return: pd.Series | None = None
+    cross_sectional_std_return: pd.Series | None = None
+    cross_sectional_symbol_count: pd.Series | None = None
 
 
 #: Ordered list of columns the ML subsystem consumes.  Order is part of the
@@ -134,6 +165,38 @@ FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     "hour_cos",
     "dow_sin",
     "dow_cos",
+    # --- cross-market (BTC/ETH relative) -------------------------------------
+    # Named after `features.reference_symbols[0]` / `[1]`, BTC/ETH by default -
+    # see `_add_reference_features`. A large share of any altcoin's 5m variance
+    # is just the market-wide move; without these the model only ever sees the
+    # symbol in isolation.
+    "btc_log_return_1",
+    "btc_log_return_12",
+    "btc_relative_strength_12",
+    "btc_beta",
+    "btc_corr",
+    "eth_log_return_1",
+    "eth_log_return_12",
+    "eth_relative_strength_12",
+    "eth_beta",
+    "eth_corr",
+    # --- cross-sectional universe context ------------------------------------
+    "xs_return_zscore",
+    # --- multi-timeframe context (resampled from the already-loaded 5m
+    # series - see `_add_multi_timeframe_features`) --------------------------
+    "mtf_fast_return",
+    "mtf_fast_range_pct",
+    "mtf_fast_trend",
+    "mtf_medium_return",
+    "mtf_medium_range_pct",
+    "mtf_medium_trend",
+    "mtf_slow_return",
+    "mtf_slow_range_pct",
+    "mtf_slow_trend",
+    # --- order-flow persistence ------------------------------------------------
+    "taker_flow_cumulative_12",
+    "taker_flow_cumulative_48",
+    "liquidation_imbalance_cumulative_12",
 )
 
 
@@ -160,6 +223,8 @@ class FeatureEngineer:
                 self._config.rank_window,
                 self._config.fdi_window,
                 self._config.kama_slow,
+                self._config.reference_beta_window,
+                max(self._config.mtf_bar_multiples, default=0) * 2,
                 48,
             )
             + 10
@@ -170,6 +235,8 @@ class FeatureEngineer:
         ohlcv: pd.DataFrame,
         futures: pd.DataFrame | None = None,
         order_book: pd.DataFrame | None = None,
+        market_context: MarketContext | None = None,
+        symbol: str | None = None,
     ) -> pd.DataFrame:
         """Compute every engineered feature for one symbol.
 
@@ -181,6 +248,13 @@ class FeatureEngineer:
                 a ``timestamp`` column.  Joined backward-asof.
             order_book: Optional order-book snapshot history with a ``timestamp``
                 column.  Joined backward-asof.
+            market_context: Optional shared :class:`MarketContext` (BTC/ETH
+                reference OHLCV plus cross-sectional universe stats). Absent
+                blocks degrade to neutral values rather than failing, same as
+                a missing ``futures``/``order_book`` feed.
+            symbol: This frame's own symbol, used only to avoid a degenerate
+                self-relative computation when ``symbol`` is itself one of
+                ``features.reference_symbols``.
 
         Returns:
             The input frame plus every column in :data:`FEATURE_COLUMNS`.  Rows
@@ -213,6 +287,9 @@ class FeatureEngineer:
             frame = self._add_hmm_features(frame)
             frame = self._add_microstructure_features(frame, futures, order_book)
             frame = self._add_session_features(frame)
+            frame = self._add_reference_features(frame, market_context, symbol)
+            frame = self._add_cross_sectional_features(frame, market_context)
+            frame = self._add_multi_timeframe_features(frame)
         except (InsufficientDataError, FeatureEngineeringError):
             raise
         except Exception as error:  # pragma: no cover - defensive catch-all
@@ -862,6 +939,20 @@ class FeatureEngineer:
         liq_total: pd.Series = (liq_buy + liq_sell).replace(0.0, np.nan)
         merged["liquidation_imbalance"] = ((liq_buy - liq_sell) / liq_total).fillna(0.0)
 
+        # --- Order-flow persistence --------------------------------------
+        # A single bar's taker/liquidation snapshot is noisy; its *rolling
+        # sum* captures sustained one-sided pressure a single-bar read
+        # misses, at two horizons (1h / 4h).
+        merged["taker_flow_cumulative_12"] = (
+            merged["taker_buy_sell_ratio"].rolling(window=12, min_periods=6).sum()
+        )
+        merged["taker_flow_cumulative_48"] = (
+            merged["taker_buy_sell_ratio"].rolling(window=48, min_periods=12).sum()
+        )
+        merged["liquidation_imbalance_cumulative_12"] = (
+            merged["liquidation_imbalance"].rolling(window=12, min_periods=6).sum()
+        )
+
         merged.index = frame.index
         return merged
 
@@ -921,6 +1012,211 @@ class FeatureEngineer:
         frame["dow_cos"] = np.cos(2.0 * np.pi * day_fraction)
         return frame
 
+    # ------------------------------------------------------------------
+    # Cross-market (BTC/ETH relative)
+    # ------------------------------------------------------------------
+    def _add_reference_features(
+        self,
+        frame: pd.DataFrame,
+        market_context: MarketContext | None,
+        symbol: str | None,
+    ) -> pd.DataFrame:
+        """BTC/ETH-relative features: lead-lag, beta, correlation, relative strength.
+
+        A large share of any altcoin's 5m variance is just the market-wide
+        move; these give the model direct access to what BTC/ETH just did
+        rather than making it re-derive that indirectly from technicals
+        computed on the symbol in isolation. Degrades to neutral (all zero)
+        per reference slot when ``market_context`` is absent or that
+        particular reference symbol's data was not available - the same
+        graceful-degradation contract as ``futures``/``order_book``.
+        """
+        config: FeatureSettings = self._config
+        window: int = config.reference_beta_window
+        own_return: pd.Series = frame["log_return_1"].fillna(0.0)
+        own_return_12: pd.Series = frame["log_return_12"]
+
+        reference_ohlcv: dict[str, pd.DataFrame] = (
+            market_context.reference_ohlcv if market_context is not None else {}
+        )
+
+        # Fixed, named slots (not one column set per configured symbol) so
+        # FEATURE_COLUMNS - the saved-model contract - never changes shape
+        # just because an operator edits `reference_symbols`.
+        for slot, prefix in enumerate(("btc", "eth")):
+            return_1_col, return_12_col = f"{prefix}_log_return_1", f"{prefix}_log_return_12"
+            relative_col, beta_col, corr_col = (
+                f"{prefix}_relative_strength_12", f"{prefix}_beta", f"{prefix}_corr"
+            )
+
+            reference_symbol: str | None = (
+                config.reference_symbols[slot] if slot < len(config.reference_symbols) else None
+            )
+            reference_frame: pd.DataFrame | None = (
+                reference_ohlcv.get(reference_symbol) if reference_symbol else None
+            )
+
+            if reference_frame is None or reference_frame.empty or reference_symbol == symbol:
+                frame[return_1_col] = 0.0
+                frame[return_12_col] = 0.0
+                frame[relative_col] = 0.0
+                frame[beta_col] = 0.0
+                frame[corr_col] = 0.0
+                continue
+
+            ref: pd.DataFrame = reference_frame[["timestamp", "close"]].copy()
+            ref["timestamp"] = ref["timestamp"].astype("int64")
+            ref = ref.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+            ref_log_close: pd.Series = np.log(ref["close"].astype(float).clip(lower=_EPSILON))
+            ref[return_1_col] = ref_log_close.diff(1)
+            ref[return_12_col] = ref_log_close.diff(12)
+            ref = ref.drop(columns=["close"])
+
+            joined: pd.DataFrame = self._asof_join(frame, ref, label=prefix)
+            ref_return_1: pd.Series = joined.get(
+                return_1_col, pd.Series(np.nan, index=frame.index)
+            ).fillna(0.0)
+            ref_return_12: pd.Series = joined.get(
+                return_12_col, pd.Series(np.nan, index=frame.index)
+            ).fillna(0.0)
+
+            frame[return_1_col] = ref_return_1
+            frame[return_12_col] = ref_return_12
+            frame[relative_col] = (own_return_12 - ref_return_12).fillna(0.0)
+
+            rolling_cov: pd.Series = own_return.rolling(window, min_periods=window // 2).cov(
+                ref_return_1
+            )
+            rolling_var: pd.Series = ref_return_1.rolling(window, min_periods=window // 2).var()
+            frame[beta_col] = (
+                (rolling_cov / rolling_var.replace(0.0, np.nan)).fillna(0.0).clip(-5.0, 5.0)
+            )
+            frame[corr_col] = (
+                own_return.rolling(window, min_periods=window // 2).corr(ref_return_1).fillna(0.0)
+            )
+
+        return frame
+
+    # ------------------------------------------------------------------
+    # Cross-sectional universe context
+    # ------------------------------------------------------------------
+    def _add_cross_sectional_features(
+        self,
+        frame: pd.DataFrame,
+        market_context: MarketContext | None,
+    ) -> pd.DataFrame:
+        """Z-score this symbol's own 1-bar return against the whole universe's.
+
+        Captures relative strength the BTC/ETH-relative block cannot: whether
+        THIS symbol moved more or less than the *entire traded universe* just
+        did, not only more/less than BTC specifically. Neutral (0.0) whenever
+        the universe snapshot in ``market_context`` is missing, empty, or too
+        thin (fewer than ``features.cross_sectional_min_symbols`` contributing
+        symbols at that bar) to be a meaningful peer distribution.
+        """
+        config: FeatureSettings = self._config
+        has_context: bool = (
+            market_context is not None
+            and market_context.cross_sectional_mean_return is not None
+            and market_context.cross_sectional_std_return is not None
+            and market_context.cross_sectional_symbol_count is not None
+            and not market_context.cross_sectional_mean_return.empty
+        )
+        if not has_context:
+            frame["xs_return_zscore"] = 0.0
+            return frame
+
+        assert market_context is not None  # narrows the Optional for the type checker
+        stats: pd.DataFrame = pd.DataFrame(
+            {
+                "timestamp": market_context.cross_sectional_mean_return.index.to_numpy(),
+                "xs_mean": market_context.cross_sectional_mean_return.to_numpy(),
+                "xs_std": market_context.cross_sectional_std_return.to_numpy(),
+                "xs_count": market_context.cross_sectional_symbol_count.to_numpy(),
+            }
+        )
+        stats["timestamp"] = stats["timestamp"].astype("int64")
+
+        joined: pd.DataFrame = self._asof_join(frame, stats, label="cross_sectional")
+        own_return: pd.Series = frame["log_return_1"].fillna(0.0)
+        xs_mean: pd.Series = joined.get("xs_mean", pd.Series(np.nan, index=frame.index))
+        xs_std: pd.Series = joined.get("xs_std", pd.Series(np.nan, index=frame.index))
+        xs_count: pd.Series = joined.get("xs_count", pd.Series(0.0, index=frame.index)).fillna(0.0)
+
+        thin: pd.Series = xs_count < config.cross_sectional_min_symbols
+        zscore: pd.Series = (own_return - xs_mean) / xs_std.replace(0.0, np.nan)
+        frame["xs_return_zscore"] = (
+            zscore.where(~thin, 0.0).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        )
+        return frame
+
+    # ------------------------------------------------------------------
+    # Multi-timeframe context
+    # ------------------------------------------------------------------
+    def _add_multi_timeframe_features(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Higher-timeframe trend/range context, resampled from the loaded 5m series.
+
+        No extra data fetch: each configured bar-multiple (default
+        ``(3, 12, 48)`` == 15m/1h/4h on a 5m base) is aggregated purely from
+        bars already in ``frame`` and merged back on with the same
+        backward-asof join used for order-book and funding snapshots (see
+        ``_asof_join``), keyed on the aggregate bar's *close* timestamp -
+        which is exactly the timestamp of its last constituent 5m bar. That
+        guarantees a still-forming higher-timeframe bar is never exposed:
+        every row within it asof-joins onto the last *fully-closed*
+        predecessor, and only the row that closes the bucket itself sees that
+        bucket's own (by then fully known) aggregate.
+        """
+        config: FeatureSettings = self._config
+        multiples: tuple[int, ...] = tuple(config.mtf_bar_multiples[:3]) or (3, 12, 48)
+        while len(multiples) < 3:
+            multiples = multiples + (multiples[-1],)
+
+        for tier, multiple in zip(("fast", "medium", "slow"), multiples):
+            return_col, range_col, trend_col = (
+                f"mtf_{tier}_return", f"mtf_{tier}_range_pct", f"mtf_{tier}_trend"
+            )
+            if multiple < 2 or len(frame) < multiple * 3:
+                frame[return_col] = 0.0
+                frame[range_col] = 0.0
+                frame[trend_col] = 0.0
+                continue
+
+            bucket: np.ndarray = np.arange(len(frame)) // multiple
+            grouped = frame.groupby(bucket)
+            bucket_size: pd.Series = grouped.size()
+            full_buckets: pd.Index = bucket_size[bucket_size == multiple].index
+
+            agg: pd.DataFrame = pd.DataFrame(
+                {
+                    "timestamp": grouped["timestamp"].last(),
+                    "open": grouped["open"].first(),
+                    "high": grouped["high"].max(),
+                    "low": grouped["low"].min(),
+                    "close": grouped["close"].last(),
+                }
+            ).loc[full_buckets]
+
+            mtf_return: pd.Series = agg["close"] / agg["open"].replace(0.0, np.nan) - 1.0
+            mtf_range: pd.Series = (agg["high"] - agg["low"]) / agg["close"].replace(0.0, np.nan)
+            mtf_trend: pd.Series = np.sign(agg["close"] - agg["open"])
+
+            aggregate: pd.DataFrame = pd.DataFrame(
+                {
+                    "timestamp": agg["timestamp"].astype("int64").to_numpy(),
+                    return_col: mtf_return.to_numpy(),
+                    range_col: mtf_range.to_numpy(),
+                    trend_col: mtf_trend.to_numpy(),
+                }
+            )
+
+            joined: pd.DataFrame = self._asof_join(frame, aggregate, label=f"mtf_{tier}")
+            frame[return_col] = joined.get(return_col, pd.Series(0.0, index=frame.index)).fillna(0.0)
+            frame[range_col] = joined.get(range_col, pd.Series(0.0, index=frame.index)).fillna(0.0)
+            frame[trend_col] = joined.get(trend_col, pd.Series(0.0, index=frame.index)).fillna(0.0)
+
+        return frame
+
 
 # ---------------------------------------------------------------------------
 # Process-pool entry point (must be module level so it can be pickled).
@@ -930,8 +1226,14 @@ def compute_features_worker(
     ohlcv_records: list[dict[str, Any]],
     futures_records: list[dict[str, Any]],
     book_records: list[dict[str, Any]],
+    market_context: MarketContext | None = None,
+    symbol: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Build features from plain records - picklable wrapper for a process pool."""
+    """Build features from plain records - picklable wrapper for a process pool.
+
+    ``market_context`` is a plain dataclass of DataFrames/Series and pickles
+    the same way the OHLCV/futures/book records already do.
+    """
     ohlcv: pd.DataFrame = pd.DataFrame.from_records(ohlcv_records)
     if ohlcv.empty:
         return []
@@ -944,7 +1246,9 @@ def compute_features_worker(
     book: pd.DataFrame | None = pd.DataFrame.from_records(book_records) if book_records else None
 
     engineer = FeatureEngineer(settings)
-    result: pd.DataFrame = engineer.build(ohlcv, futures=futures, order_book=book)
+    result: pd.DataFrame = engineer.build(
+        ohlcv, futures=futures, order_book=book, market_context=market_context, symbol=symbol
+    )
     return result.reset_index().to_dict(orient="records")
 
 
@@ -983,12 +1287,14 @@ class FeatureService:
         ohlcv: pd.DataFrame,
         futures: pd.DataFrame | None = None,
         order_book: pd.DataFrame | None = None,
+        market_context: MarketContext | None = None,
+        symbol: str | None = None,
     ) -> pd.DataFrame:
         """Compute features without blocking the caller's event loop."""
         async with self._semaphore:
             if not self._use_process_pool:
                 return await asyncio.to_thread(
-                    self._engineer.build, ohlcv, futures, order_book
+                    self._engineer.build, ohlcv, futures, order_book, market_context, symbol
                 )
 
             loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
@@ -999,6 +1305,8 @@ class FeatureService:
                 ohlcv.reset_index(drop=True).to_dict(orient="records"),
                 [] if futures is None else futures.to_dict(orient="records"),
                 [] if order_book is None else order_book.to_dict(orient="records"),
+                market_context,
+                symbol,
             )
             if not records:
                 return pd.DataFrame()
@@ -1010,10 +1318,14 @@ class FeatureService:
     async def build_many(
         self,
         payloads: Sequence[tuple[str, pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None]],
+        market_context: MarketContext | None = None,
     ) -> dict[str, pd.DataFrame]:
         """Build features for many symbols concurrently.
 
-        Symbols whose computation raises are logged and omitted from the result
+        ``market_context`` is shared across the whole batch (it is expensive
+        to build and universe-wide, not per-symbol - see
+        :class:`~module_b_features.processor.DatasetProcessor`).  Symbols
+        whose computation raises are logged and omitted from the result
         rather than failing the entire cycle.
         """
 
@@ -1024,7 +1336,7 @@ class FeatureService:
             book: pd.DataFrame | None,
         ) -> tuple[str, pd.DataFrame | None]:
             try:
-                return symbol, await self.build(ohlcv, futures, book)
+                return symbol, await self.build(ohlcv, futures, book, market_context, symbol)
             except (FeatureEngineeringError, InsufficientDataError) as error:
                 _LOGGER.error("Feature build failed for %s: %s", symbol, error)
                 return symbol, None

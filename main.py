@@ -1143,6 +1143,50 @@ class TradingSystem:
         await self.database.close()
         return report
 
+    async def command_evaluate(
+        self,
+        max_candles: int | None = None,
+        splits: int | None = None,
+    ) -> "WalkForwardReport":
+        """Walk-forward, purged out-of-sample evaluation - the honest before/after tool.
+
+        Retrains the full ML pipeline from scratch on each purged fold and
+        replays its held-out window through the real backtester, then
+        reports Sharpe/Sortino/profit-factor/expectancy/drawdown on the
+        stitched out-of-sample record. See
+        ``module_e_execution.walk_forward_eval`` for the full methodology
+        and how to A/B a settings change against this run.
+        """
+        from module_e_execution.walk_forward_eval import (
+            WalkForwardReport,
+            label_barrier_consistency_report,
+            run_walk_forward_evaluation,
+        )
+
+        await self.database.initialize()
+        symbols: list[str] = await self._resolve_cli_universe()
+        report: WalkForwardReport = await run_walk_forward_evaluation(
+            self.settings, self.database, symbols, n_splits=splits, max_candles_per_symbol=max_candles
+        )
+        print(report.summary())
+
+        if report.folds and self.ml.exit.is_loaded:
+            dataset: ProcessedDataset = await self.processor.build_training_dataset(
+                symbols=symbols, max_candles_per_symbol=max_candles
+            )
+            drift: dict[str, Any] = label_barrier_consistency_report(self.settings, self.ml, dataset)
+            if drift.get("available"):
+                print(
+                    "\nLabel-barrier vs Exit-model reward/risk check: "
+                    f"label R:R={drift['label_barrier_reward_risk']:.2f}  "
+                    f"exit-model median R:R={drift['exit_model_predicted_rr_median']:.2f}  "
+                    f"drift={drift['drift_pct']:.1%}"
+                )
+
+        await self.features.shutdown()
+        await self.database.close()
+        return report
+
     async def command_single_cycle(self) -> dict[str, Any]:
         """Run exactly one trading cycle, then exit (useful for cron/debugging)."""
         await self.startup()
@@ -1178,14 +1222,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "command",
         nargs="?",
         default="run",
-        choices=["run", "bootstrap", "train", "backtest", "cycle", "universe"],
+        choices=["run", "bootstrap", "train", "backtest", "evaluate", "cycle", "universe"],
         help="run: panel + auto setup + scheduler | universe: print the screened pairs | "
         "bootstrap: backfill | train: fit models | backtest: replay history | "
-        "cycle: one cycle then exit",
+        "evaluate: walk-forward purged out-of-sample evaluation (retrain + backtest per "
+        "fold, Sharpe/PF/drawdown on the stitched result) | cycle: one cycle then exit",
     )
     parser.add_argument("--candles", type=int, default=None, help="History depth per symbol.")
     parser.add_argument("--equity", type=float, default=None, help="Backtest starting equity.")
     parser.add_argument("--mode", choices=["paper", "live"], default=None, help="Execution mode.")
+    parser.add_argument(
+        "--splits", type=int, default=None,
+        help="evaluate: number of walk-forward folds (overrides ml.cv_folds).",
+    )
     return parser.parse_args(argv)
 
 
@@ -1209,6 +1258,9 @@ async def _async_main(arguments: argparse.Namespace) -> int:
         return 0
     if arguments.command == "backtest":
         await system.command_backtest(arguments.candles, arguments.equity)
+        return 0
+    if arguments.command == "evaluate":
+        await system.command_evaluate(arguments.candles, arguments.splits)
         return 0
     if arguments.command == "cycle":
         await system.command_single_cycle()

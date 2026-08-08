@@ -7,6 +7,7 @@ from module_b_features.features import (
     FeatureEngineer,
     FeatureService,
     HMMRegime,
+    MarketContext,
 )
 from module_b_features.labeler import LabelClass, TradeLabeler
 from module_b_features.processor import DatasetProcessor, ProcessedDataset
@@ -18,6 +19,7 @@ __all__: list[str] = [
     "FeatureService",
     "HMMRegime",
     "LabelClass",
+    "MarketContext",
     "ProcessedDataset",
     "TradeLabeler",
 ]

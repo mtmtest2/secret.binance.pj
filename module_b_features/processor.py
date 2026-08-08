@@ -26,13 +26,18 @@ from core.logger import get_logger
 from module_a_data.db_handler import DatabaseHandler
 from module_a_data.fetcher import BinanceDataFetcher
 from module_a_data.models import OHLCVCandle
-from module_b_features.features import FEATURE_COLUMNS, FeatureService
+from module_b_features.features import FEATURE_COLUMNS, FeatureService, MarketContext
 from module_b_features.labeler import LABEL_ORDER, IntrabarLookup, SubCandle, TradeLabeler
 
 _LOGGER = get_logger(__name__)
 
 #: Columns carried alongside the features for bookkeeping / backtesting.
 _META_COLUMNS: Final[tuple[str, ...]] = ("timestamp", "open", "high", "low", "close", "volume")
+
+#: Minimum training rows a purged split must leave; below this a subsampled
+#: booster's effective sample size can round to zero (see
+#: ``ProcessedDataset.train_validation_split``).
+_MIN_TRAIN_ROWS: Final[int] = 50
 
 #: Timeframe fetched for the labeler's intra-candle barrier-order refinement.
 _INTRABAR_TIMEFRAME: Final[str] = "1m"
@@ -58,6 +63,10 @@ class ProcessedDataset:
     metadata: pd.DataFrame
     symbols: tuple[str, ...] = field(default=())
     feature_columns: tuple[str, ...] = field(default=FEATURE_COLUMNS)
+    #: Per-row training weight combining label-overlap uniqueness and outcome
+    #: decisiveness (see ``TradeLabeler._sample_weights``); mean 1.0 over the
+    #: dataset. Passed to every head's ``.fit(sample_weight=...)``.
+    sample_weight: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
 
     def __len__(self) -> int:
         return len(self.features)
@@ -83,6 +92,17 @@ class ProcessedDataset:
         the training block overlap the validation block's label horizon.  Those
         rows are dropped entirely - without the purge, validation scores are
         optimistically biased by construction.
+
+        Raises:
+            ValueError: When ``purge_bars`` consumes so much of a small
+                dataset that fewer than :data:`_MIN_TRAIN_ROWS` training rows
+                would remain. A 1-row training set does not fail loudly on
+                its own - a subsampled booster can silently round its
+                effective sample size to zero and crash deep inside the
+                native library - so this is caught and reported explicitly
+                instead (a real scenario for the walk-forward evaluation
+                harness's early, still-short folds; the single full-dataset
+                training path has never had few enough rows to hit it).
         """
         rows: int = len(self.features)
         if rows == 0:
@@ -91,6 +111,11 @@ class ProcessedDataset:
         split_point: int = int(rows * (1.0 - validation_fraction))
         split_point = max(1, min(rows - 1, split_point))
         train_end: int = max(1, split_point - purge_bars)
+        if train_end < _MIN_TRAIN_ROWS:
+            raise ValueError(
+                f"purge_bars ({purge_bars}) leaves only {train_end} training row(s) "
+                f"out of {rows} - need at least {_MIN_TRAIN_ROWS}"
+            )
 
         train_index: np.ndarray = np.arange(0, train_end, dtype=np.int64)
         validation_index: np.ndarray = np.arange(split_point, rows, dtype=np.int64)
@@ -144,6 +169,7 @@ class DatasetProcessor:
         self,
         symbols: Sequence[str] | None = None,
         max_candles_per_symbol: int | None = None,
+        end_ms: int | None = None,
     ) -> ProcessedDataset:
         """Assemble a pooled, cross-sectional training dataset.
 
@@ -154,6 +180,12 @@ class DatasetProcessor:
         Args:
             symbols: Universe to include (defaults to the configured universe).
             max_candles_per_symbol: Cap on history depth per symbol.
+            end_ms: Optional hard cutoff - only candles at or before this
+                timestamp are used. Used by the walk-forward evaluation
+                harness (``module_e_execution.walk_forward_eval``) to train
+                each fold strictly on data from before its own validation
+                window, rather than the trailing "most recent N candles"
+                depth window used everywhere else.
 
         Returns:
             A :class:`ProcessedDataset` with warm-up rows and the un-simulatable
@@ -162,9 +194,16 @@ class DatasetProcessor:
         universe: list[str] = list(symbols) if symbols else list(self._settings.data.symbols)
         depth: int = max_candles_per_symbol or self._settings.data.history_bootstrap_candles
 
+        #: Built once for the whole universe - BTC/ETH reference series and the
+        #: cross-sectional return distribution are shared inputs, not something
+        #: worth recomputing (or re-fetching) once per symbol.
+        market_context: MarketContext = await self._build_market_context(universe, depth, end_ms)
+
         frames: list[pd.DataFrame] = []
         for symbol in universe:
-            frame: pd.DataFrame | None = await self._build_labeled_symbol(symbol, depth)
+            frame: pd.DataFrame | None = await self._build_labeled_symbol(
+                symbol, depth, market_context, end_ms
+            )
             if frame is not None and not frame.empty:
                 frames.append(frame)
 
@@ -184,14 +223,22 @@ class DatasetProcessor:
         )
         return dataset
 
-    async def _build_labeled_symbol(self, symbol: str, depth: int) -> pd.DataFrame | None:
+    async def _build_labeled_symbol(
+        self,
+        symbol: str,
+        depth: int,
+        market_context: MarketContext | None = None,
+        end_ms: int | None = None,
+    ) -> pd.DataFrame | None:
         """Build the feature+label frame for one symbol, or ``None`` on failure."""
         try:
-            ohlcv, futures, book = await self._load_symbol_inputs(symbol, depth)
+            ohlcv, futures, book = await self._load_symbol_inputs(symbol, depth, end_ms)
             if ohlcv.empty:
                 return None
 
-            featured: pd.DataFrame = await self._features.build(ohlcv, futures, book)
+            featured: pd.DataFrame = await self._features.build(
+                ohlcv, futures, book, market_context=market_context, symbol=symbol
+            )
             labeled: pd.DataFrame = await asyncio.to_thread(self._labeler.generate, featured)
 
             ambiguous_ts: list[int] = list(labeled.attrs.get("ambiguous_candle_timestamps", []))
@@ -350,6 +397,11 @@ class DatasetProcessor:
         ]
         exit_columns: list[str] = ["target_tp_pct", "target_sl_pct", "target_trailing_pct"]
         exit_targets: pd.DataFrame = usable[exit_columns].astype(float)
+        sample_weight: pd.Series = (
+            usable["sample_weight"].astype(float)
+            if "sample_weight" in usable.columns
+            else pd.Series(1.0, index=usable.index)
+        )
 
         return ProcessedDataset(
             features=usable[feature_columns].astype(float),
@@ -360,6 +412,7 @@ class DatasetProcessor:
             metadata=usable[metadata_columns],
             symbols=symbols,
             feature_columns=tuple(feature_columns),
+            sample_weight=sample_weight,
         )
 
     @staticmethod
@@ -374,6 +427,7 @@ class DatasetProcessor:
             ),
             risk_target=pd.Series(dtype=float),
             metadata=pd.DataFrame(),
+            sample_weight=pd.Series(dtype=float),
         )
 
     # ------------------------------------------------------------------
@@ -383,24 +437,38 @@ class DatasetProcessor:
         self,
         symbol: str,
         lookback_candles: int | None = None,
+        market_context: MarketContext | None = None,
     ) -> InferencePayload | None:
         """Produce the feature row for the most recent closed candle.
 
         No labeling is performed here - the labeler is a training-only tool and
         is never invoked on the live path.
 
+        Args:
+            symbol: Symbol to build the payload for.
+            lookback_candles: History depth override.
+            market_context: Shared BTC/ETH + cross-sectional context. When a
+                caller invokes this directly for a single symbol without one,
+                a minimal reference-only context is built on the fly (no
+                cross-sectional stats - those need the whole batch, see
+                :meth:`build_inference_payloads`).
+
         Returns:
             An :class:`InferencePayload`, or ``None`` when history is too shallow
             or every feature row is still warming up.
         """
         depth: int = lookback_candles or self._inference_depth()
+        if market_context is None:
+            market_context = await self._build_market_context([symbol], depth)
         try:
             ohlcv, futures, book = await self._load_symbol_inputs(symbol, depth)
             if ohlcv.empty:
                 _LOGGER.warning("No stored candles for %s - cannot infer", symbol)
                 return None
 
-            featured: pd.DataFrame = await self._features.build(ohlcv, futures, book)
+            featured: pd.DataFrame = await self._features.build(
+                ohlcv, futures, book, market_context=market_context, symbol=symbol
+            )
         except (InsufficientDataError, FeatureEngineeringError) as error:
             _LOGGER.warning("Inference features unavailable for %s: %s", symbol, error)
             return None
@@ -438,9 +506,19 @@ class DatasetProcessor:
         symbols: Sequence[str],
         lookback_candles: int | None = None,
     ) -> dict[str, InferencePayload]:
-        """Build inference payloads for many symbols concurrently."""
+        """Build inference payloads for many symbols concurrently.
+
+        The BTC/ETH + cross-sectional :class:`MarketContext` is built exactly
+        once for the whole batch and shared across every symbol's payload -
+        it is universe-wide data, not per-symbol.
+        """
+        depth: int = lookback_candles or self._inference_depth()
+        market_context: MarketContext = await self._build_market_context(list(symbols), depth)
         results: list[InferencePayload | None] = await asyncio.gather(
-            *(self.build_inference_payload(symbol, lookback_candles) for symbol in symbols)
+            *(
+                self.build_inference_payload(symbol, lookback_candles, market_context)
+                for symbol in symbols
+            )
         )
         return {payload.symbol: payload for payload in results if payload is not None}
 
@@ -481,43 +559,108 @@ class DatasetProcessor:
         return snapshot
 
     # ------------------------------------------------------------------
+    # Market-wide context (BTC/ETH reference + cross-sectional stats)
+    # ------------------------------------------------------------------
+    async def _build_market_context(
+        self, symbols: Sequence[str], depth: int, end_ms: int | None = None
+    ) -> MarketContext:
+        """Load BTC/ETH reference OHLCV and the universe's cross-sectional returns.
+
+        Built once per training run / per inference cycle and shared across
+        every symbol - see :class:`~module_b_features.features.MarketContext`.
+        A symbol whose own data is used to build the cross-sectional
+        distribution is not excluded from it (a leave-one-out computation
+        would be marginally more correct but, at a ~30-symbol universe, the
+        difference is negligible next to the implementation risk of getting
+        a leave-one-out formula subtly wrong).
+
+        ``end_ms``, when given, restricts every load to data at or before
+        that timestamp - see ``build_training_dataset``.
+        """
+        config = self._settings.features
+        reference_ohlcv: dict[str, pd.DataFrame] = {}
+        for reference_symbol in config.reference_symbols:
+            frame: pd.DataFrame = await self._db.load_ohlcv_dataframe(
+                reference_symbol, limit=depth, end_ms=end_ms
+            )
+            if not frame.empty:
+                reference_ohlcv[reference_symbol] = frame.reset_index(drop=True)
+
+        cross_sectional_mean: pd.Series | None = None
+        cross_sectional_std: pd.Series | None = None
+        cross_sectional_count: pd.Series | None = None
+
+        if len(symbols) >= config.cross_sectional_min_symbols:
+            returns_by_symbol: dict[str, pd.Series] = {}
+            for symbol in symbols:
+                frame = await self._db.load_ohlcv_dataframe(symbol, limit=depth, end_ms=end_ms)
+                if frame.empty:
+                    continue
+                close: pd.Series = frame["close"].astype(float)
+                log_return: pd.Series = np.log(close.clip(lower=1e-12)).diff(1)
+                returns_by_symbol[symbol] = pd.Series(
+                    log_return.to_numpy(), index=frame["timestamp"].to_numpy()
+                )
+
+            if len(returns_by_symbol) >= config.cross_sectional_min_symbols:
+                wide: pd.DataFrame = pd.DataFrame(returns_by_symbol)
+                cross_sectional_mean = wide.mean(axis=1, skipna=True)
+                cross_sectional_std = wide.std(axis=1, skipna=True)
+                cross_sectional_count = wide.count(axis=1)
+
+        return MarketContext(
+            reference_ohlcv=reference_ohlcv,
+            cross_sectional_mean_return=cross_sectional_mean,
+            cross_sectional_std_return=cross_sectional_std,
+            cross_sectional_symbol_count=cross_sectional_count,
+        )
+
+    # ------------------------------------------------------------------
     # Shared loading
     # ------------------------------------------------------------------
     async def _load_symbol_inputs(
         self,
         symbol: str,
         depth: int,
+        end_ms: int | None = None,
     ) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None]:
-        """Load OHLCV, futures metrics and order-book history for one symbol."""
-        ohlcv: pd.DataFrame = await self._db.load_ohlcv_dataframe(symbol, limit=depth)
+        """Load OHLCV, futures metrics and order-book history for one symbol.
+
+        ``end_ms``, when given, restricts every feed to the most recent
+        ``depth`` rows at or before that timestamp instead of the most recent
+        ``depth`` rows overall - see ``build_training_dataset``.
+        """
+        ohlcv: pd.DataFrame = await self._db.load_ohlcv_dataframe(symbol, limit=depth, end_ms=end_ms)
         if ohlcv.empty:
             return ohlcv, None, None
 
-        futures: pd.DataFrame = await self._db.load_futures_metrics_frame(symbol, limit=depth)
-        book: pd.DataFrame = await self._load_order_book_frame(symbol, depth)
+        futures: pd.DataFrame = await self._db.load_futures_metrics_frame(
+            symbol, limit=depth, end_ms=end_ms
+        )
+        book: pd.DataFrame = await self._load_order_book_frame(symbol, depth, end_ms)
         return (
             ohlcv,
             futures if not futures.empty else None,
             book if not book.empty else None,
         )
 
-    async def _load_order_book_frame(self, symbol: str, depth: int) -> pd.DataFrame:
+    async def _load_order_book_frame(
+        self, symbol: str, depth: int, end_ms: int | None = None
+    ) -> pd.DataFrame:
         """Load recent order-book snapshots into a timestamp-keyed frame."""
         from sqlalchemy import desc, select  # local import keeps the ORM out of the hot path
 
         from module_a_data.db_models import OrderBookRow
 
-        query = (
-            select(
-                OrderBookRow.timestamp,
-                OrderBookRow.spread_bps,
-                OrderBookRow.imbalance,
-                OrderBookRow.microprice,
-            )
-            .where(OrderBookRow.symbol == symbol)
-            .order_by(desc(OrderBookRow.timestamp))
-            .limit(depth)
-        )
+        query = select(
+            OrderBookRow.timestamp,
+            OrderBookRow.spread_bps,
+            OrderBookRow.imbalance,
+            OrderBookRow.microprice,
+        ).where(OrderBookRow.symbol == symbol)
+        if end_ms is not None:
+            query = query.where(OrderBookRow.timestamp <= end_ms)
+        query = query.order_by(desc(OrderBookRow.timestamp)).limit(depth)
         factory = self._db._factory()  # noqa: SLF001 - intentional internal reuse
         async with factory() as session:
             result = await session.execute(query)

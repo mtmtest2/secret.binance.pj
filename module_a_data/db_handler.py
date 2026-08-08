@@ -532,8 +532,15 @@ class DatabaseHandler:
             "microprice": float(row.microprice),
         }
 
-    async def load_futures_metrics_frame(self, symbol: str, limit: int = 1_000) -> pd.DataFrame:
-        """Load recent futures metrics as a timestamp-indexed frame."""
+    async def load_futures_metrics_frame(
+        self, symbol: str, limit: int = 1_000, end_ms: int | None = None
+    ) -> pd.DataFrame:
+        """Load recent futures metrics as a timestamp-indexed frame.
+
+        ``end_ms``, when given, restricts to the most recent ``limit`` rows
+        at or before that timestamp (used by the walk-forward evaluation
+        harness to train a fold strictly on its own past).
+        """
         query: Select[Any] = (
             select(
                 FuturesMetricsRow.timestamp,
@@ -545,9 +552,10 @@ class DatabaseHandler:
                 FuturesMetricsRow.liquidation_sell_volume,
             )
             .where(FuturesMetricsRow.symbol == symbol)
-            .order_by(desc(FuturesMetricsRow.timestamp))
-            .limit(limit)
         )
+        if end_ms is not None:
+            query = query.where(FuturesMetricsRow.timestamp <= end_ms)
+        query = query.order_by(desc(FuturesMetricsRow.timestamp)).limit(limit)
         async with self._factory()() as session:
             result: Result[Any] = await session.execute(query)
             rows: list[Any] = result.all()

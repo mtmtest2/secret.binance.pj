@@ -251,6 +251,29 @@ class FeatureSettings(BaseModel):
 
     max_feature_workers: int = Field(default=4, ge=1, le=32)
 
+    #: Symbols whose 5m OHLCV is loaded alongside every training/inference
+    #: symbol to compute BTC/ETH-relative features (beta, correlation,
+    #: lead-lag, relative strength). The market-wide crypto move is a large
+    #: share of any altcoin's 5m variance, so this is a first-class input
+    #: rather than something left for the model to infer from technicals
+    #: computed on the symbol in isolation.
+    reference_symbols: tuple[str, ...] = Field(default=("BTC/USDT:USDT", "ETH/USDT:USDT"))
+    #: Rolling window (bars) for the BTC/ETH beta/correlation/lead-lag features.
+    reference_beta_window: int = Field(default=96, ge=10)  # 96 * 5m == 8 h
+
+    #: Higher-timeframe context built by *resampling the already-loaded 5m
+    #: OHLCV* (no extra data fetch): each multiple is a bar count, so
+    #: ``(3, 12, 48)`` means 15m/1h/4h on a 5m base. Every aggregate bar is
+    #: asof-merged back onto the 5m grid using only bars that have already
+    #: closed (see ``_add_multi_timeframe_features``), which keeps it causal.
+    mtf_bar_multiples: tuple[int, ...] = Field(default=(3, 12, 48))
+
+    #: Minimum number of symbols required in a universe snapshot before
+    #: cross-sectional rank/z-score features are computed from it; below this
+    #: a single stray symbol could dominate the "peer" distribution, so the
+    #: features degrade to neutral instead of amplifying noise.
+    cross_sectional_min_symbols: int = Field(default=5, ge=2)
+
 
 class LabelSettings(BaseModel):
     """Forward-looking, risk-tiered label generation (Module B)."""
@@ -331,6 +354,61 @@ class MLSettings(BaseModel):
     #: model to call a trade far too often. Set to ``"balanced"`` to restore
     #: the old behaviour.
     class_weight: str | None = Field(default=None)
+    #: The Entry model's own class weighting, deliberately independent of
+    #: ``class_weight`` above. Direction should default to the natural prior
+    #: (it is the head allowed to say "quiet, no edge"); Entry is a narrower
+    #: downstream filter answering "is this *specific already-proposed* trade
+    #: a clean entry", and clean entries are a minority class it must still be
+    #: able to call - sharing one setting between both heads was silently
+    #: collapsing Entry to "always wait" (see EntryModel diagnostics).
+    entry_class_weight: str | None = Field(default="balanced")
+
+    # --- Purged walk-forward cross-validation -----------------------------
+    #: Number of purged walk-forward folds used for out-of-fold Direction
+    #: predictions (stacked into Entry/Exit/Risk), null-importance feature
+    #: pruning and the walk-forward performance report. >= 3 so each fold's
+    #: validation block samples a genuinely different market stretch.
+    cv_folds: int = Field(default=5, ge=2, le=20)
+    #: Bars purged between a fold's train and validation blocks - same role as
+    #: ``purge_bars`` above (must stay >= labels.max_holding_bars), applied
+    #: per-fold instead of once.
+    cv_purge_bars: int = Field(default=300, ge=0)
+    #: Bars *embargoed* after each validation block before the next fold's
+    #: training data resumes. Purging alone only protects the validation
+    #: block from a training label that reaches forward into it; embargo
+    #: protects the *next* fold's training data from features/labels that
+    #: still reach backward into a block that was just used for validation.
+    cv_embargo_bars: int = Field(default=300, ge=0)
+
+    # --- Ensembling, calibration, stacking, pruning ------------------------
+    #: Number of independently-seeded boosters bagged together for the
+    #: Direction and Entry heads (the two probability-estimating classifiers
+    #: benefit most from this). Predictions are averaged. ``1`` disables it.
+    ensemble_size: int = Field(default=3, ge=1, le=10)
+    #: Fit an isotonic (one-vs-rest) calibrator on purged out-of-fold
+    #: predictions after training, so ``predict_proba`` output is
+    #: decision-theoretically meaningful before the Decision Engine
+    #: thresholds it - raw GBM probabilities under class imbalance usually
+    #: are not.
+    calibrate_probabilities: bool = Field(default=True)
+    #: Feed the Direction model's out-of-fold predicted probabilities into
+    #: the Entry/Exit/Risk heads as extra input features (proper stacking:
+    #: trained on out-of-fold values, so a row's Entry/Exit/Risk features
+    #: never come from a Direction model that saw that row during training).
+    use_direction_stacking: bool = Field(default=True)
+    #: Drop features whose out-of-sample importance never clears a shuffled
+    #: noise column's importance across CV folds (null-importance pruning) -
+    #: with a weak overall signal, unpruned correlated features mostly add
+    #: variance rather than real predictive power.
+    prune_weak_features: bool = Field(default=True)
+    #: A feature must beat the noise column in at least this fraction of
+    #: folds to be kept.
+    prune_min_fold_win_rate: float = Field(default=0.6, ge=0.0, le=1.0)
+    #: Weight each training row by label-overlap uniqueness and outcome
+    #: decisiveness (see ``TradeLabeler._sample_weights``). Exposed as a
+    #: toggle mainly so a walk-forward evaluation run can A/B it against the
+    #: pre-redesign uniform-weight behaviour.
+    use_sample_weighting: bool = Field(default=True)
 
 
 class DecisionSettings(BaseModel):
@@ -345,7 +423,12 @@ class DecisionSettings(BaseModel):
     min_direction_margin: float = Field(default=0.08, ge=0.0, lt=1.0)
     #: Relaxed from 0.35 in step with the confidence threshold above.
     max_no_trade_probability: float = Field(default=0.45, gt=0.0, le=1.0)
-    #: Relaxed from 0.55.
+    #: Hard floor only. The Entry model now learns its own operating
+    #: threshold from a purged validation precision/recall sweep (stored in
+    #: its metadata as ``optimal_threshold``) and uses ``max(that, this)`` at
+    #: inference - this setting stops an operator from accidentally
+    #: configuring a floor *below* what the trained model's own calibration
+    #: supports, it no longer single-handedly sets the cutoff.
     min_entry_probability: float = Field(default=0.50, gt=0.0, lt=1.0)
 
     min_leverage: int = Field(default=1, ge=0, le=10)

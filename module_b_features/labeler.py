@@ -188,6 +188,7 @@ class TradeLabeler:
             ``long_mae_ratio`` / ``short_mae_ratio``  Path heat as a share of the stop
             ``long_pnl_pct`` / ``short_pnl_pct``       Barrier-accurate simulated PnL
             ``label_is_valid``            ``False`` for the un-simulatable tail
+            ``sample_weight``             Overlap + decisiveness training weight
             ============================  ==========================================
 
             Also sets ``result.attrs["ambiguous_candle_timestamps"]``: the sorted
@@ -260,7 +261,11 @@ class TradeLabeler:
         result["label_index"] = [LABEL_TO_INDEX.get(name, LABEL_TO_INDEX[
             LabelClass.NO_TRADE_OR_FAIL.value
         ]) for name in labels]
-        result["label_is_valid"] = long_side.outcome != TradeOutcome.UNRESOLVED.value
+        label_is_valid: np.ndarray = long_side.outcome != TradeOutcome.UNRESOLVED.value
+        result["label_is_valid"] = label_is_valid
+        result["sample_weight"] = self._sample_weights(
+            len(frame), horizon, chosen_side, long_side, short_side, label_is_valid
+        )
 
         result["long_outcome"] = long_side.outcome
         result["short_outcome"] = short_side.outcome
@@ -706,6 +711,77 @@ class TradeLabeler:
             base = min(3, base + 1)
 
         return base == 3
+
+    # ------------------------------------------------------------------
+    # Sample weighting
+    # ------------------------------------------------------------------
+    def _sample_weights(
+        self,
+        rows: int,
+        horizon: int,
+        chosen_side: np.ndarray,
+        long_side: _SideSimulation,
+        short_side: _SideSimulation,
+        label_is_valid: np.ndarray,
+    ) -> np.ndarray:
+        """Down-weight heavily-overlapping labels; up-weight decisive wins.
+
+        Two independent adjustments, multiplied together (see *Advances in
+        Financial Machine Learning*, de Prado, ch. 4 - concurrency-based
+        sample uniqueness):
+
+        1. **Uniqueness.**  Every label looks ``horizon`` bars forward, so
+           labels at adjacent timestamps share most of their look-ahead
+           window and are *not* the independent samples a boosted-tree loss
+           implicitly assumes - training on them unweighted overstates the
+           effective sample size and lets a single noisy stretch dominate the
+           gradient.  A row's weight is scaled down by the *average* number of
+           other labels' windows that were concurrently "open" over its own
+           ``[i, i + horizon)`` span - a row sitting in an isolated stretch is
+           worth more than one buried in a run of near-identical, overlapping
+           windows.
+        2. **Decisiveness.**  Among winning trades, one that never came close
+           to its stop is a cleaner statement about the setup than one that
+           barely scraped past it (the latter is closer to a coin flip that
+           happened to land right); non-winning rows are left at the
+           uniqueness weight alone.
+
+        Returns weights normalised to a mean of 1.0 over the valid rows, so
+        total gradient magnitude stays comparable to the unweighted case -
+        this changes *which* rows the model listens to, not the overall
+        learning rate.
+        """
+        # --- 1. Uniqueness: average concurrency of the fixed [i, i+horizon) window.
+        delta: np.ndarray = np.zeros(rows + horizon, dtype=np.float64)
+        delta[:rows] += 1.0
+        delta[horizon : horizon + rows] -= 1.0
+        concurrency: np.ndarray = np.cumsum(delta)[:rows]
+
+        window_sum: np.ndarray = np.concatenate([[0.0], np.cumsum(concurrency)])
+        start_index: np.ndarray = np.arange(rows)
+        end_index: np.ndarray = np.minimum(start_index + horizon, rows)
+        average_concurrency: np.ndarray = (
+            window_sum[end_index] - window_sum[start_index]
+        ) / np.maximum(end_index - start_index, 1)
+        uniqueness: np.ndarray = 1.0 / np.maximum(average_concurrency, 1.0)
+
+        # --- 2. Decisiveness: cleaner (lower-MAE) wins count for more.
+        mae_ratio: np.ndarray = np.where(
+            chosen_side == 1,
+            long_side.mae_ratio,
+            np.where(chosen_side == -1, short_side.mae_ratio, np.nan),
+        )
+        decisiveness: np.ndarray = np.where(
+            chosen_side != 0,
+            1.0 + (1.0 - np.clip(np.nan_to_num(mae_ratio, nan=1.0), 0.0, 1.0)),
+            1.0,
+        )
+
+        weight: np.ndarray = uniqueness * decisiveness
+        valid_mean: float = float(weight[label_is_valid].mean()) if np.any(label_is_valid) else 1.0
+        if valid_mean > 0.0:
+            weight = weight / valid_mean
+        return weight
 
     # ------------------------------------------------------------------
     # Per-model targets

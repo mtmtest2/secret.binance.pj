@@ -142,6 +142,8 @@ class Backtester:
         max_candles: int | None = None,
         initial_equity: float | None = None,
         warmup_bars: int | None = None,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
     ) -> BacktestReport:
         """Run a full backtest across the requested universe.
 
@@ -150,6 +152,11 @@ class Backtester:
             max_candles: History depth per symbol.
             initial_equity: Starting virtual equity.
             warmup_bars: Bars skipped at the start so slow features are warm.
+            start_ms: Optional lower timestamp bound - restricts the loaded
+                window instead of always taking the most recent
+                ``max_candles`` bars. Used by the walk-forward evaluation
+                harness to replay exactly one fold's held-out window.
+            end_ms: Optional upper timestamp bound, paired with ``start_ms``.
 
         Returns:
             A :class:`BacktestReport` with the standard quantitative metrics.
@@ -158,12 +165,12 @@ class Backtester:
         depth: int = max_candles or self._settings.data.history_bootstrap_candles
         equity: float = initial_equity or self._config.paper_starting_balance
 
-        featured: dict[str, pd.DataFrame] = await self._prepare(universe, depth)
+        featured: dict[str, pd.DataFrame] = await self._prepare(universe, depth, start_ms, end_ms)
         if not featured:
             raise InsufficientDataError("no symbol produced a usable feature frame")
 
         funding: dict[str, pd.DataFrame] = {
-            symbol: await self._db.load_futures_metrics_frame(symbol, limit=depth)
+            symbol: await self._db.load_futures_metrics_frame(symbol, limit=depth, end_ms=end_ms)
             for symbol in featured
         }
 
@@ -173,16 +180,26 @@ class Backtester:
     # ------------------------------------------------------------------
     # Data preparation
     # ------------------------------------------------------------------
-    async def _prepare(self, symbols: Sequence[str], depth: int) -> dict[str, pd.DataFrame]:
+    async def _prepare(
+        self,
+        symbols: Sequence[str],
+        depth: int,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+    ) -> dict[str, pd.DataFrame]:
         """Load candles and precompute the causal feature matrix per symbol."""
         prepared: dict[str, pd.DataFrame] = {}
         for symbol in symbols:
-            ohlcv: pd.DataFrame = await self._db.load_ohlcv_dataframe(symbol, limit=depth)
+            ohlcv: pd.DataFrame = await self._db.load_ohlcv_dataframe(
+                symbol, limit=depth, start_ms=start_ms, end_ms=end_ms
+            )
             if len(ohlcv) < 200:
                 _LOGGER.warning("Skipping %s: only %d candles stored", symbol, len(ohlcv))
                 continue
 
-            futures: pd.DataFrame = await self._db.load_futures_metrics_frame(symbol, limit=depth)
+            futures: pd.DataFrame = await self._db.load_futures_metrics_frame(
+                symbol, limit=depth, end_ms=end_ms
+            )
             try:
                 frame: pd.DataFrame = await self._features.build(
                     ohlcv, futures if not futures.empty else None, None
