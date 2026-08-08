@@ -205,10 +205,15 @@ class QCSettings(BaseModel):
 
     #: A candle whose volume exceeds ``median * this`` is flagged as an anomaly.
     volume_spike_median_multiple: float = Field(default=50.0, gt=1.0)
-    #: Robust z-score (MAD based) above which a log-return is flagged.
-    return_mad_zscore_limit: float = Field(default=14.0, gt=1.0)
-    #: Absolute per-candle return ceiling (fraction, 0.35 == 35 %).
-    max_abs_candle_return: float = Field(default=0.35, gt=0.0, le=1.0)
+    #: Robust z-score (MAD based) above which a log-return is flagged. Raised
+    #: from 14 to 30 - a 1-year window inevitably contains genuine flash
+    #: crashes/wicks that the original limit misflagged as bad data, driving
+    #: bootstrap into repeated heal-and-fail loops instead of accepting them.
+    return_mad_zscore_limit: float = Field(default=30.0, gt=1.0)
+    #: Absolute per-candle return ceiling (fraction, 0.75 == 75 %). Raised
+    #: from 0.35 for the same reason: a real 1-year crypto history includes
+    #: single-bar moves the tighter ceiling was rejecting as anomalies.
+    max_abs_candle_return: float = Field(default=0.75, gt=0.0, le=1.0)
     #: Tolerated fraction of zero-volume candles inside a fetched block.
     max_zero_volume_ratio: float = Field(default=0.25, ge=0.0, le=1.0)
     #: Maximum acceptable staleness of the newest closed candle, in bars.
