@@ -254,7 +254,9 @@ class BinanceDataFetcher:
             candle is dropped when ``data.drop_unclosed_candle`` is enabled, so
             every returned candle is guaranteed to be closed.
         """
-        _raw_count, candles = await self._fetch_ohlcv_page(symbol, limit=limit, since_ms=since_ms)
+        _raw_count, _malformed, candles = await self._fetch_ohlcv_page(
+            symbol, limit=limit, since_ms=since_ms
+        )
         return candles
 
     async def _fetch_ohlcv_page(
@@ -262,14 +264,20 @@ class BinanceDataFetcher:
         symbol: str,
         limit: int | None = None,
         since_ms: int | None = None,
-    ) -> tuple[int, list[OHLCVCandle]]:
-        """Fetch and validate one page, exposing the raw exchange row count too.
+    ) -> tuple[int, int, list[OHLCVCandle]]:
+        """Fetch and validate one page, exposing row-count detail beyond the list.
 
-        The raw count lets :meth:`fetch_ohlcv_range` tell "the exchange truly has
-        no more candles here" (``raw_count == 0``) apart from "the exchange sent
-        rows but every one failed validation" (``raw_count > 0`` and the returned
-        list is empty) - the two look identical from the validated list alone,
-        but only the first is safe to treat as the end of history.
+        Returns ``(raw_count, malformed_count, candles)``.  Three outcomes look
+        identical if you only inspect ``candles`` (it's simply empty), but they
+        mean very different things to :meth:`fetch_ohlcv_range`:
+
+        * ``raw_count == 0`` - the exchange truly has no more candles here.
+        * ``raw_count > 0``, ``malformed_count == raw_count`` - every row failed
+          structural validation; this is a genuine data problem worth retrying.
+        * ``raw_count > 0``, ``malformed_count == 0`` - every row parsed fine but
+          was filtered out as the still-forming candle (``drop_unclosed_candle``).
+          That is the live edge, not corruption - there is nothing more to fetch
+          by paging further, and it must never be mistaken for "malformed".
         """
         await self.load_markets()
         page_limit: int = limit if limit is not None else self._settings.data.ohlcv_limit
@@ -286,6 +294,7 @@ class BinanceDataFetcher:
 
         cutoff_ms: int = utc_now_ms()
         candles: list[OHLCVCandle] = []
+        malformed: int = 0
         for row in raw:
             try:
                 candle: OHLCVCandle = OHLCVCandle.from_ccxt(row, symbol, self._timeframe)
@@ -293,6 +302,7 @@ class BinanceDataFetcher:
                 # A structurally broken row is dropped here; the QC validator will
                 # observe the resulting gap and trigger a targeted heal.
                 _LOGGER.warning("Dropping malformed candle for %s: %s", symbol, error)
+                malformed += 1
                 continue
             if self._settings.data.drop_unclosed_candle:
                 if candle.timestamp + self._timeframe_ms > cutoff_ms:
@@ -300,7 +310,7 @@ class BinanceDataFetcher:
             candles.append(candle)
 
         candles.sort(key=lambda item: item.timestamp)
-        return len(raw), candles
+        return len(raw), malformed, candles
 
     async def fetch_ohlcv_range(
         self,
@@ -312,11 +322,15 @@ class BinanceDataFetcher:
         """Fetch every closed candle in ``[start_ms, end_ms]`` using pagination.
 
         Binance caps a single ``klines`` response at 1500 rows, so long ranges
-        are walked forward page by page.  The loop distinguishes three outcomes
+        are walked forward page by page.  The loop distinguishes four outcomes
         per page:
 
         * **Genuine end of history** (the exchange returned zero rows) - a clean
           stop, nothing more to fetch.
+        * **The live edge** (every row parsed fine but was filtered out as the
+          still-forming candle) - also a clean stop: there is nothing more to
+          fetch by paging further, and this must never be mistaken for
+          malformed data just because the validated list happens to be empty.
         * **A page of rows that all failed validation** - retried a bounded
           number of times with backoff rather than silently accepted as "no more
           data", so a burst of malformed rows cannot punch a silent hole at the
@@ -343,13 +357,20 @@ class BinanceDataFetcher:
 
         while cursor <= end_ms and guard < max_pages:
             guard += 1
-            raw_count, page = await self._fetch_ohlcv_page(symbol, limit=limit, since_ms=cursor)
+            raw_count, malformed_count, page = await self._fetch_ohlcv_page(
+                symbol, limit=limit, since_ms=cursor
+            )
 
             if raw_count == 0:
                 # The exchange itself reports nothing more from `cursor` onward.
                 break
 
             if not page:
+                if malformed_count == 0:
+                    # Every row parsed fine but was filtered out as the
+                    # still-forming candle (the live edge) - not corruption,
+                    # and paging further will not produce anything either.
+                    break
                 empty_validation_retries += 1
                 if empty_validation_retries > max_empty_validation_retries:
                     raise DataFetchError(
@@ -358,10 +379,12 @@ class BinanceDataFetcher:
                         window_end_ms=end_ms,
                     )
                 _LOGGER.warning(
-                    "%s: page at %d returned %d row(s), none valid - retry %d/%d",
+                    "%s: page at %d returned %d row(s), %d malformed, none valid "
+                    "- retry %d/%d",
                     symbol,
                     cursor,
                     raw_count,
+                    malformed_count,
                     empty_validation_retries,
                     max_empty_validation_retries,
                 )

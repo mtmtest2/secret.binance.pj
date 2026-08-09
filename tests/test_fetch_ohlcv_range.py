@@ -154,6 +154,40 @@ async def test_stuck_pagination_raises_rather_than_truncating_silently() -> None
 
 
 # ---------------------------------------------------------------------------
+# The still-forming candle at the live edge must not be mistaken for
+# "malformed rows" (regression: it parses fine, it's just filtered by
+# drop_unclosed_candle, which looks identical to "nothing valid" unless the
+# malformed-row count is tracked separately from the raw row count).
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_unclosed_candle_at_live_edge_stops_cleanly_not_as_malformed() -> None:
+    from core.utils import last_closed_candle_open_ms
+
+    closed_end = last_closed_candle_open_ms(TF_MS)  # newest fully-closed bar
+    forming_ts = closed_end + TF_MS  # the still-forming candle ("now")
+    start_ts = closed_end - 9 * TF_MS  # 10 closed bars total
+
+    def responder(since: int, limit: int) -> list[list[Any]]:
+        start = max(since, start_ts)
+        out: list[list[Any]] = []
+        ts = start
+        while len(out) < limit and ts <= forming_ts:
+            out.append(row(ts))
+            ts += TF_MS
+        return out
+
+    fetcher, _ = build_fetcher(responder)
+    # Mirrors how a STALE_DATA heal window extends its end through to "now".
+    candles = await fetcher.fetch_ohlcv_range(
+        "BTC/USDT:USDT", start_ts, forming_ts, page_limit=50
+    )
+
+    assert len(candles) == 10
+    assert candles[-1].timestamp == closed_end
+    assert all(c.timestamp <= closed_end for c in candles)
+
+
+# ---------------------------------------------------------------------------
 # Genuine end of history (exchange returns nothing) stops cleanly
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio

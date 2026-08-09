@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import (
 from config.settings import Settings
 from core.exceptions import DatabaseError
 from core.logger import get_logger
+from core.utils import chunked
 from module_a_data.db_models import (
     AuditLogRow,
     Base,
@@ -57,6 +58,17 @@ _OHLCV_COLUMNS: Final[tuple[str, ...]] = (
     "close",
     "volume",
 )
+
+#: A single ``INSERT ... VALUES (...), (...), ...`` statement binds one SQL
+#: variable per column per row - unlike ``executemany``, ``.values(list)``
+#: builds one literal multi-row statement and is *not* auto-chunked by
+#: SQLAlchemy's "insertmanyvalues" machinery.  SQLite's compiled variable-count
+#: ceiling ranges from 999 (pre-3.32, still shipped on some distros) up to
+#: 32766 on modern builds; a full-history bootstrap easily produces tens of
+#: thousands of rows, so batching is mandatory rather than an optimisation.
+#: 8 columns/row * 100 rows = 800 bound parameters, safely under even the old
+#: 999-variable ceiling.
+_UPSERT_BATCH_ROWS: Final[int] = 100
 
 
 class DatabaseHandler:
@@ -138,6 +150,12 @@ class DatabaseHandler:
     async def upsert_candles(self, candles: Sequence[OHLCVCandle]) -> int:
         """Bulk-upsert validated candles.
 
+        Batched into ``_UPSERT_BATCH_ROWS``-row statements within a single
+        transaction: a full-history bootstrap can easily exceed 100,000 rows,
+        and SQLite's bound-parameter ceiling makes one giant multi-row
+        ``INSERT`` for the whole block fail outright (see
+        :data:`_UPSERT_BATCH_ROWS`).
+
         Returns:
             The number of rows submitted (SQLite does not report affected rows
             reliably for multi-row upserts).
@@ -159,22 +177,26 @@ class DatabaseHandler:
             for candle in candles
         ]
 
-        statement = sqlite_insert(OHLCVRow).values(payload)
-        statement = statement.on_conflict_do_update(
-            index_elements=[OHLCVRow.symbol, OHLCVRow.timeframe, OHLCVRow.timestamp],
-            set_={
-                "open": statement.excluded.open,
-                "high": statement.excluded.high,
-                "low": statement.excluded.low,
-                "close": statement.excluded.close,
-                "volume": statement.excluded.volume,
-            },
-        )
-
         try:
             async with self._factory()() as session:
                 async with session.begin():
-                    await session.execute(statement)
+                    for batch in chunked(payload, _UPSERT_BATCH_ROWS):
+                        statement = sqlite_insert(OHLCVRow).values(batch)
+                        statement = statement.on_conflict_do_update(
+                            index_elements=[
+                                OHLCVRow.symbol,
+                                OHLCVRow.timeframe,
+                                OHLCVRow.timestamp,
+                            ],
+                            set_={
+                                "open": statement.excluded.open,
+                                "high": statement.excluded.high,
+                                "low": statement.excluded.low,
+                                "close": statement.excluded.close,
+                                "volume": statement.excluded.volume,
+                            },
+                        )
+                        await session.execute(statement)
         except SQLAlchemyError as error:
             raise DatabaseError("candle upsert failed", rows=len(payload)) from error
         return len(payload)
