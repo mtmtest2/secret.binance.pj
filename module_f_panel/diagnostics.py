@@ -43,7 +43,7 @@ NOT_AVAILABLE: Final[str] = "NOT_AVAILABLE"
 LATEST_REPORT_STATE_KEY: Final[str] = "ml_diagnostic_latest_report"
 REPORTS_DIR_NAME: Final[str] = "reports"
 
-#: Feature -> group, matching the audited 53-feature inventory
+#: Feature -> group, matching the feature inventory
 #: (module_b_features/features.py::FEATURE_COLUMNS). Kept here rather than in
 #: the feature module itself since grouping is purely a reporting concern.
 FEATURE_GROUPS: Final[dict[str, str]] = {
@@ -73,6 +73,8 @@ FEATURE_GROUPS: Final[dict[str, str]] = {
     "garch_vol_rank": "Volatility",
     "garch_vol_ratio": "Volatility",
     "vol_of_vol": "Volatility",
+    "wick_ratio": "Path Heat",
+    "whipsaw_rate": "Path Heat",
     "rsi": "Momentum",
     "rsi_delta": "Momentum",
     "log_return_1": "Momentum",
@@ -252,6 +254,51 @@ async def _qc_telemetry(database: DatabaseHandler) -> dict[str, Any]:
         "symbol_exclusions_total": len(exclusion_records),
         "recent_symbol_exclusions": exclusion_records[-100:],
     }
+
+
+#: Neutral placeholder value each microstructure/derivatives feature takes
+#: when its underlying data source was empty at feature-build time (see
+#: module_b_features/features.py::_add_microstructure_features). A feature
+#: parked at this value for nearly every row is a strong signal that source
+#: is not actually being collected for this run, not that the market was
+#: genuinely neutral on every single bar.
+_NEUTRAL_MICROSTRUCTURE_DEFAULTS: Final[dict[str, float]] = {
+    "ob_imbalance": 0.0,
+    "ob_spread_bps": 0.0,
+    "funding_rate": 0.0,
+    "open_interest_change": 0.0,
+    "long_short_ratio": 0.0,  # log(1.0)
+    "taker_buy_sell_ratio": 0.0,  # log(1.0)
+    "liquidation_imbalance": 0.0,
+}
+
+
+def _microstructure_coverage(dataset: ProcessedDataset) -> dict[str, Any]:
+    """Real fraction of training rows where each microstructure/derivatives
+    feature carries live data rather than sitting at its neutral default.
+
+    The Entry model's own feature-importance ranking has repeatedly shown
+    order-book features absent from its top 20 despite being exactly what
+    "is this a clean entry" should lean on - this makes it possible to tell,
+    from measured data rather than a guess, whether that is because the
+    signal genuinely is not very informative or because the underlying feed
+    (order-book snapshots, funding, open interest, liquidations) is not
+    actually populated for this run.
+    """
+    if dataset.features.empty:
+        return {"status": NOT_AVAILABLE, "reason": "empty dataset"}
+
+    coverage: dict[str, Any] = {}
+    for feature, neutral in _NEUTRAL_MICROSTRUCTURE_DEFAULTS.items():
+        if feature not in dataset.features.columns:
+            continue
+        values: np.ndarray = dataset.features[feature].to_numpy(dtype=float)
+        non_neutral_fraction: float = float(np.mean(~np.isclose(values, neutral, atol=1e-9)))
+        coverage[feature] = {
+            "non_neutral_row_fraction": non_neutral_fraction,
+            "likely_populated": non_neutral_fraction > 0.05,
+        }
+    return {"status": "AVAILABLE", "features": coverage}
 
 
 async def _cycle_timings(database: DatabaseHandler) -> dict[str, Any]:
@@ -481,6 +528,7 @@ async def build_report(
             "statistics": _feature_statistics(dataset),
             "correlation": _feature_correlation(dataset),
             "drift": _feature_drift(dataset, validation_index),
+            "microstructure_coverage": _microstructure_coverage(dataset),
         },
         "labels": {
             "configuration": _label_configuration(settings),
@@ -567,6 +615,21 @@ def _recommendations(report: dict[str, Any], comparison: list[dict[str, Any]]) -
     if report.get("backtest", {}).get("status") == NOT_AVAILABLE:
         high.append("Run a backtest for this artifact set before considering it for paper/live trading")
 
+    coverage = report.get("features", {}).get("microstructure_coverage", {})
+    if coverage.get("status") == "AVAILABLE":
+        unpopulated = sorted(
+            name
+            for name, info in coverage.get("features", {}).items()
+            if isinstance(info, dict) and not info.get("likely_populated", True)
+        )
+        if unpopulated:
+            high.append(
+                "Microstructure/derivatives feed(s) sit at their neutral default for nearly "
+                f"every row (likely not being collected): {', '.join(unpopulated)} - check "
+                "data collection for these sources before trusting Entry/Direction feature "
+                "importance that involves them"
+            )
+
     for row in comparison:
         if row.get("verdict") == "regressed":
             medium.append(f"{row['metric']} regressed from {row['before']:.4f} to {row['after']:.4f}")
@@ -580,14 +643,30 @@ def _recommendations(report: dict[str, Any], comparison: list[dict[str, Any]]) -
                 "consider not shipping this regressor for that target"
             )
 
-    for name in ("direction", "entry"):
-        calib = report.get("calibration", {}).get(name, {})
-        if calib.get("status") == "AVAILABLE" and calib.get("improved"):
-            if report.get(name, {}).get("production_calibration") == "isotonic":
-                low.append(f"{name} isotonic calibration measurably improves log loss and is wired into inference")
+    entry_calib = report.get("calibration", {}).get("entry", {})
+    if entry_calib.get("status") == "AVAILABLE" and entry_calib.get("improved"):
+        if report.get("entry", {}).get("production_calibration") == "isotonic":
+            low.append("entry isotonic calibration measurably improves log loss and is wired into inference")
+        else:
+            low.append(
+                "entry isotonic calibration measurably improves log loss but is not yet "
+                "wired into inference (not enough held-out rows to fit a production calibrator)"
+            )
+
+    # Direction is a two-stage cascade (gate + long/short); each stage is
+    # calibrated independently rather than as one multiclass estimator.
+    direction_calib = report.get("calibration", {}).get("direction", {})
+    direction_production = report.get("direction", {}).get("production_calibration", {})
+    if not isinstance(direction_production, dict):
+        direction_production = {}
+    for stage_key, stage_label in (("gate", "direction gate (trade vs no-trade)"), ("direction", "direction long/short")):
+        stage_calib = direction_calib.get(stage_key, {}) if isinstance(direction_calib, dict) else {}
+        if stage_calib.get("status") == "AVAILABLE" and stage_calib.get("improved"):
+            if direction_production.get(stage_key) == "isotonic":
+                low.append(f"{stage_label} isotonic calibration measurably improves log loss and is wired into inference")
             else:
                 low.append(
-                    f"{name} isotonic calibration measurably improves log loss but is not yet "
+                    f"{stage_label} isotonic calibration measurably improves log loss but is not yet "
                     "wired into inference (not enough held-out rows to fit a production calibrator)"
                 )
 

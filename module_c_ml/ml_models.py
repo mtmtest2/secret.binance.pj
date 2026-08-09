@@ -43,7 +43,7 @@ from core.exceptions import ModelNotLoadedError, ModelTrainingError
 from core.logger import get_logger
 from core.utils import clamp, git_commit_hash
 from module_b_features.features import FEATURE_COLUMNS, HMMRegime
-from module_b_features.labeler import LABEL_ORDER, LabelClass, risk_tier_from_score
+from module_b_features.labeler import LABEL_ORDER, LABEL_TO_INDEX, LabelClass, risk_tier_from_score
 from module_b_features.processor import InferencePayload, ProcessedDataset
 from module_c_ml import metrics as ml_metrics
 from module_c_ml.schemas import (
@@ -544,8 +544,25 @@ class DirectionModel(BaseModelHead):
 
     name = "direction_model"
 
+    #: Minimum trade-labelled training rows required to fit stage 2
+    #: (long-vs-short). Below this a single softmax split is too noisy to
+    #: trust, so stage 2 is skipped and long/short are left at 50/50.
+    _MIN_DIRECTION_TRAIN_ROWS: Final[int] = 50
+
     def train(self, dataset: ProcessedDataset) -> dict[str, Any]:
-        """Fit the multi-class classifier on the pooled, purged dataset."""
+        """Fit the two-stage cascade on the pooled, purged dataset.
+
+        Stage 1 (the "gate") answers a binary question: is this bar a trade
+        at all, or NO_TRADE?  Stage 2 answers a second, independent binary
+        question - given that it is a trade, is it LONG or SHORT? - trained
+        only on the rows stage 1's ground truth calls a trade.  A single
+        3-way softmax forces one decision boundary to serve both questions at
+        once, even though they lean on different signal (whether-to-trade
+        skews toward volatility/regime features, long-vs-short toward
+        directional/momentum ones); splitting them is the same rationale that
+        already moved risk tiering out of this label (see the labeler module
+        docstring).
+        """
         if dataset.is_empty:
             raise ModelTrainingError("direction model received an empty dataset")
 
@@ -553,8 +570,7 @@ class DirectionModel(BaseModelHead):
         if len(classes) < 2:
             raise ModelTrainingError("direction model needs >= 2 classes", classes=classes)
 
-        class_index: dict[str, int] = {name: index for index, name in enumerate(LABEL_ORDER)}
-        encoded: pd.Series = dataset.direction_target.map(class_index)
+        encoded: pd.Series = dataset.direction_target.map(LABEL_TO_INDEX)
         if encoded.isna().any():
             raise ModelTrainingError("direction labels contain unknown classes")
 
@@ -562,18 +578,15 @@ class DirectionModel(BaseModelHead):
             self._config.validation_fraction, self._config.purge_bars
         )
         features: pd.DataFrame = dataset.features
-        estimator: Any = self._make_classifier(num_class=len(LABEL_ORDER))
-        estimator = self._fit_estimator(
-            estimator,
-            features.iloc[train_index],
-            encoded.iloc[train_index].astype(int),
-            features.iloc[validation_index],
-            encoded.iloc[validation_index].astype(int),
-            eval_metric="multi_logloss",
-            sample_weight=self._recency_weights(self._timestamps_for(dataset, train_index)),
+        sample_weight: np.ndarray | None = self._recency_weights(
+            self._timestamps_for(dataset, train_index)
         )
 
-        self._model = estimator
+        gate_estimator, direction_estimator = self._fit_cascade(
+            features, encoded, train_index, validation_index, sample_weight, early_stopping=True
+        )
+
+        self._model = {"gate": gate_estimator, "direction": direction_estimator}
         self._feature_columns = dataset.feature_columns
 
         validation_features: pd.DataFrame = features.iloc[validation_index]
@@ -582,30 +595,30 @@ class DirectionModel(BaseModelHead):
         importance: dict[str, Any] = {"status": "NOT_AVAILABLE", "reason": "no validation rows"}
         calibration: dict[str, Any] = {"status": "NOT_AVAILABLE", "reason": "no validation rows"}
         per_symbol: dict[str, Any] = {}
-        production_calibration: str = "raw"
+        production_calibration: dict[str, str] = {"gate": "raw", "direction": "raw"}
+
         if not validation_features.empty:
-            probabilities: np.ndarray = np.asarray(estimator.predict_proba(validation_features))
-            full_metrics = ml_metrics.direction_metrics(validation_target, probabilities, LABEL_ORDER)
-            importance = ml_metrics.feature_importance(estimator, dataset.feature_columns)
-            calib_x, calib_y, eval_x, eval_y = _temporal_half_split(validation_features, validation_target)
-            calibration = ml_metrics.calibrate_classifier(
-                estimator, calib_x, calib_y, eval_x, eval_y, n_classes=len(LABEL_ORDER)
+            probabilities: np.ndarray = self._combined_probabilities(
+                gate_estimator, direction_estimator, validation_features
             )
+            full_metrics = ml_metrics.direction_metrics(validation_target, probabilities, LABEL_ORDER)
+            importance = {
+                "gate": ml_metrics.feature_importance(gate_estimator, dataset.feature_columns),
+                "direction": (
+                    ml_metrics.feature_importance(direction_estimator, dataset.feature_columns)
+                    if direction_estimator is not None
+                    else {"status": "NOT_AVAILABLE", "reason": "not enough trade rows to fit stage 2"}
+                ),
+            }
             if "symbol" in dataset.metadata.columns:
                 symbols_validation: pd.Series = dataset.metadata["symbol"].iloc[validation_index]
                 per_symbol = ml_metrics.per_symbol_direction_accuracy(
                     validation_target, probabilities.argmax(axis=1), symbols_validation
                 )
-            # Calibration measurably improves log loss (see `calibration` above);
-            # wire it into the model that will actually serve inference, fit on
-            # every held-out row rather than the half reserved for that report.
-            if calibration.get("status") == "AVAILABLE" and calibration.get("improved"):
-                calibrated_model: Any = self._fit_production_calibrator(
-                    estimator, validation_features, validation_target
-                )
-                if calibrated_model is not None:
-                    self._model = calibrated_model
-                    production_calibration = "isotonic"
+
+            calibration, self._model, production_calibration = self._calibrate_cascade(
+                gate_estimator, direction_estimator, validation_features, validation_target
+            )
 
         self._metadata = {
             "trained_at": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
@@ -620,6 +633,7 @@ class DirectionModel(BaseModelHead):
             "calibration": calibration,
             "production_calibration": production_calibration,
             "per_symbol": per_symbol,
+            "architecture": "two_stage_cascade",
         }
         headline: dict[str, Any] = {
             key: full_metrics[key]
@@ -639,32 +653,210 @@ class DirectionModel(BaseModelHead):
             return self._heuristic(features)
 
         aligned: pd.DataFrame = self._align(features)
-        raw: np.ndarray = np.asarray(self._model.predict_proba(aligned), dtype=np.float64)[0]
+        gate_estimator: Any = self._model["gate"]
+        direction_estimator: Any | None = self._model.get("direction")
 
-        classes: list[int] = [int(value) for value in getattr(self._model, "classes_", [])]
-        probabilities: dict[str, float] = {name: 0.0 for name in LABEL_ORDER}
-        if classes and len(classes) == raw.size:
-            for position, class_index in enumerate(classes):
-                if 0 <= class_index < len(LABEL_ORDER):
-                    probabilities[LABEL_ORDER[class_index]] = float(raw[position])
-        else:  # pragma: no cover - estimator without `classes_`
-            for position, name in enumerate(LABEL_ORDER[: raw.size]):
-                probabilities[name] = float(raw[position])
+        trade_probability: float = float(
+            np.asarray(gate_estimator.predict_proba(aligned), dtype=np.float64)[0, -1]
+        )
+        long_given_trade: float = (
+            float(np.asarray(direction_estimator.predict_proba(aligned), dtype=np.float64)[0, -1])
+            if direction_estimator is not None
+            else 0.5
+        )
 
-        return DirectionPrediction(probabilities=probabilities, source=ModelSource.TRAINED)
+        long_probability: float = trade_probability * long_given_trade
+        short_probability: float = trade_probability * (1.0 - long_given_trade)
+        no_trade_probability: float = max(0.0, 1.0 - long_probability - short_probability)
+
+        return DirectionPrediction(
+            probabilities={
+                LabelClass.LONG_SUCCESS.value: long_probability,
+                LabelClass.SHORT_SUCCESS.value: short_probability,
+                LabelClass.NO_TRADE_OR_FAIL.value: no_trade_probability,
+            },
+            source=ModelSource.TRAINED,
+        )
+
+    # ------------------------------------------------------------------
+    # Two-stage cascade internals
+    # ------------------------------------------------------------------
+    def _fit_cascade(
+        self,
+        features: pd.DataFrame,
+        encoded: pd.Series,
+        train_positions: np.ndarray,
+        validation_positions: np.ndarray,
+        sample_weight: np.ndarray | None,
+        *,
+        early_stopping: bool,
+    ) -> tuple[Any, Any | None]:
+        """Fit the trade gate, then long-vs-short on the gate's true-trade rows.
+
+        ``sample_weight`` (if given) is aligned with ``train_positions`` and
+        is sliced down to the trade subset for stage 2. ``early_stopping``
+        selects between the production path (uses the validation block for
+        early stopping, like every other head) and the fast path used by
+        :meth:`walk_forward`, where fitting many folds cheaply matters more
+        than the last bit of accuracy an inner validation split would buy.
+        """
+        no_trade_index: int = LABEL_TO_INDEX[LabelClass.NO_TRADE_OR_FAIL.value]
+        long_index: int = LABEL_TO_INDEX[LabelClass.LONG_SUCCESS.value]
+        is_trade: pd.Series = (encoded != no_trade_index).astype(int)
+        is_long: pd.Series = (encoded == long_index).astype(int)
+
+        gate_estimator: Any = self._make_classifier(num_class=2)
+        if early_stopping:
+            gate_estimator = self._fit_estimator(
+                gate_estimator,
+                features.iloc[train_positions],
+                is_trade.iloc[train_positions],
+                features.iloc[validation_positions],
+                is_trade.iloc[validation_positions],
+                eval_metric="binary_logloss",
+                sample_weight=sample_weight,
+            )
+        else:
+            fit_kwargs: dict[str, Any] = {} if sample_weight is None else {"sample_weight": sample_weight}
+            gate_estimator.fit(features.iloc[train_positions], is_trade.iloc[train_positions], **fit_kwargs)
+
+        trade_mask: np.ndarray = is_trade.to_numpy()[train_positions] == 1
+        train_trade_positions: np.ndarray = train_positions[trade_mask]
+        validation_trade_positions: np.ndarray = (
+            validation_positions[is_trade.to_numpy()[validation_positions] == 1]
+            if len(validation_positions)
+            else validation_positions
+        )
+
+        direction_estimator: Any | None = None
+        if (
+            len(train_trade_positions) >= self._MIN_DIRECTION_TRAIN_ROWS
+            and is_long.iloc[train_trade_positions].nunique() >= 2
+        ):
+            direction_sample_weight: np.ndarray | None = (
+                sample_weight[trade_mask] if sample_weight is not None else None
+            )
+            direction_estimator = self._make_classifier(num_class=2)
+            if early_stopping:
+                direction_estimator = self._fit_estimator(
+                    direction_estimator,
+                    features.iloc[train_trade_positions],
+                    is_long.iloc[train_trade_positions],
+                    features.iloc[validation_trade_positions],
+                    is_long.iloc[validation_trade_positions],
+                    eval_metric="binary_logloss",
+                    sample_weight=direction_sample_weight,
+                )
+            else:
+                fit_kwargs = (
+                    {} if direction_sample_weight is None else {"sample_weight": direction_sample_weight}
+                )
+                direction_estimator.fit(
+                    features.iloc[train_trade_positions], is_long.iloc[train_trade_positions], **fit_kwargs
+                )
+        return gate_estimator, direction_estimator
+
+    @staticmethod
+    def _combined_probabilities(
+        gate_estimator: Any, direction_estimator: Any | None, features: pd.DataFrame
+    ) -> np.ndarray:
+        """Recombine the two-stage cascade into a ``(n, len(LABEL_ORDER))`` matrix."""
+        trade_probability: np.ndarray = np.asarray(gate_estimator.predict_proba(features))[:, -1]
+        long_given_trade: np.ndarray = (
+            np.asarray(direction_estimator.predict_proba(features))[:, -1]
+            if direction_estimator is not None
+            else np.full(len(features), 0.5)
+        )
+
+        matrix: np.ndarray = np.zeros((len(features), len(LABEL_ORDER)))
+        matrix[:, LABEL_TO_INDEX[LabelClass.LONG_SUCCESS.value]] = trade_probability * long_given_trade
+        matrix[:, LABEL_TO_INDEX[LabelClass.SHORT_SUCCESS.value]] = trade_probability * (
+            1.0 - long_given_trade
+        )
+        matrix[:, LABEL_TO_INDEX[LabelClass.NO_TRADE_OR_FAIL.value]] = 1.0 - trade_probability
+        return matrix
+
+    def _calibrate_cascade(
+        self,
+        gate_estimator: Any,
+        direction_estimator: Any | None,
+        validation_features: pd.DataFrame,
+        validation_target: pd.Series,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
+        """Measure and (when it helps) wire in isotonic calibration per stage.
+
+        Each binary stage is calibrated independently - there is no single
+        multiclass estimator to calibrate as a whole once the cascade is
+        split in two. Returns ``(calibration_report, model_dict,
+        production_calibration)`` so the caller can drop all three straight
+        into ``self._model`` / ``self._metadata``.
+        """
+        no_trade_index: int = LABEL_TO_INDEX[LabelClass.NO_TRADE_OR_FAIL.value]
+        long_index: int = LABEL_TO_INDEX[LabelClass.LONG_SUCCESS.value]
+        is_trade_validation: pd.Series = (validation_target != no_trade_index).astype(int)
+
+        model: dict[str, Any] = {"gate": gate_estimator, "direction": direction_estimator}
+        production_calibration: dict[str, str] = {"gate": "raw", "direction": "raw"}
+
+        calib_x, calib_y, eval_x, eval_y = _temporal_half_split(validation_features, is_trade_validation)
+        gate_calibration: dict[str, Any] = ml_metrics.calibrate_classifier(
+            gate_estimator, calib_x, calib_y, eval_x, eval_y, n_classes=2
+        )
+        if gate_calibration.get("status") == "AVAILABLE" and gate_calibration.get("improved"):
+            calibrated_gate: Any = self._fit_production_calibrator(
+                gate_estimator, validation_features, is_trade_validation
+            )
+            if calibrated_gate is not None:
+                model["gate"] = calibrated_gate
+                production_calibration["gate"] = "isotonic"
+
+        direction_calibration: dict[str, Any] = {
+            "status": "NOT_AVAILABLE",
+            "reason": "stage 2 was not fitted (not enough trade rows)",
+        }
+        if direction_estimator is not None:
+            trade_mask: pd.Series = is_trade_validation == 1
+            direction_features: pd.DataFrame = validation_features[trade_mask]
+            direction_target: pd.Series = (validation_target[trade_mask] == long_index).astype(int)
+            if len(direction_features) >= 100:
+                d_calib_x, d_calib_y, d_eval_x, d_eval_y = _temporal_half_split(
+                    direction_features, direction_target
+                )
+                direction_calibration = ml_metrics.calibrate_classifier(
+                    direction_estimator, d_calib_x, d_calib_y, d_eval_x, d_eval_y, n_classes=2
+                )
+                if direction_calibration.get("status") == "AVAILABLE" and direction_calibration.get(
+                    "improved"
+                ):
+                    calibrated_direction: Any = self._fit_production_calibrator(
+                        direction_estimator, direction_features, direction_target
+                    )
+                    if calibrated_direction is not None:
+                        model["direction"] = calibrated_direction
+                        production_calibration["direction"] = "isotonic"
+            else:
+                direction_calibration = {
+                    "status": "NOT_AVAILABLE",
+                    "reason": "not enough trade rows in validation for a calibration split",
+                }
+
+        calibration: dict[str, Any] = {"gate": gate_calibration, "direction": direction_calibration}
+        return calibration, model, production_calibration
 
     def walk_forward(self, dataset: ProcessedDataset, n_folds: int = 4) -> dict[str, Any]:
         """Expanding-window walk-forward evaluation across multiple rolling folds.
 
-        :meth:`train` fits and scores one production model on a single
+        :meth:`train` fits and scores one production cascade on a single
         temporal train/validation split - the ML diagnostic report's own
         recommendations flag that as the single biggest validation gap ("only
         a single split is currently performed"), since a lucky split can make
         a model look better than it generalises.  This fits ``n_folds``
-        independent classifiers, each trained only on data strictly preceding
-        its own validation block (with the same purge gap used in
-        production), and reports per-fold plus aggregate accuracy so a wide
-        spread across folds - not just the headline number - is visible.
+        independent cascades (same two-stage architecture as production,
+        minus early stopping and calibration - see :meth:`_fit_cascade`),
+        each trained only on data strictly preceding its own validation block
+        (with the same purge gap used in production), and reports per-fold
+        plus aggregate accuracy so a wide spread across folds - not just the
+        headline number - is visible.
 
         Every fold is a genuinely separate fit (no artifact is mutated or
         reused): this never touches ``self._model``.
@@ -684,8 +876,7 @@ class DirectionModel(BaseModelHead):
                 ),
             }
 
-        class_index: dict[str, int] = {name: index for index, name in enumerate(LABEL_ORDER)}
-        encoded: pd.Series = dataset.direction_target.map(class_index)
+        encoded: pd.Series = dataset.direction_target.map(LABEL_TO_INDEX)
         if encoded.isna().any():
             return {"status": "NOT_AVAILABLE", "reason": "direction labels contain unknown classes"}
 
@@ -704,20 +895,20 @@ class DirectionModel(BaseModelHead):
             if train_end < min_rows_per_fold or (val_end - val_start) < min_rows_per_fold // 2:
                 continue
 
-            fold_target: pd.Series = encoded.iloc[:train_end].astype(int)
-            if fold_target.nunique() < 2:
+            train_positions: np.ndarray = np.arange(train_end)
+            validation_positions: np.ndarray = np.arange(val_start, val_end)
+            if encoded.iloc[train_positions].nunique() < 2:
                 continue
 
-            estimator: Any = self._make_classifier(num_class=len(LABEL_ORDER))
-            sample_weight = self._recency_weights(
-                self._timestamps_for(dataset, np.arange(train_end))
+            sample_weight = self._recency_weights(self._timestamps_for(dataset, train_positions))
+            gate_estimator, direction_estimator = self._fit_cascade(
+                features, encoded, train_positions, validation_positions, sample_weight, early_stopping=False
             )
-            fit_kwargs: dict[str, Any] = {} if sample_weight is None else {"sample_weight": sample_weight}
-            estimator.fit(features.iloc[:train_end], fold_target, **fit_kwargs)
 
-            val_features: pd.DataFrame = features.iloc[val_start:val_end]
-            val_target: pd.Series = encoded.iloc[val_start:val_end].astype(int)
-            probabilities: np.ndarray = np.asarray(estimator.predict_proba(val_features))
+            val_target: pd.Series = encoded.iloc[validation_positions].astype(int)
+            probabilities: np.ndarray = self._combined_probabilities(
+                gate_estimator, direction_estimator, features.iloc[validation_positions]
+            )
             fold_metrics: dict[str, Any] = ml_metrics.direction_metrics(
                 val_target, probabilities, LABEL_ORDER
             )
@@ -748,9 +939,9 @@ class DirectionModel(BaseModelHead):
             "balanced_accuracy_mean": float(np.mean(balanced)) if balanced else None,
             "balanced_accuracy_std": float(np.std(balanced)) if balanced else None,
             "note": (
-                "Each fold fits an independent classifier (not the production "
-                "model) purely to measure how much accuracy varies across "
-                "different time periods."
+                "Each fold fits an independent two-stage cascade (not the "
+                "production model) purely to measure how much accuracy varies "
+                "across different time periods."
             ),
         }
 
@@ -833,15 +1024,22 @@ class EntryModel(BaseModelHead):
         importance: dict[str, Any] = {"status": "NOT_AVAILABLE", "reason": "no validation rows"}
         calibration: dict[str, Any] = {"status": "NOT_AVAILABLE", "reason": "no validation rows"}
         production_calibration: str = "raw"
-        cutoff: float = self._settings.decision.min_entry_probability
+        configured_floor: float = self._settings.decision.min_entry_probability
+        cutoff: float = configured_floor
         if len(validation_index) > 0:
             validation_features: pd.DataFrame = features.iloc[validation_index]
             validation_target: pd.Series = target.iloc[validation_index]
             probabilities: np.ndarray = np.asarray(
                 estimator.predict_proba(validation_features)
             )[:, 1]
-            full_metrics = ml_metrics.entry_metrics(validation_target, probabilities, cutoff)
             threshold_sweep = ml_metrics.entry_threshold_sweep(validation_target, probabilities)
+            # Auto-tune the decision threshold from the model's own validation
+            # sweep instead of trusting one hand-picked config constant - see
+            # _select_recommended_threshold for why precision is weighted over
+            # recall (a false-positive entry costs real capital; a missed
+            # true positive only costs a smaller position count).
+            cutoff = self._select_recommended_threshold(threshold_sweep, configured_floor)
+            full_metrics = ml_metrics.entry_metrics(validation_target, probabilities, cutoff)
             importance = ml_metrics.feature_importance(estimator, dataset.feature_columns)
             calib_x, calib_y, eval_x, eval_y = _temporal_half_split(
                 validation_features, validation_target
@@ -864,6 +1062,7 @@ class EntryModel(BaseModelHead):
             "validation_rows": int(len(validation_index)),
             "positive_rate": float(target.mean()),
             "decision_threshold": cutoff,
+            "configured_floor_threshold": configured_floor,
             "hyperparameters": _hyperparameter_snapshot(self._config),
             "metrics": full_metrics,
             "threshold_sweep": threshold_sweep,
@@ -874,8 +1073,38 @@ class EntryModel(BaseModelHead):
         headline: dict[str, Any] = {
             key: full_metrics[key] for key in ("precision", "recall", "roc_auc") if key in full_metrics
         }
-        _LOGGER.info("Entry model trained: %s", headline)
+        _LOGGER.info("Entry model trained: %s (threshold=%.2f)", headline, cutoff)
         return full_metrics
+
+    @staticmethod
+    def _select_recommended_threshold(sweep: list[dict[str, Any]], floor: float) -> float:
+        """Pick the best threshold from the sweep by F-beta=0.5 (precision
+        weighted 2x over recall), restricted to thresholds carrying enough
+        signals to trust (``meets_min_sample_size``).
+
+        A plain F1 pick tends to land on the loosest threshold in the sweep
+        (highest recall), which is the wrong bias for an entry filter: a
+        false-positive entry commits real capital, while a missed true
+        positive only costs a smaller position count later. Falls back to
+        ``floor`` (the configured default) when nothing in the sweep
+        qualifies, so a sparse validation slice can never hand back a
+        threshold nobody could act on.
+        """
+        beta_squared: float = 0.25  # beta = 0.5
+        candidates: list[dict[str, Any]] = [row for row in sweep if row.get("meets_min_sample_size")]
+        if not candidates:
+            return floor
+
+        def f_beta(row: dict[str, Any]) -> float:
+            precision: float = float(row.get("precision", 0.0) or 0.0)
+            recall: float = float(row.get("recall", 0.0) or 0.0)
+            denominator: float = beta_squared * precision + recall
+            if denominator <= 0.0:
+                return 0.0
+            return (1.0 + beta_squared) * precision * recall / denominator
+
+        best: dict[str, Any] = max(candidates, key=f_beta)
+        return float(best["threshold"])
 
     def predict(
         self,
@@ -885,7 +1114,9 @@ class EntryModel(BaseModelHead):
     ) -> EntryPrediction:
         """Decide whether to act on this candle or wait for the next one."""
         cutoff: float = (
-            threshold if threshold is not None else self._settings.decision.min_entry_probability
+            threshold
+            if threshold is not None
+            else self._metadata.get("decision_threshold", self._settings.decision.min_entry_probability)
         )
         if self._model is None:
             return self._heuristic(features, action, cutoff)
@@ -1165,14 +1396,19 @@ class RiskModel(BaseModelHead):
         )
         features: pd.DataFrame = dataset.features
 
-        estimator: Any = self._make_regressor()
+        # target_risk_score is right-skewed (mean 0.29, median 0.20 in the
+        # first production run) the same way the exit-geometry percentages
+        # are, so it gets the same L1 (robust) objective rather than L2 -
+        # a handful of extreme-heat rows should not dominate the loss and
+        # drag every other prediction toward them.
+        estimator: Any = self._make_regressor(robust=True)
         estimator = self._fit_estimator(
             estimator,
             features.iloc[train_index],
             target.iloc[train_index],
             features.iloc[validation_index],
             target.iloc[validation_index],
-            eval_metric="l2",
+            eval_metric="l1",
             sample_weight=self._recency_weights(self._timestamps_for(dataset, train_index)),
         )
 

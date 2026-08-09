@@ -338,6 +338,53 @@ class TradingSystem:
             len(usable),
         )
 
+    async def _run_validation_backtest(self, dataset: ProcessedDataset) -> BacktestReport | None:
+        """Replay the out-of-sample validation window through the full pipeline.
+
+        The ML diagnostic report's trading-level fields (win rate, profit
+        factor, expectancy, max drawdown, Sharpe) were previously always
+        ``NOT_AVAILABLE`` because nothing ever ran a backtest and passed it
+        in. Bounding the replay to roughly the same tail window the four
+        heads were validated on - rather than the full multi-year history -
+        keeps it genuinely out-of-sample and fast enough to run on every
+        training cycle (the bar-by-bar simulator is O(bars x symbols)).
+
+        Caveat, stated honestly rather than hidden: when the Direction/Entry
+        heads' production isotonic calibrators are wired in
+        (``BaseModelHead._fit_production_calibrator``), they are fit on this
+        same validation block. This is therefore the best available
+        approximation of a clean holdout, not a third, fully untouched split -
+        treat the resulting numbers as directionally informative rather than
+        a certified live-performance estimate.
+
+        Never raises: a backtest failure must not block training or the
+        diagnostic report it enriches.
+        """
+        if not dataset.symbols:
+            return None
+        try:
+            _, validation_index = dataset.train_validation_split(
+                self.settings.ml.validation_fraction, self.settings.ml.purge_bars
+            )
+            if len(validation_index) == 0:
+                return None
+
+            symbols: list[str] = list(dataset.symbols)
+            validation_bars_per_symbol: int = -(-len(validation_index) // len(symbols))  # ceil
+            warmup_padding: int = self.features.engineer.minimum_rows()
+
+            backtester = Backtester(
+                self.settings, self.database, self.features, self.ml, self.decisions
+            )
+            return await backtester.run(
+                symbols=symbols,
+                max_candles=validation_bars_per_symbol + warmup_padding,
+                warmup_bars=warmup_padding,
+            )
+        except Exception as error:  # noqa: BLE001 - a backtest failure must not block training
+            _LOGGER.error("Validation backtest failed: %s", error, exc_info=True)
+            return None
+
     async def _setup_train(self, symbols: list[str], force_retrain: bool) -> None:
         """Stage 2 - build the dataset and fit the four heads."""
         if not self.settings.auto_train and not force_retrain:
@@ -390,6 +437,7 @@ class TradingSystem:
         _LOGGER.info("Training complete: %s", _headline_metrics(report))
 
         run_id: str = str(uuid.uuid4())
+        backtest_report: BacktestReport | None = await self._run_validation_backtest(dataset)
         try:
             diagnostic_report: dict[str, Any] = await diagnostics.build_report(
                 settings=self.settings,
@@ -397,6 +445,7 @@ class TradingSystem:
                 ml=self.ml,
                 dataset=dataset,
                 run_id=run_id,
+                backtest=backtest_report,
             )
             self.latest_ml_report_id = run_id
             _LOGGER.info(
@@ -1113,9 +1162,15 @@ class TradingSystem:
             _LOGGER.info("%-10s -> %s", head, metrics)
 
         run_id: str = str(uuid.uuid4())
+        backtest_report: BacktestReport | None = await self._run_validation_backtest(dataset)
         try:
             diagnostic_report: dict[str, Any] = await diagnostics.build_report(
-                settings=self.settings, database=self.database, ml=self.ml, dataset=dataset, run_id=run_id
+                settings=self.settings,
+                database=self.database,
+                ml=self.ml,
+                dataset=dataset,
+                run_id=run_id,
+                backtest=backtest_report,
             )
             self.latest_ml_report_id = run_id
             reports_dir = self.settings.ml.model_dir.parent / diagnostics.REPORTS_DIR_NAME

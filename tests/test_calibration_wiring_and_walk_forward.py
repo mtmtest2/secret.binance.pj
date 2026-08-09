@@ -68,19 +68,27 @@ def test_direction_model_wires_calibrated_model_into_inference_when_it_helps() -
     model = DirectionModel(settings)
     model.train(dataset)
 
-    # Production calibration status is recorded honestly in metadata either way.
-    assert model.metadata["production_calibration"] in {"isotonic", "raw"}
+    # Direction is a two-stage cascade: production calibration is recorded
+    # per stage, honestly, either way.
+    production = model.metadata["production_calibration"]
+    assert set(production) == {"gate", "direction"}
+    assert production["gate"] in {"isotonic", "raw"}
+    assert production["direction"] in {"isotonic", "raw"}
 
     prediction = model.predict(dataset.features.iloc[[0]])
     assert set(prediction.probabilities) == set(LABEL_ORDER)
     assert prediction.probabilities == pytest.approx(prediction.probabilities)
     assert sum(prediction.probabilities.values()) == pytest.approx(1.0, abs=1e-6)
 
-    if model.metadata["production_calibration"] == "isotonic":
-        # The wrapped calibrator must still expose the sklearn classifier API
-        # DirectionModel.predict() relies on.
-        assert hasattr(model._model, "classes_")
-        assert hasattr(model._model, "predict_proba")
+    # self._model is now {"gate": ..., "direction": ...}; whichever stage got
+    # calibrated must still expose the sklearn classifier API predict()
+    # relies on.
+    assert set(model._model) == {"gate", "direction"}
+    for stage_key, calibrated in production.items():
+        stage_model = model._model.get(stage_key)
+        if calibrated == "isotonic" and stage_model is not None:
+            assert hasattr(stage_model, "classes_")
+            assert hasattr(stage_model, "predict_proba")
 
 
 def test_entry_model_predict_still_works_regardless_of_calibration_outcome() -> None:

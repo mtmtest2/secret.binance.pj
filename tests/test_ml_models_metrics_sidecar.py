@@ -76,8 +76,15 @@ def test_entry_model_metadata_includes_threshold_sweep_and_decision_threshold(tm
     head = EntryModel(settings)
     head.train(dataset)
 
-    assert head.metadata["decision_threshold"] == pytest.approx(settings.decision.min_entry_probability)
+    # decision_threshold is now auto-selected from the validation sweep
+    # (F-beta=0.5, precision-weighted); configured_floor_threshold is the
+    # untouched config default and is what a degenerate sweep falls back to.
+    assert head.metadata["configured_floor_threshold"] == pytest.approx(
+        settings.decision.min_entry_probability
+    )
     sweep = head.metadata["threshold_sweep"]
+    valid_thresholds = {row["threshold"] for row in sweep} | {settings.decision.min_entry_probability}
+    assert head.metadata["decision_threshold"] in valid_thresholds
     assert len(sweep) == len(head.metadata["threshold_sweep"])  # sanity: non-empty, self-consistent
     assert {row["threshold"] for row in sweep} == set(
         (0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90)

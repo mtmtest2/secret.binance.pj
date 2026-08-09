@@ -120,6 +120,9 @@ FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     "garch_vol_rank",
     "garch_vol_ratio",
     "vol_of_vol",
+    # --- path heat / whipsaw -------------------------------------------------
+    "wick_ratio",
+    "whipsaw_rate",
     # --- regime -------------------------------------------------------------
     "hmm_regime",
     "hmm_prob_bull",
@@ -224,6 +227,7 @@ class FeatureEngineer:
         try:
             frame = self._add_price_features(frame)
             frame = self._add_volatility_features(frame)
+            frame = self._add_risk_features(frame)
             frame = self._add_volume_features(frame)
             frame = self._add_garch_features(frame)
             frame = self._add_hmm_features(frame)
@@ -331,6 +335,37 @@ class FeatureEngineer:
             .std(ddof=0)
             .div(frame["realized_vol_12"].replace(0.0, np.nan))
         )
+        return frame
+
+    # ------------------------------------------------------------------
+    # Path heat / whipsaw
+    # ------------------------------------------------------------------
+    def _add_risk_features(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Whipsaw / rejection-wick proxies for the Risk model's path-heat target.
+
+        The Risk model predicts how much a trade is likely to get whipsawed
+        before resolving (the labeler's ``target_risk_score``, built from the
+        max-adverse-excursion ratio). The existing volatility features (ATR,
+        realised vol, GARCH) only capture the *magnitude* of price moves, not
+        how often direction reverses or how much of a candle's range was a
+        rejected wick rather than a genuine directional move - two signals
+        that are conceptually closer to "how choppy has this been" than
+        "how big have moves been". Both are purely trailing/rolling, so they
+        stay causal like every other feature in this module.
+        """
+        high: pd.Series = frame["high"].astype(float)
+        low: pd.Series = frame["low"].astype(float)
+        open_price: pd.Series = frame["open"].astype(float)
+        close: pd.Series = frame["close"].astype(float)
+
+        candle_range: pd.Series = (high - low).replace(0.0, np.nan)
+        body: pd.Series = (close - open_price).abs()
+        raw_wick_ratio: pd.Series = 1.0 - (body / candle_range).clip(0.0, 1.0)
+        frame["wick_ratio"] = raw_wick_ratio.rolling(window=6, min_periods=3).mean().fillna(0.0)
+
+        log_return: pd.Series = frame["log_return_1"].fillna(0.0)
+        sign_flip: pd.Series = (np.sign(log_return) != np.sign(log_return.shift(1))).astype(float)
+        frame["whipsaw_rate"] = sign_flip.rolling(window=12, min_periods=6).mean().fillna(0.0)
         return frame
 
     # ------------------------------------------------------------------
