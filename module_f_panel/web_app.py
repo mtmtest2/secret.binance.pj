@@ -82,6 +82,12 @@ class SystemController(Protocol):
     async def reset_risk_guard(self, operator: str) -> dict[str, Any]:
         """Clear a RED latch after manual review."""
 
+    async def ml_diagnostics(self) -> dict[str, Any]:
+        """The full ML diagnostic report for the most recent training run."""
+
+    async def ml_diagnostics_markdown(self) -> str:
+        """The same report, rendered as human-readable Markdown."""
+
 
 def build_app(controller: SystemController) -> FastAPI:
     """Construct the FastAPI application bound to ``controller``."""
@@ -166,6 +172,12 @@ def build_app(controller: SystemController) -> FastAPI:
         """Closed and open trades with fees, funding and realised PnL."""
         return render("trades_content.html", "trades_scripts.html")
 
+    @app.get("/ml-report", response_class=HTMLResponse, summary="ML diagnostic report")
+    async def ml_report_page() -> HTMLResponse:
+        """Full training diagnostics: dataset health, per-head metrics, data
+        quality, features, labels, backtest and the AI-ready summary."""
+        return render("ml_report_content.html", "ml_report_scripts.html")
+
     # ------------------------------------------------------------------
     # Read-only API
     # ------------------------------------------------------------------
@@ -212,6 +224,47 @@ def build_app(controller: SystemController) -> FastAPI:
     async def api_logs(limit: int = Query(default=200, ge=1, le=800)) -> JSONResponse:
         """Tail of the in-memory ring buffer - no filesystem access required."""
         return JSONResponse({"rows": LOG_BUFFER.snapshot(limit)})
+
+    # ------------------------------------------------------------------
+    # ML diagnostic report API
+    # ------------------------------------------------------------------
+    @app.get("/api/ml/diagnostics", summary="Full ML diagnostic report (JSON)")
+    async def api_ml_diagnostics() -> JSONResponse:
+        """The structured report for the most recent training run.
+
+        Every section is either real, measured data or the literal string
+        ``"NOT_AVAILABLE"`` - never a fabricated value. See ``/ml-report`` for
+        the human-readable dashboard built on top of the same data.
+        """
+        try:
+            return JSONResponse(await controller.ml_diagnostics())
+        except Exception as error:  # pragma: no cover - the panel must not 500
+            _LOGGER.error("ML diagnostics unavailable: %s", error, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"diagnostics unavailable: {error}") from error
+
+    @app.get("/api/ml/diagnostics/export.json", summary="Download the full report as JSON")
+    async def api_ml_diagnostics_export_json() -> JSONResponse:
+        """Same content as ``/api/ml/diagnostics``, offered as a download."""
+        report: dict[str, Any] = await controller.ml_diagnostics()
+        run_id: str = str(report.get("run", {}).get("run_id", "latest"))
+        return JSONResponse(
+            report,
+            headers={"Content-Disposition": f'attachment; filename="ml_diagnostic_{run_id}.json"'},
+        )
+
+    @app.get("/api/ml/diagnostics/export.md", summary="Download the human-readable report")
+    async def api_ml_diagnostics_export_markdown() -> Any:
+        """Markdown rendering of the same report, offered as a download."""
+        from fastapi.responses import PlainTextResponse
+
+        markdown: str = await controller.ml_diagnostics_markdown()
+        report: dict[str, Any] = await controller.ml_diagnostics()
+        run_id: str = str(report.get("run", {}).get("run_id", "latest"))
+        return PlainTextResponse(
+            markdown,
+            media_type="text/markdown",
+            headers={"Content-Disposition": f'attachment; filename="ml_diagnostic_{run_id}.md"'},
+        )
 
     # ------------------------------------------------------------------
     # Universe API

@@ -48,6 +48,7 @@ _BASE: Final[
         <a href="/universe">Pairs</a>
         <a href="/audit">Audit</a>
         <a href="/trades">Trades</a>
+        <a href="/ml-report">ML Report</a>
         <a href="/api/status">API</a>
         <span id="clock" class="muted text-xs"></span>
       </nav>
@@ -617,6 +618,237 @@ setInterval(loadTrades, 15000);
 </script>
 """
 
+_ML_REPORT_CONTENT: Final[
+    str
+] = """
+<section class="card" id="ml-ai-summary">
+  <div class="font-bold mb-3">AI DIAGNOSTIC SUMMARY</div>
+  <div id="ml-summary-body" class="muted text-sm">Loading...</div>
+</section>
+
+<section class="card">
+  <div class="flex items-center justify-between flex-wrap gap-3 mb-3">
+    <div class="font-bold">ML DIAGNOSTIC REPORT</div>
+    <div class="flex gap-2">
+      <a href="/api/ml/diagnostics/export.json"
+         class="bg-sky-700 hover:bg-sky-600 rounded px-3 py-1 text-xs font-bold">
+        EXPORT FULL ML DIAGNOSTIC REPORT (JSON)</a>
+      <a href="/api/ml/diagnostics/export.md"
+         class="bg-slate-700 hover:bg-slate-600 rounded px-3 py-1 text-xs font-bold">
+        DOWNLOAD HUMAN-READABLE REPORT (MD)</a>
+    </div>
+  </div>
+  <div id="ml-run-overview" class="muted text-xs mb-2"></div>
+</section>
+
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
+  <section class="card"><div class="font-bold mb-2">DATASET HEALTH</div>
+    <div id="ml-dataset" class="scroll"></div></section>
+  <section class="card"><div class="font-bold mb-2">DATA QUALITY / HEALING</div>
+    <div id="ml-dataquality" class="scroll"></div></section>
+</div>
+
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
+  <section class="card"><div class="font-bold mb-2">DIRECTION MODEL</div>
+    <div id="ml-direction" class="scroll"></div></section>
+  <section class="card"><div class="font-bold mb-2">ENTRY MODEL</div>
+    <div id="ml-entry" class="scroll"></div></section>
+</div>
+
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
+  <section class="card"><div class="font-bold mb-2">EXIT MODEL</div>
+    <div id="ml-exit" class="scroll"></div></section>
+  <section class="card"><div class="font-bold mb-2">RISK MODEL</div>
+    <div id="ml-risk" class="scroll"></div></section>
+</div>
+
+<section class="card"><div class="font-bold mb-2">FEATURES</div>
+  <div id="ml-features" class="scroll"></div></section>
+
+<section class="card"><div class="font-bold mb-2">LABELS</div>
+  <div id="ml-labels" class="scroll"></div></section>
+
+<section class="card"><div class="font-bold mb-2">WALK-FORWARD</div>
+  <div id="ml-walkforward" class="muted text-xs"></div></section>
+
+<section class="card"><div class="font-bold mb-2">BACKTEST</div>
+  <div id="ml-backtest" class="scroll"></div></section>
+
+<section class="card"><div class="font-bold mb-2">SYMBOLS</div>
+  <div id="ml-symbols" class="scroll"></div></section>
+
+<section class="card"><div class="font-bold mb-2">PIPELINE TIMING</div>
+  <div id="ml-timings" class="scroll"></div></section>
+
+<section class="card"><div class="font-bold mb-2">BEFORE vs AFTER (previous accepted baseline)</div>
+  <div id="ml-comparison" class="scroll"></div></section>
+
+<section class="card"><div class="font-bold mb-2">RECOMMENDATIONS</div>
+  <div id="ml-recommendations"></div></section>
+
+<section class="card">
+  <div class="font-bold mb-2">RAW REPORT (JSON)</div>
+  <div class="muted text-xs mb-2">Everything above is derived from this - nothing is only in a chart.</div>
+  <div class="scroll"><pre id="ml-raw-json" style="font-size:11px; white-space:pre-wrap;"></pre></div>
+</section>
+"""
+
+_ML_REPORT_SCRIPTS: Final[
+    str
+] = """
+<script>
+function kv(obj) {
+  if (obj === null || obj === undefined) return '<span class="muted">NOT_AVAILABLE</span>';
+  const keys = Object.keys(obj);
+  if (!keys.length) return '<span class="muted">NOT_AVAILABLE</span>';
+  return '<table><tbody>' + keys.map(k => {
+    let v = obj[k];
+    if (v !== null && typeof v === 'object') v = '<pre style="font-size:10px; margin:0;">' + JSON.stringify(v, null, 1) + '</pre>';
+    return '<tr><td class="muted">' + k + '</td><td>' + v + '</td></tr>';
+  }).join('') + '</tbody></table>';
+}
+
+function table(rows, columns) {
+  if (!rows || !rows.length) return '<span class="muted">NOT_AVAILABLE</span>';
+  const head = '<thead><tr>' + columns.map(c => '<th>' + c + '</th>').join('') + '</tr></thead>';
+  const body = '<tbody>' + rows.map(r => '<tr>' + columns.map(c => '<td>' + (r[c] === undefined ? '-' : r[c]) + '</td>').join('') + '</tr>').join('') + '</tbody>';
+  return '<table>' + head + body + '</table>';
+}
+
+function headModelBlock(head) {
+  if (!head || head.status === 'NOT_TRAINED') return '<span class="warn">NOT TRAINED</span>';
+  const m = head.metrics || {};
+  let extra = '';
+  if (head.calibration && head.calibration.status === 'AVAILABLE') {
+    extra += '<div class="muted text-xs mt-2">Calibration (isotonic): log loss ' +
+      fmt(head.calibration.log_loss_raw, 4) + ' -&gt; ' + fmt(head.calibration.log_loss_calibrated, 4) +
+      (head.calibration.improved ? ' <span class="pos">(improved)</span>' : ' <span class="warn">(no improvement)</span>') + '</div>';
+  }
+  if (head.threshold_sweep) {
+    extra += '<div class="muted text-xs mt-2">Threshold sweep</div>' +
+      table(head.threshold_sweep, ['threshold', 'signals', 'precision', 'recall', 'f1']);
+  }
+  if (head.feature_importance && head.feature_importance.status === 'AVAILABLE') {
+    extra += '<div class="muted text-xs mt-2">Top features</div>' +
+      table(head.feature_importance.top_features.slice(0, 10), ['feature', 'importance', 'importance_pct']);
+  }
+  return kv(m) + extra;
+}
+
+async function loadMlReport() {
+  const report = await (await fetch('/api/ml/diagnostics')).json();
+  if (report.status === 'NOT_AVAILABLE') {
+    document.getElementById('ml-summary-body').innerHTML =
+      '<span class="muted">No training run has completed yet - ' + (report.reason || '') + '</span>';
+    document.getElementById('ml-raw-json').textContent = JSON.stringify(report, null, 2);
+    return;
+  }
+
+  const s = report.ai_summary || {};
+  const statusColor = {GOOD: 'pos', WARNING: 'warn', CRITICAL: 'neg'}[s.overall_status] || 'muted';
+  document.getElementById('ml-summary-body').innerHTML =
+    '<span class="pill ' + statusColor + '">' + (s.overall_status || 'NOT_AVAILABLE') + '</span> &nbsp; ' +
+    '<table class="mt-2"><tbody>' +
+      '<tr><td class="muted">Strongest component</td><td>' + s.strongest_component + '</td></tr>' +
+      '<tr><td class="muted">Weakest component</td><td>' + s.weakest_component + '</td></tr>' +
+      '<tr><td class="muted">Biggest data problem</td><td>' + s.biggest_data_problem + '</td></tr>' +
+      '<tr><td class="muted">Biggest ML problem</td><td>' + s.biggest_ml_problem + '</td></tr>' +
+      '<tr><td class="muted">Biggest validation problem</td><td>' + s.biggest_validation_problem + '</td></tr>' +
+      '<tr><td class="muted">Biggest trading problem</td><td>' + s.biggest_trading_problem + '</td></tr>' +
+      '<tr><td class="muted">Most important improvement</td><td>' + s.most_important_metric_improvement + '</td></tr>' +
+      '<tr><td class="muted">Most important degradation</td><td>' + s.most_important_metric_degradation + '</td></tr>' +
+      '<tr><td class="muted">Recommended next action</td><td>' + s.recommended_next_action + '</td></tr>' +
+    '</tbody></table>';
+
+  const run = report.run || {};
+  document.getElementById('ml-run-overview').textContent =
+    'run ' + run.run_id + ' | git ' + run.git_commit + ' | ' + run.generated_at + ' | symbols: ' +
+    (run.symbols || []).join(', ');
+
+  document.getElementById('ml-dataset').innerHTML = kv(report.dataset);
+
+  const dq = report.data_quality || {};
+  document.getElementById('ml-dataquality').innerHTML =
+    kv({status: dq.status, heal_attempts_total: dq.heal_attempts_total,
+        heal_attempts_by_result: dq.heal_attempts_by_result,
+        symbol_exclusions_total: dq.symbol_exclusions_total}) +
+    '<div class="muted text-xs mt-2">Recent exclusions</div>' +
+    table(dq.recent_symbol_exclusions || [], ['symbol', 'reason', 'excluded_at_ms']);
+
+  document.getElementById('ml-direction').innerHTML = headModelBlock(report.direction);
+  document.getElementById('ml-entry').innerHTML = headModelBlock(report.entry);
+
+  const exitHead = report.exit || {};
+  if (exitHead.status === 'NOT_TRAINED') {
+    document.getElementById('ml-exit').innerHTML = '<span class="warn">NOT TRAINED</span>';
+  } else {
+    const targets = Object.keys(exitHead.metrics || {});
+    document.getElementById('ml-exit').innerHTML = targets.map(t =>
+      '<div class="muted text-xs mt-1">' + t + '</div>' + kv(exitHead.metrics[t])
+    ).join('');
+  }
+  document.getElementById('ml-risk').innerHTML = headModelBlock(report.risk);
+
+  const feat = report.features || {};
+  const drift = (feat.drift && feat.drift.most_drifted_features) || [];
+  document.getElementById('ml-features').innerHTML =
+    '<div class="muted text-xs">Most drifted features (train vs validation)</div>' +
+    table(drift.slice(0, 15), ['feature', 'mean_shift_in_train_std', 'variance_ratio']) +
+    '<div class="muted text-xs mt-3">Top correlated feature pairs</div>' +
+    table(((feat.correlation && feat.correlation.top_correlated_pairs) || []).slice(0, 15),
+          ['feature_a', 'feature_b', 'correlation']);
+
+  document.getElementById('ml-labels').innerHTML =
+    kv(report.labels ? report.labels.configuration : null) +
+    '<div class="muted text-xs mt-2">Class distribution</div>' +
+    kv(report.labels ? report.labels.class_distribution : null);
+
+  const wf = report.walk_forward || {};
+  document.getElementById('ml-walkforward').innerHTML =
+    '<span class="muted">' + (wf.status || 'NOT_AVAILABLE') + (wf.reason ? ': ' + wf.reason : '') + '</span>';
+
+  const bt = report.backtest || {};
+  document.getElementById('ml-backtest').innerHTML =
+    bt.status === 'NOT_AVAILABLE' ? '<span class="muted">NOT_AVAILABLE</span>' : kv(bt.metrics || bt);
+
+  const symbols = report.symbols || {};
+  const perSymbolRows = Object.keys(symbols.per_symbol_rows || {}).map(sym => ({
+    symbol: sym,
+    rows: symbols.per_symbol_rows[sym],
+    direction_accuracy: symbols.per_symbol_direction_accuracy &&
+      symbols.per_symbol_direction_accuracy[sym] ? fmt(symbols.per_symbol_direction_accuracy[sym].accuracy, 3) : '-',
+  }));
+  document.getElementById('ml-symbols').innerHTML = table(perSymbolRows, ['symbol', 'rows', 'direction_accuracy']);
+
+  const timings = report.timings || {};
+  if (timings.status === 'AVAILABLE') {
+    const rows = Object.keys(timings.per_stage || {}).map(stage => ({stage: stage, ...timings.per_stage[stage]}));
+    document.getElementById('ml-timings').innerHTML =
+      '<div class="muted text-xs mb-1">' + timings.cycles_measured + ' cycle(s) measured</div>' +
+      table(rows, ['stage', 'mean_seconds', 'median_seconds', 'max_seconds', 'min_seconds']);
+  } else {
+    document.getElementById('ml-timings').innerHTML = '<span class="muted">NOT_AVAILABLE</span>';
+  }
+
+  document.getElementById('ml-comparison').innerHTML =
+    table(report.comparison_to_previous_baseline || [], ['metric', 'before', 'after', 'change', 'verdict']);
+
+  const rec = report.recommendations || {};
+  document.getElementById('ml-recommendations').innerHTML =
+    ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'].map(level => {
+      const items = rec[level] || [];
+      if (!items.length) return '';
+      return '<div class="mt-2"><span class="pill ' +
+        (level === 'CRITICAL' ? 'neg' : level === 'HIGH' ? 'warn' : 'muted') + '">' + level + '</span>' +
+        '<ul class="text-xs mt-1">' + items.map(i => '<li>- ' + i + '</li>').join('') + '</ul></div>';
+    }).join('') || '<span class="muted">none</span>';
+
+  document.getElementById('ml-raw-json').textContent = JSON.stringify(report, null, 2);
+}
+loadMlReport();
+</script>
+"""
+
 #: Template registry consumed by the Jinja2 ``DictLoader`` in ``web_app.py``.
 TEMPLATES: Final[dict[str, str]] = {
     "base.html": _BASE,
@@ -628,4 +860,6 @@ TEMPLATES: Final[dict[str, str]] = {
     "universe_scripts.html": _UNIVERSE_SCRIPTS,
     "trades_content.html": _TRADES_CONTENT,
     "trades_scripts.html": _TRADES_SCRIPTS,
+    "ml_report_content.html": _ML_REPORT_CONTENT,
+    "ml_report_scripts.html": _ML_REPORT_SCRIPTS,
 }

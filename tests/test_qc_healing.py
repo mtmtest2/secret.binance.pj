@@ -137,9 +137,12 @@ async def test_validate_and_heal_heals_a_fixable_gap() -> None:
     async def refetch(symbol: str, start_ms: int, end_ms: int) -> list[OHLCVCandle]:
         return [c for c in full if start_ms <= c.timestamp <= end_ms]
 
-    healed, report = await validator.validate_and_heal("X", damaged, refetch)
+    healed, report, heal_attempts = await validator.validate_and_heal("X", damaged, refetch)
     assert report.passed
     assert len(healed) == 20
+    assert len(heal_attempts) == 1
+    assert heal_attempts[0].result == "resolved"
+    assert heal_attempts[0].bars_invalid_after_heal == 0
 
 
 @pytest.mark.asyncio
@@ -164,7 +167,7 @@ async def test_validate_and_heal_quarantines_unfixable_gap_when_enabled() -> Non
     async def refetch(symbol: str, start_ms: int, end_ms: int) -> list[OHLCVCandle]:
         return []
 
-    healed, report = await validator.validate_and_heal(
+    healed, report, heal_attempts = await validator.validate_and_heal(
         "X", damaged, refetch, quarantine_unhealable=True
     )
     assert report.passed
@@ -172,6 +175,7 @@ async def test_validate_and_heal_quarantines_unfixable_gap_when_enabled() -> Non
     assert healed[0].timestamp == full[10].timestamp
     assert healed[-1].timestamp == full[-1].timestamp
     assert len(healed) == 20
+    assert heal_attempts[-1].result == "quarantined"
 
 
 @pytest.mark.asyncio
@@ -199,6 +203,7 @@ async def test_validate_and_heal_passthrough_when_already_clean() -> None:
     async def refetch(symbol: str, start_ms: int, end_ms: int) -> list[OHLCVCandle]:
         raise AssertionError("refetch must not be called when the block is already clean")
 
-    healed, report = await validator.validate_and_heal("X", full, refetch)
+    healed, report, heal_attempts = await validator.validate_and_heal("X", full, refetch)
     assert report.passed
     assert len(healed) == 20
+    assert heal_attempts == []

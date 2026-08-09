@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import random
+import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Sequence, TypeVar
 
 T = TypeVar("T")
@@ -103,6 +105,29 @@ def longest_clean_trailing_run(
         if cleaned[index] - cleaned[index - 1] > timeframe_ms:
             cut_index = index
     return cleaned[cut_index:]
+
+
+def git_commit_hash() -> str:
+    """Best-effort short git commit hash of the running checkout.
+
+    Used to stamp model artifacts and diagnostic reports so a training run is
+    reproducible - never raises: returns ``"unknown"`` outside a git checkout
+    or when the ``git`` binary is unavailable (e.g. a stripped-down
+    deployment image).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            cwd=Path(__file__).resolve().parent.parent,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover - environment-dependent
+        return "unknown"
+    commit: str = result.stdout.strip()
+    return commit if result.returncode == 0 and commit else "unknown"
 
 
 # ---------------------------------------------------------------------------

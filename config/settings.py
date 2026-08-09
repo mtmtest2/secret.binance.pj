@@ -168,9 +168,14 @@ class QCSettings(BaseModel):
     #: one contiguous re-fetch window instead of two separate ones.
     heal_merge_gap_bars: int = Field(default=3, ge=0)
     #: When a heal attempt would otherwise need more distinct windows than this,
-    #: it falls back to one window spanning the full damaged range - fragmenting
+    #: it falls back to batched windows spanning the damaged range - fragmenting
     #: further would trade a handful of extra requests for no real precision.
     max_heal_window_groups: int = Field(default=12, ge=1)
+    #: Hard cap, in bars, on the span of any single fallback batch window. Without
+    #: this, widespread damage across a long history could otherwise collapse
+    #: into one unbounded re-fetch of tens of thousands of candles; instead the
+    #: full damaged range is split into controlled, bounded-size batches.
+    max_heal_window_bars: int = Field(default=2_000, ge=50)
 
     #: A candle whose volume exceeds ``median * this`` is flagged as an anomaly.
     volume_spike_median_multiple: float = Field(default=50.0, gt=1.0)

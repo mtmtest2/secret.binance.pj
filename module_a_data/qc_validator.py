@@ -55,6 +55,7 @@ from core.utils import (
 )
 from module_a_data.models import (
     FuturesMetrics,
+    HealAttempt,
     OHLCVCandle,
     OrderBookSnapshot,
     QCIssue,
@@ -164,7 +165,7 @@ class QCValidator:
         refetch: RefetchCallback,
         *,
         quarantine_unhealable: bool = False,
-    ) -> tuple[list[OHLCVCandle], QCReport]:
+    ) -> tuple[list[OHLCVCandle], QCReport, list[HealAttempt]]:
         """Validate a block and recursively repair it until it is pristine.
 
         The heal loop is *targeted*: only the damaged timestamp windows are
@@ -192,10 +193,15 @@ class QCValidator:
                 rather than traded on a trimmed subset.
 
         Returns:
-            ``(healed_candles, final_report)``.  ``final_report.passed`` is
-            always ``True`` for the returned candles, whether they arrived
+            ``(healed_candles, final_report, heal_attempts)``.  ``final_report.passed``
+            is always ``True`` for the returned candles, whether they arrived
             pristine, were healed, or - when quarantining - were trimmed down to
-            their longest clean trailing run.
+            their longest clean trailing run.  ``heal_attempts`` records every
+            re-fetch round tried (symbol, reason, window span, bars
+            requested/received/written, remaining damage, duration and
+            per-round result), even when the call ultimately raises - the
+            records are attached to the raised error's ``context["heal_attempts"]``
+            so a caller can log or persist them either way.
 
         Raises:
             DataIntegrityError: When the block is still invalid after
@@ -206,6 +212,25 @@ class QCValidator:
         """
         working: list[OHLCVCandle] = sorted(candles, key=lambda item: item.timestamp)
         report: QCReport = self.validate_candles(symbol, working)
+        heal_attempts: list[HealAttempt] = []
+
+        def _record_quarantine(before: QCReport, kept: list[OHLCVCandle]) -> None:
+            heal_attempts.append(
+                HealAttempt(
+                    symbol=symbol,
+                    attempt_number=len(heal_attempts) + 1,
+                    reason=before.critical_codes,
+                    window_count=0,
+                    start_timestamp=kept[0].timestamp if kept else None,
+                    end_timestamp=kept[-1].timestamp if kept else None,
+                    bars_requested=0,
+                    bars_received=0,
+                    bars_written=0,
+                    bars_invalid_after_heal=0,
+                    duration_seconds=0.0,
+                    result="quarantined",
+                )
+            )
 
         attempt: int = 0
         deadline: float = time.monotonic() + self._qc.max_heal_duration_seconds
@@ -213,24 +238,30 @@ class QCValidator:
             if not report.healable:
                 quarantined = self._try_quarantine(symbol, working, report, quarantine_unhealable)
                 if quarantined is not None:
-                    return quarantined
+                    healed_candles, final_report = quarantined
+                    _record_quarantine(report, healed_candles)
+                    return healed_candles, final_report, heal_attempts
                 raise DataIntegrityError(
                     "QC failure cannot be healed by re-fetching",
                     symbol=symbol,
                     codes=report.critical_codes,
+                    heal_attempts=[record.model_dump(mode="json") for record in heal_attempts],
                 )
             if time.monotonic() >= deadline:
                 # A stuck healer must not hold the shared request-rate budget
                 # indefinitely and starve every other symbol's cycle.
                 quarantined = self._try_quarantine(symbol, working, report, quarantine_unhealable)
                 if quarantined is not None:
-                    return quarantined
+                    healed_candles, final_report = quarantined
+                    _record_quarantine(report, healed_candles)
+                    return healed_candles, final_report, heal_attempts
                 raise DataIntegrityError(
                     "heal loop exceeded its wall-clock budget",
                     symbol=symbol,
                     attempts=attempt,
                     budget_seconds=self._qc.max_heal_duration_seconds,
                     codes=report.critical_codes,
+                    heal_attempts=[record.model_dump(mode="json") for record in heal_attempts],
                 )
 
             delay: float = backoff_delay(
@@ -240,10 +271,11 @@ class QCValidator:
                 jitter=self._settings.exchange.backoff_jitter,
             )
             windows: list[tuple[int, int]] = self._heal_windows(working, report)
+            reason: tuple[str, ...] = report.critical_codes
             _LOGGER.warning(
                 "QC failed for %s (%s) - heal attempt %d/%d: %d window(s) in %.2fs",
                 symbol,
-                ", ".join(report.critical_codes),
+                ", ".join(reason),
                 attempt + 1,
                 self._qc.max_heal_attempts,
                 len(windows),
@@ -251,28 +283,53 @@ class QCValidator:
             )
             await asyncio.sleep(delay)
 
+            attempt_started: float = time.monotonic()
+            bars_requested: int = sum(
+                max(1, (end_ms - start_ms) // self._timeframe_ms) for start_ms, end_ms in windows
+            )
             patches: list[list[OHLCVCandle]] = await asyncio.gather(
                 *(refetch(symbol, start_ms, end_ms) for start_ms, end_ms in windows)
             )
+            bars_received: int = sum(len(patch) for patch in patches)
 
             working = self._merge_patches(working, self._suspicious_timestamps(report), patches)
             report = self.validate_candles(symbol, working)
             attempt += 1
 
+            heal_attempts.append(
+                HealAttempt(
+                    symbol=symbol,
+                    attempt_number=attempt,
+                    reason=reason,
+                    window_count=len(windows),
+                    start_timestamp=windows[0][0] if windows else None,
+                    end_timestamp=windows[-1][1] if windows else None,
+                    bars_requested=bars_requested,
+                    bars_received=bars_received,
+                    bars_written=bars_received,
+                    bars_invalid_after_heal=len(self._suspicious_timestamps(report)),
+                    duration_seconds=time.monotonic() - attempt_started,
+                    result="resolved" if report.passed else "still_invalid",
+                )
+            )
+
         if not report.passed:
             quarantined = self._try_quarantine(symbol, working, report, quarantine_unhealable)
             if quarantined is not None:
-                return quarantined
+                healed_candles, final_report = quarantined
+                _record_quarantine(report, healed_candles)
+                return healed_candles, final_report, heal_attempts
             raise DataIntegrityError(
                 "data still invalid after exhausting heal attempts",
                 symbol=symbol,
                 attempts=attempt,
                 codes=report.critical_codes,
+                heal_attempts=[record.model_dump(mode="json") for record in heal_attempts],
             )
 
         if attempt:
             _LOGGER.info("Healed %s after %d attempt(s): %d rows", symbol, attempt, len(working))
-        return working, report
+        return working, report, heal_attempts
 
     def _try_quarantine(
         self,
@@ -911,8 +968,12 @@ class QCValidator:
         When the block is empty, the last ``ohlcv_limit`` bars are requested from
         scratch.  When grouping would produce more windows than
         ``max_heal_window_groups``, the damage is judged widespread enough that
-        fragmentation buys no precision, and a single spanning window is used
-        instead (the previous, simpler behaviour).
+        per-gap fragmentation buys no precision - but the runs are still
+        coalesced into **bounded batches** of at most ``max_heal_window_bars``
+        each, never one unbounded window spanning the whole range.  Without this
+        cap, sufficiently scattered damage across a long history (a stale-data
+        stretch, a multi-day exchange gap) could otherwise turn into a single
+        re-fetch of tens of thousands of candles in one attempt.
         """
         suspicious: set[int] = self._suspicious_timestamps(report)
 
@@ -942,8 +1003,28 @@ class QCValidator:
             windows[-1] = (last_start, max(last_end, newest_expected))
 
         if len(windows) > self._qc.max_heal_window_groups:
-            return [(windows[0][0], windows[-1][1])]
+            return self._batch_windows(windows)
         return windows
+
+    def _batch_windows(self, windows: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
+        """Coalesce many small windows into few, but bounded-size, batches.
+
+        Greedily extends each batch until adding the next window would push its
+        span past ``max_heal_window_bars``, then starts a new batch.  This keeps
+        every single re-fetch request controlled in size regardless of how many
+        (or how widely scattered) the original damaged windows were.
+        """
+        max_span_ms: int = self._qc.max_heal_window_bars * self._timeframe_ms
+        batches: list[tuple[int, int]] = []
+        batch_start, batch_end = windows[0]
+        for start_ms, end_ms in windows[1:]:
+            if end_ms - batch_start <= max_span_ms:
+                batch_end = end_ms
+            else:
+                batches.append((batch_start, batch_end))
+                batch_start, batch_end = start_ms, end_ms
+        batches.append((batch_start, batch_end))
+        return batches
 
     def _merge_patches(
         self,

@@ -28,6 +28,7 @@ Inference contract
 from __future__ import annotations
 
 import asyncio
+import json
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,10 +41,11 @@ import pandas as pd
 from config.settings import MLSettings, Settings
 from core.exceptions import ModelNotLoadedError, ModelTrainingError
 from core.logger import get_logger
-from core.utils import clamp
+from core.utils import clamp, git_commit_hash
 from module_b_features.features import FEATURE_COLUMNS, HMMRegime
 from module_b_features.labeler import LABEL_ORDER, LabelClass
 from module_b_features.processor import InferencePayload, ProcessedDataset
+from module_c_ml import metrics as ml_metrics
 from module_c_ml.schemas import (
     DirectionPrediction,
     EntryPrediction,
@@ -57,6 +59,24 @@ from module_c_ml.schemas import (
 _LOGGER = get_logger(__name__)
 
 _ARTIFACT_VERSION: Final[str] = "1.0.0"
+
+#: Hyperparameter fields recorded verbatim in every artifact's metadata, so a
+#: training run can be reproduced from the sidecar JSON alone.
+_HYPERPARAMETER_FIELDS: Final[tuple[str, ...]] = (
+    "booster",
+    "n_estimators",
+    "learning_rate",
+    "max_depth",
+    "num_leaves",
+    "min_child_samples",
+    "subsample",
+    "colsample_bytree",
+    "reg_lambda",
+    "random_state",
+    "validation_fraction",
+    "purge_bars",
+    "early_stopping_rounds",
+)
 
 # Hard sanity rails applied to every exit geometry, trained or heuristic.
 _MIN_TP_PCT: Final[float] = 0.0020
@@ -99,6 +119,31 @@ def load_artifact(path: Path) -> dict[str, Any] | None:
     return payload
 
 
+def _hyperparameter_snapshot(config: MLSettings) -> dict[str, Any]:
+    """The exact booster hyperparameters used for this run, for reproducibility."""
+    return {field: getattr(config, field) for field in _HYPERPARAMETER_FIELDS if hasattr(config, field)}
+
+
+def _temporal_half_split(
+    features: pd.DataFrame, target: pd.Series
+) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]:
+    """Split an already-temporally-ordered block into an earlier and later half.
+
+    Used to carve a calibration-fit slice (earlier) and a calibration-eval
+    slice (later) out of the validation block, so calibration is fit and
+    scored on genuinely non-overlapping, temporally ordered data rather than
+    reusing the same rows for both - the same discipline as the primary
+    train/validation split, one level down.
+    """
+    midpoint: int = len(features) // 2
+    return (
+        features.iloc[:midpoint],
+        target.iloc[:midpoint],
+        features.iloc[midpoint:],
+        target.iloc[midpoint:],
+    )
+
+
 class BaseModelHead(ABC):
     """Shared training / persistence plumbing for the four heads."""
 
@@ -139,7 +184,16 @@ class BaseModelHead(ABC):
     # Persistence
     # ------------------------------------------------------------------
     def save(self, path: Path | None = None) -> Path:
-        """Persist the fitted estimator plus its feature contract."""
+        """Persist the fitted estimator plus its feature contract.
+
+        Alongside the joblib artifact (the only thing inference needs), a
+        human- and machine-readable ``{name}.metrics.json`` sidecar is also
+        written with the full training metadata - hyperparameters, git
+        commit, feature list, dataset size, class distribution and every
+        computed metric.  The joblib blob is opaque to a diagnostic report
+        generator; the JSON sidecar is what makes a run's results readable
+        without unpickling an estimator.
+        """
         if self._model is None:
             raise ModelNotLoadedError(f"{self.name}: nothing to save", head=self.name)
 
@@ -156,6 +210,23 @@ class BaseModelHead(ABC):
             destination,
             compress=3,
         )
+        sidecar: Path = destination.with_suffix(".metrics.json")
+        try:
+            sidecar.write_text(
+                json.dumps(
+                    {
+                        "artifact_version": _ARTIFACT_VERSION,
+                        "head": self.name,
+                        "feature_columns": list(self._feature_columns),
+                        **self._metadata,
+                    },
+                    indent=2,
+                    default=str,
+                ),
+                encoding="utf-8",
+            )
+        except OSError as error:  # pragma: no cover - disk full / permissions
+            _LOGGER.error("Could not write metrics sidecar for %s: %s", self.name, error)
         _LOGGER.info("Saved %s model -> %s", self.name, destination)
         return destination
 
@@ -391,40 +462,47 @@ class DirectionModel(BaseModelHead):
 
         self._model = estimator
         self._feature_columns = dataset.feature_columns
-        metrics: dict[str, Any] = self._score(
-            estimator, features.iloc[validation_index], encoded.iloc[validation_index].astype(int)
-        )
+
+        validation_features: pd.DataFrame = features.iloc[validation_index]
+        validation_target: pd.Series = encoded.iloc[validation_index].astype(int)
+        full_metrics: dict[str, Any] = {}
+        importance: dict[str, Any] = {"status": "NOT_AVAILABLE", "reason": "no validation rows"}
+        calibration: dict[str, Any] = {"status": "NOT_AVAILABLE", "reason": "no validation rows"}
+        per_symbol: dict[str, Any] = {}
+        if not validation_features.empty:
+            probabilities: np.ndarray = np.asarray(estimator.predict_proba(validation_features))
+            full_metrics = ml_metrics.direction_metrics(validation_target, probabilities, LABEL_ORDER)
+            importance = ml_metrics.feature_importance(estimator, dataset.feature_columns)
+            calib_x, calib_y, eval_x, eval_y = _temporal_half_split(validation_features, validation_target)
+            calibration = ml_metrics.calibrate_classifier(
+                estimator, calib_x, calib_y, eval_x, eval_y, n_classes=len(LABEL_ORDER)
+            )
+            if "symbol" in dataset.metadata.columns:
+                symbols_validation: pd.Series = dataset.metadata["symbol"].iloc[validation_index]
+                per_symbol = ml_metrics.per_symbol_direction_accuracy(
+                    validation_target, probabilities.argmax(axis=1), symbols_validation
+                )
+
         self._metadata = {
             "trained_at": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
+            "git_commit": git_commit_hash(),
             "rows": int(len(train_index)),
             "validation_rows": int(len(validation_index)),
             "classes": list(LABEL_ORDER),
             "distribution": dataset.class_distribution(),
-            "metrics": metrics,
+            "hyperparameters": _hyperparameter_snapshot(self._config),
+            "metrics": full_metrics,
+            "feature_importance": importance,
+            "calibration": calibration,
+            "per_symbol": per_symbol,
         }
-        _LOGGER.info("Direction model trained: %s", metrics)
-        return metrics
-
-    @staticmethod
-    def _score(estimator: Any, features: pd.DataFrame, target: pd.Series) -> dict[str, float]:
-        """Compute validation accuracy, balanced accuracy and log loss."""
-        if features.empty:
-            return {}
-        from sklearn.metrics import accuracy_score, balanced_accuracy_score, log_loss
-
-        predictions: np.ndarray = estimator.predict(features)
-        probabilities: np.ndarray = estimator.predict_proba(features)
-        try:
-            loss: float = float(
-                log_loss(target, probabilities, labels=list(range(len(LABEL_ORDER))))
-            )
-        except ValueError:  # pragma: no cover - degenerate validation block
-            loss = float("nan")
-        return {
-            "accuracy": float(accuracy_score(target, predictions)),
-            "balanced_accuracy": float(balanced_accuracy_score(target, predictions)),
-            "log_loss": loss,
+        headline: dict[str, Any] = {
+            key: full_metrics[key]
+            for key in ("accuracy", "balanced_accuracy", "log_loss")
+            if key in full_metrics
         }
+        _LOGGER.info("Direction model trained: %s", headline)
+        return full_metrics
 
     def predict(self, features: pd.DataFrame) -> DirectionPrediction:
         """Score a single feature row (stateless, thread-safe).
@@ -525,32 +603,45 @@ class EntryModel(BaseModelHead):
         self._model = estimator
         self._feature_columns = dataset.feature_columns
 
-        metrics: dict[str, float] = {}
+        full_metrics: dict[str, Any] = {}
+        threshold_sweep: list[dict[str, Any]] = []
+        importance: dict[str, Any] = {"status": "NOT_AVAILABLE", "reason": "no validation rows"}
+        calibration: dict[str, Any] = {"status": "NOT_AVAILABLE", "reason": "no validation rows"}
+        cutoff: float = self._settings.decision.min_entry_probability
         if len(validation_index) > 0:
-            from sklearn.metrics import precision_score, recall_score, roc_auc_score
-
             validation_features: pd.DataFrame = features.iloc[validation_index]
             validation_target: pd.Series = target.iloc[validation_index]
-            predictions: np.ndarray = estimator.predict(validation_features)
-            probabilities: np.ndarray = estimator.predict_proba(validation_features)[:, 1]
-            metrics = {
-                "precision": float(precision_score(validation_target, predictions, zero_division=0)),
-                "recall": float(recall_score(validation_target, predictions, zero_division=0)),
-                "roc_auc": (
-                    float(roc_auc_score(validation_target, probabilities))
-                    if validation_target.nunique() > 1
-                    else float("nan")
-                ),
-            }
+            probabilities: np.ndarray = np.asarray(
+                estimator.predict_proba(validation_features)
+            )[:, 1]
+            full_metrics = ml_metrics.entry_metrics(validation_target, probabilities, cutoff)
+            threshold_sweep = ml_metrics.entry_threshold_sweep(validation_target, probabilities)
+            importance = ml_metrics.feature_importance(estimator, dataset.feature_columns)
+            calib_x, calib_y, eval_x, eval_y = _temporal_half_split(
+                validation_features, validation_target
+            )
+            calibration = ml_metrics.calibrate_classifier(
+                estimator, calib_x, calib_y, eval_x, eval_y, n_classes=2
+            )
 
         self._metadata = {
             "trained_at": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
+            "git_commit": git_commit_hash(),
             "rows": int(len(train_index)),
+            "validation_rows": int(len(validation_index)),
             "positive_rate": float(target.mean()),
-            "metrics": metrics,
+            "decision_threshold": cutoff,
+            "hyperparameters": _hyperparameter_snapshot(self._config),
+            "metrics": full_metrics,
+            "threshold_sweep": threshold_sweep,
+            "feature_importance": importance,
+            "calibration": calibration,
         }
-        _LOGGER.info("Entry model trained: %s", metrics)
-        return metrics
+        headline: dict[str, Any] = {
+            key: full_metrics[key] for key in ("precision", "recall", "roc_auc") if key in full_metrics
+        }
+        _LOGGER.info("Entry model trained: %s", headline)
+        return full_metrics
 
     def predict(
         self,
@@ -649,8 +740,11 @@ class ExitModel(BaseModelHead):
         train_end: int = max(1, split_point - self._config.purge_bars)
 
         estimators: dict[str, Any] = {}
-        metrics: dict[str, float] = {}
-        from sklearn.metrics import mean_absolute_error
+        full_metrics: dict[str, Any] = {}
+        importance: dict[str, Any] = {}
+
+        validation_features: pd.DataFrame = features.iloc[split_point:]
+        baseline: dict[str, np.ndarray] = self._baseline_predictions(validation_features)
 
         for column in self._TARGETS:
             estimator: Any = self._make_regressor()
@@ -658,26 +752,72 @@ class ExitModel(BaseModelHead):
                 estimator,
                 features.iloc[:train_end],
                 targets[column].iloc[:train_end],
-                features.iloc[split_point:],
+                validation_features,
                 targets[column].iloc[split_point:],
                 eval_metric="l1",
             )
             estimators[column] = estimator
             if split_point < len(features):
-                predictions: np.ndarray = estimator.predict(features.iloc[split_point:])
-                metrics[f"{column}_mae"] = float(
-                    mean_absolute_error(targets[column].iloc[split_point:], predictions)
+                predictions: np.ndarray = estimator.predict(validation_features)
+                validation_target: np.ndarray = targets[column].iloc[split_point:].to_numpy()
+                target_metrics: dict[str, Any] = ml_metrics.regression_metrics(
+                    validation_target, predictions
                 )
+                baseline_metrics: dict[str, Any] = ml_metrics.regression_metrics(
+                    validation_target, baseline[column]
+                )
+                target_metrics["baseline_rule_based_mae"] = baseline_metrics.get("mae")
+                target_metrics["beats_rule_based_baseline"] = bool(
+                    target_metrics.get("mae", float("inf")) < baseline_metrics.get("mae", float("inf"))
+                )
+                full_metrics[column] = target_metrics
+                importance[column] = ml_metrics.feature_importance(estimator, dataset.feature_columns)
 
         self._model = estimators
         self._feature_columns = dataset.feature_columns
         self._metadata = {
             "trained_at": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
+            "git_commit": git_commit_hash(),
             "rows": int(train_end),
-            "metrics": metrics,
+            "validation_rows": int(len(features) - split_point),
+            "hyperparameters": _hyperparameter_snapshot(self._config),
+            "metrics": full_metrics,
+            "feature_importance": importance,
         }
-        _LOGGER.info("Exit model trained: %s", metrics)
-        return metrics
+        headline: dict[str, Any] = {
+            column: full_metrics[column].get("mae") for column in full_metrics
+        }
+        _LOGGER.info("Exit model trained: %s", headline)
+        return full_metrics
+
+    def _baseline_predictions(self, features: pd.DataFrame) -> dict[str, np.ndarray]:
+        """Vectorised twin of :meth:`_heuristic`'s ATR-scaled rule, for comparison.
+
+        Per Part 15 of the diagnostic reporting requirements: the ML exit
+        model must prove it beats the plain rule-based baseline that would
+        run in its place, rather than being trusted on its validation MAE
+        alone.
+        """
+        atr_pct: pd.Series = features.get("atr_pct", pd.Series(0.0, index=features.index)).fillna(0.0)
+        garch: pd.Series = features.get(
+            "garch_volatility", pd.Series(0.0, index=features.index)
+        ).fillna(0.0)
+        effective_atr: pd.Series = atr_pct.where(atr_pct > 0.0, (garch * 2.0).clip(lower=0.0025))
+
+        vol_rank: pd.Series = features.get(
+            "garch_vol_rank", pd.Series(0.5, index=features.index)
+        ).fillna(0.5)
+        widen: pd.Series = 1.0 + 0.6 * vol_rank.clip(0.0, 1.0)
+
+        stop_loss: np.ndarray = (effective_atr * self._settings.labels.sl_atr_multiple * widen).to_numpy()
+        take_profit: np.ndarray = (
+            effective_atr * self._settings.labels.tp_atr_multiple * widen
+        ).to_numpy()
+        return {
+            "target_tp_pct": take_profit,
+            "target_sl_pct": stop_loss,
+            "target_trailing_pct": take_profit * 0.5,
+        }
 
     def predict(self, features: pd.DataFrame) -> ExitParameters:
         """Produce the trade-management geometry for the current bar."""
@@ -796,23 +936,29 @@ class RiskModel(BaseModelHead):
         self._model = estimator
         self._feature_columns = dataset.feature_columns
 
-        metrics: dict[str, float] = {}
+        full_metrics: dict[str, Any] = {}
+        importance: dict[str, Any] = {"status": "NOT_AVAILABLE", "reason": "no validation rows"}
         if len(validation_index) > 0:
-            from sklearn.metrics import mean_absolute_error, r2_score
-
             predictions: np.ndarray = estimator.predict(features.iloc[validation_index])
-            metrics = {
-                "mae": float(mean_absolute_error(target.iloc[validation_index], predictions)),
-                "r2": float(r2_score(target.iloc[validation_index], predictions)),
-            }
+            full_metrics = ml_metrics.regression_metrics(
+                target.iloc[validation_index].to_numpy(), predictions
+            )
+            importance = ml_metrics.feature_importance(estimator, dataset.feature_columns)
 
         self._metadata = {
             "trained_at": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
+            "git_commit": git_commit_hash(),
             "rows": int(len(train_index)),
-            "metrics": metrics,
+            "validation_rows": int(len(validation_index)),
+            "hyperparameters": _hyperparameter_snapshot(self._config),
+            "metrics": full_metrics,
+            "feature_importance": importance,
         }
-        _LOGGER.info("Risk model trained: %s", metrics)
-        return metrics
+        headline: dict[str, Any] = {
+            key: full_metrics[key] for key in ("mae", "r2") if key in full_metrics
+        }
+        _LOGGER.info("Risk model trained: %s", headline)
+        return full_metrics
 
     def predict(
         self,

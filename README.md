@@ -223,8 +223,8 @@ Every decision cycle is logged, **including every `NO_TRADE`**, with the feature
 snapshot, all four model outputs and the exact rule that fired. Writes are
 batched through an `asyncio.Queue`, so the trading loop never waits on SQLite.
 
-The panel serves `/` (dashboard), `/universe` (pair picker), `/audit` and
-`/trades`, plus a JSON API:
+The panel serves `/` (dashboard), `/universe` (pair picker), `/audit`,
+`/trades` and `/ml-report` (ML diagnostic report), plus a JSON API:
 
 | Endpoint | Purpose |
 |---|---|
@@ -237,6 +237,25 @@ The panel serves `/` (dashboard), `/universe` (pair picker), `/audit` and
 | `POST /api/trading/stop` | Disarm (`{"flatten": true}` to close positions too) |
 | `POST /api/kill_switch` | Trip RED, flatten everything |
 | `POST /api/reset_risk_guard` | Clear a RED latch |
+| `GET /api/ml/diagnostics` | Full ML diagnostic report for the last training run (JSON) |
+| `GET /api/ml/diagnostics/export.json` | Same report, as a download |
+| `GET /api/ml/diagnostics/export.md` | Human-readable Markdown rendering, as a download |
+
+### ML diagnostic report
+
+Every completed training run (`python main.py train`, or the panel's
+COLLECTING_DATA → TRAINING step) builds one structured report covering
+dataset health, QC/healing telemetry, per-head metrics (Direction, Entry,
+Exit, Risk) with confusion matrices, threshold sweeps, calibration and
+feature importance, label distribution, per-symbol breakdown, pipeline
+timing, and a before/after comparison against the previous run. An AI-ready
+summary sits at the top so the report can be handed to another AI to
+diagnose what changed. Every field with no real source data is the literal
+string `NOT_AVAILABLE` rather than a guess (e.g. walk-forward evaluation and
+backtest metrics, which this run does not compute). Reports are written to
+`<model_dir>/../reports/ml_diagnostic_<run_id>.{json,md}` and viewable at
+`/ml-report`. See `AUDIT_REPORT.md` for the full pipeline audit this was
+built from.
 
 ---
 

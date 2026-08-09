@@ -48,6 +48,13 @@ class ProcessedDataset:
     metadata: pd.DataFrame
     symbols: tuple[str, ...] = field(default=())
     feature_columns: tuple[str, ...] = field(default=FEATURE_COLUMNS)
+    #: Real, measured dataset-health counters from the cleaning step that
+    #: produced this dataset - never approximated - for the ML diagnostic
+    #: report's Dataset Health section.
+    total_candidate_rows: int = field(default=0)
+    rejected_invalid_label_rows: int = field(default=0)
+    dropped_missing_or_inf_rows: int = field(default=0)
+    duplicate_feature_rows: int = field(default=0)
 
     def __len__(self) -> int:
         return len(self.features)
@@ -195,7 +202,9 @@ class DatasetProcessor:
 
     def _to_dataset(self, pooled: pd.DataFrame, symbols: tuple[str, ...]) -> ProcessedDataset:
         """Clean the pooled frame and split it into per-model targets."""
+        total_candidate_rows: int = len(pooled)
         usable: pd.DataFrame = pooled[pooled["label_is_valid"].fillna(False)].copy()
+        rejected_invalid_label_rows: int = total_candidate_rows - len(usable)
 
         feature_columns: list[str] = list(FEATURE_COLUMNS)
         usable = usable.replace([np.inf, -np.inf], np.nan)
@@ -210,6 +219,7 @@ class DatasetProcessor:
             return self._empty_dataset()
 
         usable = usable.reset_index(drop=True)
+        duplicate_feature_rows: int = int(usable.duplicated(subset=feature_columns).sum())
 
         metadata_columns: list[str] = [
             column for column in ("symbol", *_META_COLUMNS) if column in usable.columns
@@ -226,6 +236,10 @@ class DatasetProcessor:
             metadata=usable[metadata_columns],
             symbols=symbols,
             feature_columns=tuple(feature_columns),
+            total_candidate_rows=total_candidate_rows,
+            rejected_invalid_label_rows=rejected_invalid_label_rows,
+            dropped_missing_or_inf_rows=dropped,
+            duplicate_feature_rows=duplicate_feature_rows,
         )
 
     @staticmethod
