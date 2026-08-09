@@ -24,6 +24,8 @@ from config.settings import Settings
 from core.exceptions import FeatureEngineeringError, InsufficientDataError
 from core.logger import get_logger
 from module_a_data.db_handler import DatabaseHandler
+from module_a_data.models import QCIssue, QCSeverity
+from module_a_data.qc_validator import QCValidator
 from module_b_features.features import FEATURE_COLUMNS, FeatureService
 from module_b_features.labeler import LABEL_ORDER, TradeLabeler
 
@@ -109,11 +111,16 @@ class DatasetProcessor:
         database: DatabaseHandler,
         feature_service: FeatureService | None = None,
         labeler: TradeLabeler | None = None,
+        validator: QCValidator | None = None,
     ) -> None:
         self._settings: Settings = settings
         self._db: DatabaseHandler = database
         self._features: FeatureService = feature_service or FeatureService(settings)
         self._labeler: TradeLabeler = labeler or TradeLabeler(settings)
+        #: Second gate, run on whatever Module B reads back from storage - see
+        #: `QCValidator.validate_stored_frame` for why ingestion-time validation
+        #: alone is not sufficient.
+        self._validator: QCValidator = validator or QCValidator(settings)
 
     @property
     def feature_service(self) -> FeatureService:
@@ -346,10 +353,31 @@ class DatasetProcessor:
         symbol: str,
         depth: int,
     ) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None]:
-        """Load OHLCV, futures metrics and order-book history for one symbol."""
+        """Load OHLCV, futures metrics and order-book history for one symbol.
+
+        Raises:
+            InsufficientDataError: When the stored OHLCV window fails the
+                structural integrity check (gaps, duplicates, misaligned or
+                unsorted timestamps, non-finite/illogical prices).  A symbol in
+                this state must not reach feature engineering or the ML
+                pipeline, whether the call originates from training or from
+                live inference.
+        """
         ohlcv: pd.DataFrame = await self._db.load_ohlcv_dataframe(symbol, limit=depth)
         if ohlcv.empty:
             return ohlcv, None, None
+
+        integrity_issues: list[QCIssue] = self._validator.validate_stored_frame(symbol, ohlcv)
+        critical: list[QCIssue] = [
+            issue for issue in integrity_issues if issue.severity is QCSeverity.CRITICAL
+        ]
+        if critical:
+            codes: tuple[str, ...] = tuple(sorted({issue.code.value for issue in critical}))
+            raise InsufficientDataError(
+                "stored candle window failed integrity validation",
+                symbol=symbol,
+                codes=codes,
+            )
 
         futures: pd.DataFrame = await self._db.load_futures_metrics_frame(symbol, limit=depth)
         book: pd.DataFrame = await self._load_order_book_frame(symbol, depth)

@@ -37,9 +37,11 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from typing import Awaitable, Callable, Final, Iterable, Sequence
 
 import numpy as np
+import pandas as pd
 
 from config.settings import Settings
 from core.exceptions import DataIntegrityError
@@ -154,36 +156,74 @@ class QCValidator:
         symbol: str,
         candles: Sequence[OHLCVCandle],
         refetch: RefetchCallback,
+        *,
+        quarantine_unhealable: bool = False,
     ) -> tuple[list[OHLCVCandle], QCReport]:
         """Validate a block and recursively repair it until it is pristine.
 
-        The heal loop is *targeted*: only the damaged timestamp window is
-        re-requested, and repaired rows are merged over the corrupt ones by
-        timestamp.  Candles flagged as corrupt (bad price/volume logic or return
-        outliers) are dropped before the merge so the exchange's fresh copy wins.
+        The heal loop is *targeted*: only the damaged timestamp windows are
+        re-requested (see :meth:`_heal_windows`), and repaired rows are merged
+        over the corrupt ones by timestamp.  Candles flagged as corrupt (bad
+        price/volume logic or return outliers) are dropped before the merge so
+        the exchange's fresh copy wins.
 
         Args:
             symbol: Symbol under repair.
             candles: The block as first fetched.
             refetch: ``async (symbol, start_ms, end_ms) -> list[OHLCVCandle]``.
+            quarantine_unhealable: When heal attempts are exhausted (or the
+                wall-clock budget runs out) and this is ``True``, do not discard
+                the whole block.  Instead drop every candle tied to a surviving
+                CRITICAL issue plus anything before the last remaining gap, and
+                keep the longest clean run ending at the newest candle - the
+                shape every downstream consumer expects.  This is what lets a
+                historical backfill make monotonic progress in the face of a
+                permanently unfetchable window (an exchange-side halt, a
+                pre-listing gap) instead of re-attempting - and re-failing - the
+                exact same doomed re-fetch on every single bootstrap run.  The
+                live per-cycle path leaves this ``False``: a symbol whose fresh
+                data cannot be fully healed is excluded from that cycle outright
+                rather than traded on a trimmed subset.
 
         Returns:
-            ``(healed_candles, final_report)`` where the report has passed.
+            ``(healed_candles, final_report)``.  ``final_report.passed`` is
+            always ``True`` for the returned candles, whether they arrived
+            pristine, were healed, or - when quarantining - were trimmed down to
+            their longest clean trailing run.
 
         Raises:
             DataIntegrityError: When the block is still invalid after
-                ``qc.max_heal_attempts`` repair rounds, or when the failure is
-                not the kind a re-fetch can fix.
+                ``qc.max_heal_attempts`` repair rounds (or the wall-clock
+                budget elapses) and either quarantining is disabled or nothing
+                clean survives it, or when the failure is not the kind a
+                re-fetch can fix.
         """
         working: list[OHLCVCandle] = sorted(candles, key=lambda item: item.timestamp)
         report: QCReport = self.validate_candles(symbol, working)
 
         attempt: int = 0
+        deadline: float = time.monotonic() + self._qc.max_heal_duration_seconds
         while not report.passed and attempt < self._qc.max_heal_attempts:
             if not report.healable:
+                quarantined = self._try_quarantine(symbol, working, report, quarantine_unhealable)
+                if quarantined is not None:
+                    return quarantined
                 raise DataIntegrityError(
                     "QC failure cannot be healed by re-fetching",
                     symbol=symbol,
+                    codes=report.critical_codes,
+                )
+            if time.monotonic() >= deadline:
+                # A stuck healer must not hold the shared request-rate budget
+                # indefinitely and starve every other symbol's cycle.
+                quarantined = self._try_quarantine(symbol, working, report, quarantine_unhealable)
+                if quarantined is not None:
+                    return quarantined
+                raise DataIntegrityError(
+                    "heal loop exceeded its wall-clock budget",
+                    symbol=symbol,
+                    attempts=attempt,
+                    budget_seconds=self._qc.max_heal_duration_seconds,
                     codes=report.critical_codes,
                 )
 
@@ -193,28 +233,30 @@ class QCValidator:
                 max_seconds=self._settings.exchange.backoff_max_seconds,
                 jitter=self._settings.exchange.backoff_jitter,
             )
+            windows: list[tuple[int, int]] = self._heal_windows(working, report)
             _LOGGER.warning(
-                "QC failed for %s (%s) - heal attempt %d/%d in %.2fs",
+                "QC failed for %s (%s) - heal attempt %d/%d: %d window(s) in %.2fs",
                 symbol,
                 ", ".join(report.critical_codes),
                 attempt + 1,
                 self._qc.max_heal_attempts,
+                len(windows),
                 delay,
             )
             await asyncio.sleep(delay)
 
-            start_ms, end_ms = self._heal_window(working, report)
-            repaired: list[OHLCVCandle] = await refetch(symbol, start_ms, end_ms)
-
-            working = self._merge_blocks(
-                base=working,
-                patch=repaired,
-                drop_range=(start_ms, end_ms),
+            patches: list[list[OHLCVCandle]] = await asyncio.gather(
+                *(refetch(symbol, start_ms, end_ms) for start_ms, end_ms in windows)
             )
+
+            working = self._merge_patches(working, self._suspicious_timestamps(report), patches)
             report = self.validate_candles(symbol, working)
             attempt += 1
 
         if not report.passed:
+            quarantined = self._try_quarantine(symbol, working, report, quarantine_unhealable)
+            if quarantined is not None:
+                return quarantined
             raise DataIntegrityError(
                 "data still invalid after exhausting heal attempts",
                 symbol=symbol,
@@ -225,6 +267,73 @@ class QCValidator:
         if attempt:
             _LOGGER.info("Healed %s after %d attempt(s): %d rows", symbol, attempt, len(working))
         return working, report
+
+    def _try_quarantine(
+        self,
+        symbol: str,
+        working: list[OHLCVCandle],
+        report: QCReport,
+        enabled: bool,
+    ) -> tuple[list[OHLCVCandle], QCReport] | None:
+        """Attempt to salvage a clean trailing run when quarantining is enabled.
+
+        Returns ``None`` (never salvageable) unless ``enabled`` is set and a
+        non-empty, fully-passing trailing run survives trimming.
+        """
+        if not enabled:
+            return None
+        trimmed: list[OHLCVCandle] = self._longest_clean_trailing_run(working, report)
+        if not trimmed:
+            return None
+        trimmed_report: QCReport = self.validate_candles(symbol, trimmed)
+        if not trimmed_report.passed:
+            return None
+        _LOGGER.warning(
+            "%s: %d candle(s) quarantined as unhealable (%s) - keeping the clean "
+            "trailing run of %d candle(s) from %d to %d",
+            symbol,
+            len(working) - len(trimmed),
+            ", ".join(report.critical_codes),
+            len(trimmed),
+            trimmed[0].timestamp,
+            trimmed[-1].timestamp,
+        )
+        return trimmed, trimmed_report
+
+    def _longest_clean_trailing_run(
+        self,
+        working: Sequence[OHLCVCandle],
+        report: QCReport,
+    ) -> list[OHLCVCandle]:
+        """Drop every candle tied to a surviving CRITICAL issue, then keep only
+        the contiguous run ending at the newest candle.
+
+        A candle flagged as corrupt (bad price/volume logic, a NaN, a return
+        outlier) is removed outright.  A candle that was never fetched in the
+        first place (``MISSING_CANDLES``) is already absent, so it naturally
+        opens a gap in the sorted timestamp sequence.  Either way, the first
+        gap counted back from the end marks where the last *unhealable* damage
+        sits; everything from there forward - the newest, most relevant history
+        - is what gets kept, since every downstream consumer expects a single
+        contiguous grid rather than history with a hole punched in the middle.
+        """
+        bad: set[int] = set()
+        for issue in report.issues:
+            if issue.severity is QCSeverity.CRITICAL:
+                bad.update(issue.timestamps)
+
+        cleaned: list[OHLCVCandle] = sorted(
+            (candle for candle in working if candle.timestamp not in bad),
+            key=lambda item: item.timestamp,
+        )
+        if not cleaned:
+            return []
+
+        cut_index: int = 0
+        for index in range(1, len(cleaned)):
+            if cleaned[index].timestamp - cleaned[index - 1].timestamp > self._timeframe_ms:
+                cut_index = index
+        return cleaned[cut_index:]
 
     def validate_order_book(self, book: OrderBookSnapshot | None, symbol: str) -> list[QCIssue]:
         """Sanity-check a reduced order-book snapshot."""
@@ -298,6 +407,139 @@ class QCValidator:
                     healable=False,
                 )
             )
+        return issues
+
+    def validate_stored_frame(self, symbol: str, frame: pd.DataFrame) -> list[QCIssue]:
+        """Fast structural check for OHLCV already read back from storage.
+
+        Module A's gatekeeper runs once, at ingestion.  Module B then reads an
+        arbitrary trailing window straight out of SQLite - and that window can
+        span rows written by different cycles (or different bootstrap runs)
+        that were each individually clean but are not guaranteed to be
+        *jointly* contiguous.  This is the second gate: it re-checks grid
+        alignment, duplicates, ordering, gaps and basic price/finite sanity over
+        whatever Module B is about to hand to feature engineering, so a symbol
+        whose stored window turns out to be broken is rejected before it can
+        reach the ML pipeline rather than silently producing features over a
+        discontinuous series.
+
+        Freshness and statistical-outlier checks are deliberately not repeated
+        here: they are only meaningful for the newest fetched tail (a live
+        cycle), not for an arbitrary historical slice used for training.
+        """
+        issues: list[QCIssue] = []
+        if frame.empty or "timestamp" not in frame.columns:
+            issues.append(
+                QCIssue(
+                    code=QCIssueCode.EMPTY_DATASET,
+                    severity=QCSeverity.CRITICAL,
+                    message="no stored candles available",
+                    symbol=symbol,
+                    healable=False,
+                )
+            )
+            return issues
+
+        timestamps: list[int] = [int(value) for value in frame["timestamp"].tolist()]
+
+        duplicates: list[int] = self._find_duplicates(timestamps)
+        if duplicates:
+            issues.append(
+                QCIssue(
+                    code=QCIssueCode.DUPLICATE_TIMESTAMP,
+                    severity=QCSeverity.CRITICAL,
+                    message=f"{len(duplicates)} duplicated candle open time(s) in storage",
+                    symbol=symbol,
+                    timestamps=tuple(duplicates[:50]),
+                    healable=False,
+                )
+            )
+
+        if timestamps != sorted(timestamps):
+            issues.append(
+                QCIssue(
+                    code=QCIssueCode.UNSORTED_TIMESTAMPS,
+                    severity=QCSeverity.CRITICAL,
+                    message="stored candles are not chronologically ordered",
+                    symbol=symbol,
+                    healable=False,
+                )
+            )
+            timestamps = sorted(timestamps)
+
+        misaligned: list[int] = [ts for ts in timestamps if ts % self._timeframe_ms != 0]
+        if misaligned:
+            issues.append(
+                QCIssue(
+                    code=QCIssueCode.MISALIGNED_TIMESTAMP,
+                    severity=QCSeverity.CRITICAL,
+                    message=f"{len(misaligned)} stored timestamp(s) off the 5m grid",
+                    symbol=symbol,
+                    timestamps=tuple(misaligned[:50]),
+                    healable=False,
+                )
+            )
+
+        missing: list[int] = self._find_missing_timestamps(timestamps)
+        if missing:
+            issues.append(
+                QCIssue(
+                    code=QCIssueCode.MISSING_CANDLES,
+                    severity=QCSeverity.CRITICAL,
+                    message=(
+                        f"{len(missing)} missing 5m candle(s) inside the stored window "
+                        f"between {timestamps[0]} and {timestamps[-1]}"
+                    ),
+                    symbol=symbol,
+                    timestamps=tuple(missing[:50]),
+                    healable=False,
+                )
+            )
+
+        price_columns: list[str] = [
+            column for column in ("open", "high", "low", "close") if column in frame.columns
+        ]
+        if len(price_columns) == 4:
+            prices: np.ndarray = frame[price_columns].to_numpy(dtype=np.float64)
+            volume: np.ndarray = (
+                frame["volume"].to_numpy(dtype=np.float64)
+                if "volume" in frame.columns
+                else np.zeros(len(frame))
+            )
+            finite: np.ndarray = np.isfinite(prices).all(axis=1) & np.isfinite(volume)
+            if not bool(finite.all()):
+                issues.append(
+                    QCIssue(
+                        code=QCIssueCode.NAN_VALUES,
+                        severity=QCSeverity.CRITICAL,
+                        message=f"{int((~finite).sum())} stored row(s) contain NaN/inf values",
+                        symbol=symbol,
+                        healable=False,
+                    )
+                )
+            positive: np.ndarray = finite & (prices > 0.0).all(axis=1)
+            open_, high, low, close = (prices[:, index] for index in range(4))
+            geometry: np.ndarray = (
+                positive
+                & (high >= low)
+                & (high >= np.maximum(open_, close))
+                & (low <= np.minimum(open_, close))
+            )
+            bad_geometry: np.ndarray = finite & ~geometry
+            if bool(bad_geometry.any()):
+                issues.append(
+                    QCIssue(
+                        code=QCIssueCode.PRICE_LOGIC_VIOLATION,
+                        severity=QCSeverity.CRITICAL,
+                        message=(
+                            f"{int(bad_geometry.sum())} stored row(s) violate OHLC price "
+                            "logic or contain a non-positive price"
+                        ),
+                        symbol=symbol,
+                        healable=False,
+                    )
+                )
+
         return issues
 
     # ------------------------------------------------------------------
@@ -634,55 +876,99 @@ class QCValidator:
     # ------------------------------------------------------------------
     # Healing helpers
     # ------------------------------------------------------------------
-    def _heal_window(
-        self,
-        candles: Sequence[OHLCVCandle],
-        report: QCReport,
-    ) -> tuple[int, int]:
-        """Compute the ``[start_ms, end_ms]`` window that must be re-fetched.
-
-        The window spans every suspicious timestamp (missing candles plus the
-        timestamps attached to CRITICAL issues), padded by one bar on each side so
-        boundary candles are refreshed too.  When the block is empty, the last
-        ``ohlcv_limit`` bars are requested from scratch.
-        """
+    def _suspicious_timestamps(self, report: QCReport) -> set[int]:
+        """Every timestamp a heal round must treat as damaged: missing candles
+        plus the timestamps attached to CRITICAL issues."""
         suspicious: set[int] = set(report.missing_timestamps)
         for issue in report.issues:
             if issue.severity is QCSeverity.CRITICAL:
                 suspicious.update(issue.timestamps)
+        return suspicious
+
+    def _heal_windows(
+        self,
+        candles: Sequence[OHLCVCandle],
+        report: QCReport,
+    ) -> list[tuple[int, int]]:
+        """Compute the precise ``[start_ms, end_ms]`` windows that need re-fetching.
+
+        Suspicious timestamps (missing candles plus the timestamps attached to
+        CRITICAL issues) are grouped into contiguous runs - merging runs within
+        ``heal_merge_gap_bars`` of each other - and each run becomes its own
+        targeted re-fetch window, padded by one bar on each side so the exchange
+        is asked for a little context around the damage.  This is what keeps a
+        heal *precise*: two unrelated one-candle glitches at opposite ends of a
+        long history each cost one small request instead of the two being fused
+        into a single re-fetch spanning the entire block.  The padding only
+        widens what gets *requested* - :meth:`_merge_patches` only ever drops the
+        exact suspicious timestamps from the working set, so a padded boundary
+        candle that was already clean survives even when the re-fetch does not
+        happen to return it again.
+
+        A ``STALE_DATA`` verdict additionally stretches the newest window through
+        to the freshest candle the grid currently expects, so a heal that is
+        several bars behind catches all the way up in one round rather than
+        creeping forward one bar per attempt while real time keeps moving.
+
+        When the block is empty, the last ``ohlcv_limit`` bars are requested from
+        scratch.  When grouping would produce more windows than
+        ``max_heal_window_groups``, the damage is judged widespread enough that
+        fragmentation buys no precision, and a single spanning window is used
+        instead (the previous, simpler behaviour).
+        """
+        suspicious: set[int] = self._suspicious_timestamps(report)
 
         if not suspicious:
             if candles:
-                return candles[0].timestamp, candles[-1].timestamp + self._timeframe_ms
+                return [(candles[0].timestamp, candles[-1].timestamp + self._timeframe_ms)]
             end_ms: int = last_closed_candle_open_ms(self._timeframe_ms)
             span: int = self._settings.data.ohlcv_limit * self._timeframe_ms
-            return end_ms - span, end_ms
+            return [(end_ms - span, end_ms)]
 
-        start_ms: int = min(suspicious) - self._timeframe_ms
-        end_ms = max(suspicious) + self._timeframe_ms
-        return start_ms, end_ms
+        ordered: list[int] = sorted(suspicious)
+        merge_gap_ms: int = self._qc.heal_merge_gap_bars * self._timeframe_ms
+        runs: list[list[int]] = [[ordered[0]]]
+        for ts in ordered[1:]:
+            if ts - runs[-1][-1] <= self._timeframe_ms + merge_gap_ms:
+                runs[-1].append(ts)
+            else:
+                runs.append([ts])
 
-    def _merge_blocks(
+        windows: list[tuple[int, int]] = [
+            (run[0] - self._timeframe_ms, run[-1] + self._timeframe_ms) for run in runs
+        ]
+
+        if QCIssueCode.STALE_DATA.value in report.critical_codes:
+            newest_expected: int = last_closed_candle_open_ms(self._timeframe_ms) + self._timeframe_ms
+            last_start, last_end = windows[-1]
+            windows[-1] = (last_start, max(last_end, newest_expected))
+
+        if len(windows) > self._qc.max_heal_window_groups:
+            return [(windows[0][0], windows[-1][1])]
+        return windows
+
+    def _merge_patches(
         self,
         base: Sequence[OHLCVCandle],
-        patch: Sequence[OHLCVCandle],
-        drop_range: tuple[int, int],
+        drop_timestamps: set[int],
+        patches: Sequence[Sequence[OHLCVCandle]],
     ) -> list[OHLCVCandle]:
-        """Merge freshly fetched candles over the damaged window.
+        """Apply one heal round's re-fetched patches over the working set.
 
-        Every base candle inside ``drop_range`` is discarded first: the exchange's
-        new copy is authoritative, and keeping the corrupt row would let a bad
-        print survive the heal.  Candles outside the window are preserved so the
-        history depth needed by Module B is not lost.
+        Only the *exact* suspicious timestamps are dropped from ``base`` - never
+        the wider padded window a patch was fetched over - so a clean boundary
+        candle is never discarded just because a re-fetch legitimately returned
+        nothing for a neighbouring, genuinely damaged timestamp.  Every patch row
+        is then applied as an upsert, which both fills the dropped timestamps and
+        opportunistically refreshes any padded-but-clean candle the exchange
+        happened to send back too.
         """
-        low, high = drop_range
         merged: dict[int, OHLCVCandle] = {
-            candle.timestamp: candle
-            for candle in base
-            if not (low <= candle.timestamp <= high)
+            candle.timestamp: candle for candle in base if candle.timestamp not in drop_timestamps
         }
-        for candle in patch:
-            merged[candle.timestamp] = candle
+        for patch in patches:
+            for candle in patch:
+                merged[candle.timestamp] = candle
         return [merged[key] for key in sorted(merged)]
 
     @staticmethod

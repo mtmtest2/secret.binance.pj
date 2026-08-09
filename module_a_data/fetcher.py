@@ -25,7 +25,7 @@ import ccxt.async_support as ccxt
 from config.settings import Settings
 from core.exceptions import DataFetchError
 from core.logger import get_logger
-from core.utils import async_retry, safe_float, utc_now_ms
+from core.utils import async_retry, backoff_delay, safe_float, utc_now_ms
 from module_a_data.models import FuturesMetrics, OHLCVCandle, OrderBookSnapshot
 
 _LOGGER = get_logger(__name__)
@@ -91,7 +91,29 @@ class BinanceDataFetcher:
         self._restrict_to_linear_markets(exchange)
         if self._settings.exchange.testnet:
             exchange.set_sandbox_mode(True)
+        self._apply_rate_scale(exchange)
         return exchange
+
+    def _apply_rate_scale(self, exchange: ccxt.binance) -> None:
+        """Slow ccxt's built-in request pacing to ``request_rate_scale`` of default.
+
+        ``enableRateLimit`` makes ccxt sleep ``exchange.rateLimit`` milliseconds
+        between weight-1 requests regardless of how many coroutines are waiting
+        on the semaphore, so this is the one lever that actually controls the
+        rate at which requests leave the process - inflating it is what caps
+        real throughput at a fraction of the exchange's default speed.
+        """
+        scale: float = self._settings.exchange.request_rate_scale
+        if scale >= 1.0:
+            return
+        original: float = float(exchange.rateLimit)
+        exchange.rateLimit = int(round(original / scale))
+        _LOGGER.info(
+            "API request rate capped at %.0f%% of default (ccxt rateLimit %d -> %d ms)",
+            scale * 100.0,
+            int(original),
+            exchange.rateLimit,
+        )
 
     @staticmethod
     def _restrict_to_linear_markets(exchange: ccxt.binance) -> None:
@@ -232,6 +254,23 @@ class BinanceDataFetcher:
             candle is dropped when ``data.drop_unclosed_candle`` is enabled, so
             every returned candle is guaranteed to be closed.
         """
+        _raw_count, candles = await self._fetch_ohlcv_page(symbol, limit=limit, since_ms=since_ms)
+        return candles
+
+    async def _fetch_ohlcv_page(
+        self,
+        symbol: str,
+        limit: int | None = None,
+        since_ms: int | None = None,
+    ) -> tuple[int, list[OHLCVCandle]]:
+        """Fetch and validate one page, exposing the raw exchange row count too.
+
+        The raw count lets :meth:`fetch_ohlcv_range` tell "the exchange truly has
+        no more candles here" (``raw_count == 0``) apart from "the exchange sent
+        rows but every one failed validation" (``raw_count > 0`` and the returned
+        list is empty) - the two look identical from the validated list alone,
+        but only the first is safe to treat as the end of history.
+        """
         await self.load_markets()
         page_limit: int = limit if limit is not None else self._settings.data.ohlcv_limit
 
@@ -261,7 +300,7 @@ class BinanceDataFetcher:
             candles.append(candle)
 
         candles.sort(key=lambda item: item.timestamp)
-        return candles
+        return len(raw), candles
 
     async def fetch_ohlcv_range(
         self,
@@ -273,24 +312,69 @@ class BinanceDataFetcher:
         """Fetch every closed candle in ``[start_ms, end_ms]`` using pagination.
 
         Binance caps a single ``klines`` response at 1500 rows, so long ranges
-        are walked forward page by page.  The loop is defensive against an
-        exchange that returns an empty or non-advancing page (it breaks instead
-        of spinning forever).
+        are walked forward page by page.  The loop distinguishes three outcomes
+        per page:
+
+        * **Genuine end of history** (the exchange returned zero rows) - a clean
+          stop, nothing more to fetch.
+        * **A page of rows that all failed validation** - retried a bounded
+          number of times with backoff rather than silently accepted as "no more
+          data", so a burst of malformed rows cannot punch a silent hole at the
+          tail of the range.
+        * **The page-count safety guard tripping before ``end_ms`` is reached** -
+          raised as an error rather than returned as a quietly truncated result,
+          because a caller that only inspects the returned list has no way to
+          tell "complete" from "silently cut short".
         """
         await self.load_markets()
         limit: int = page_limit if page_limit is not None else self._settings.data.ohlcv_limit
         collected: dict[int, OHLCVCandle] = {}
         cursor: int = start_ms
         guard: int = 0
-        max_pages: int = max(1, (end_ms - start_ms) // (self._timeframe_ms * limit) + 4)
+        # Generous on purpose: a real gap in the exchange's history (a halt, a
+        # delisting window) makes the cursor jump *forward* faster than a naive
+        # per-page estimate assumes, but retried empty-validation pages consume
+        # guard budget without advancing the cursor at all.
+        max_pages: int = max(
+            10, 2 * ((end_ms - start_ms) // (self._timeframe_ms * limit) + 1) + 20
+        )
+        empty_validation_retries: int = 0
+        max_empty_validation_retries: int = 3
 
         while cursor <= end_ms and guard < max_pages:
             guard += 1
-            page: list[OHLCVCandle] = await self.fetch_ohlcv(
-                symbol, limit=limit, since_ms=cursor
-            )
-            if not page:
+            raw_count, page = await self._fetch_ohlcv_page(symbol, limit=limit, since_ms=cursor)
+
+            if raw_count == 0:
+                # The exchange itself reports nothing more from `cursor` onward.
                 break
+
+            if not page:
+                empty_validation_retries += 1
+                if empty_validation_retries > max_empty_validation_retries:
+                    raise DataFetchError(
+                        f"fetch_ohlcv_range[{symbol}] received only malformed rows",
+                        window_start_ms=cursor,
+                        window_end_ms=end_ms,
+                    )
+                _LOGGER.warning(
+                    "%s: page at %d returned %d row(s), none valid - retry %d/%d",
+                    symbol,
+                    cursor,
+                    raw_count,
+                    empty_validation_retries,
+                    max_empty_validation_retries,
+                )
+                await asyncio.sleep(
+                    backoff_delay(
+                        empty_validation_retries - 1,
+                        base_seconds=self._settings.exchange.backoff_base_seconds,
+                        max_seconds=self._settings.exchange.backoff_max_seconds,
+                        jitter=self._settings.exchange.backoff_jitter,
+                    )
+                )
+                continue
+            empty_validation_retries = 0
 
             fresh: int = 0
             for candle in page:
@@ -303,6 +387,17 @@ class BinanceDataFetcher:
                 # The exchange is not advancing; stop rather than loop forever.
                 break
             cursor = next_cursor
+
+        if cursor <= end_ms and guard >= max_pages:
+            raise DataFetchError(
+                f"fetch_ohlcv_range[{symbol}] hit the {max_pages}-page safety guard "
+                "before covering the requested window - refusing to return a "
+                "silently truncated result",
+                window_start_ms=start_ms,
+                window_end_ms=end_ms,
+                reached_ms=cursor,
+                collected=len(collected),
+            )
 
         return [collected[key] for key in sorted(collected)]
 

@@ -110,8 +110,12 @@ class DataPipeline:
 
                     report: QCReport = self._validator.validate_candles(symbol, candles)
                     if not report.passed:
+                        # Quarantine rather than discard: a permanently unfetchable
+                        # window (an exchange halt, a pre-listing gap) must not
+                        # cost the whole symbol its otherwise-clean history on
+                        # every single bootstrap run.
                         healed, _ = await self._validator.validate_and_heal(
-                            symbol, candles, self._refetch
+                            symbol, candles, self._refetch, quarantine_unhealable=True
                         )
                         candles = healed
 

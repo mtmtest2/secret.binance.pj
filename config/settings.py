@@ -83,6 +83,15 @@ class ExchangeSettings(BaseModel):
 
     max_concurrent_requests: int = Field(default=8, ge=1, le=64)
 
+    #: Throttle every request to this fraction of ccxt's default pacing, so the
+    #: exchange's per-IP weight budget is never approached under normal load.
+    #: ccxt's built-in throttler paces *dispatch* of every call (independent of
+    #: ``max_concurrent_requests``, which only bounds in-flight I/O) by sleeping
+    #: ``exchange.rateLimit`` ms between weight-1 requests; dividing that budget
+    #: by this fraction is what actually slows the request rate to 80 % of the
+    #: exchange's default speed - 1.0 keeps ccxt's own default pacing.
+    request_rate_scale: float = Field(default=0.8, gt=0.0, le=1.0)
+
 
 class DataSettings(BaseModel):
     """Data-ingestion parameters for the 5-minute pipeline."""
@@ -150,6 +159,18 @@ class QCSettings(BaseModel):
 
     max_heal_attempts: int = Field(default=4, ge=1, le=10)
     heal_backoff_seconds: float = Field(default=2.0, gt=0.0)
+    #: Hard wall-clock ceiling on one symbol's total heal loop, regardless of how
+    #: many attempts remain in the budget.  Bounds worst-case latency so a symbol
+    #: stuck healing cannot indefinitely hold the shared request-rate budget and
+    #: starve every other symbol's cycle.
+    max_heal_duration_seconds: float = Field(default=90.0, gt=0.0)
+    #: Suspicious timestamps within this many bars of each other are healed as
+    #: one contiguous re-fetch window instead of two separate ones.
+    heal_merge_gap_bars: int = Field(default=3, ge=0)
+    #: When a heal attempt would otherwise need more distinct windows than this,
+    #: it falls back to one window spanning the full damaged range - fragmenting
+    #: further would trade a handful of extra requests for no real precision.
+    max_heal_window_groups: int = Field(default=12, ge=1)
 
     #: A candle whose volume exceeds ``median * this`` is flagged as an anomaly.
     volume_spike_median_multiple: float = Field(default=50.0, gt=1.0)
