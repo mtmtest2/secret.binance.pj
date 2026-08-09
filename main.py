@@ -407,7 +407,7 @@ class TradingSystem:
         )
         self.phase = SystemPhase.TRAINING
         self.progress.begin(SystemPhase.TRAINING, "building dataset", f"retraining ({reason})")
-        self.progress.advance(0, 2, "engineering features and labels")
+        self.progress.advance(0, 4, "engineering features and labels")
 
         dataset: ProcessedDataset = await self.processor.build_training_dataset(symbols=symbols)
         if dataset.is_empty:
@@ -416,10 +416,11 @@ class TradingSystem:
                 "not enough clean history"
             )
 
-        self.progress.advance(1, 2, f"fitting 4 models on {len(dataset)} rows")
+        self.progress.set_step("fitting models")
+        self.progress.advance(1, 4, f"fitting 4 models on {len(dataset)} rows")
         _LOGGER.info("Training on %d rows | %s", len(dataset), dataset.class_distribution())
         report: dict[str, Any] = await self.ml.train_all(dataset)
-        self.progress.advance(2, 2, "training complete")
+        self.progress.advance(2, 4, "models fitted")
 
         failed: list[str] = [head for head, metrics in report.items() if "error" in metrics]
         if failed:
@@ -437,8 +438,13 @@ class TradingSystem:
         _LOGGER.info("Training complete: %s", _headline_metrics(report))
 
         run_id: str = str(uuid.uuid4())
+        self.progress.set_step("running validation backtest", "replaying out-of-sample bars")
         backtest_report: BacktestReport | None = await self._run_validation_backtest(dataset)
+        self.progress.advance(3, 4, "validation backtest complete")
         try:
+            self.progress.set_step(
+                "generating diagnostic report", "walk-forward validation and feature analytics"
+            )
             diagnostic_report: dict[str, Any] = await diagnostics.build_report(
                 settings=self.settings,
                 database=self.database,
@@ -448,6 +454,7 @@ class TradingSystem:
                 backtest=backtest_report,
             )
             self.latest_ml_report_id = run_id
+            self.progress.advance(4, 4, "diagnostic report ready")
             _LOGGER.info(
                 "ML diagnostic report %s: status=%s",
                 run_id,
