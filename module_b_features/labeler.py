@@ -34,6 +34,22 @@ The tier combines path risk (MAE ratio) with the volatility regime at entry
 and caps it at ``VERY_HIGH``, which - by configuration - is folded into
 ``NO_TRADE_OR_FAIL``: a trade that only worked because the market was violent is
 not an edge worth learning.
+
+The tier is *not* fused into the Direction model's label.  Earlier revisions
+split each direction into a LOW_RISK/HIGH_RISK pair of classes (five classes
+total); that made the label a noisy compound of "which way" and "how clean
+was the path", and the two questions have very different feature signatures.
+The path-risk half is only knowable from information a pre-trade feature
+vector barely carries (it depends on the exact intra-trade excursion), so
+fusing it into the direction target diluted the one signal the Direction
+model can actually learn well - forecasting the primary discrete outcome -
+and swamped a 44%-majority NO_TRADE class in five-way search noise, causing
+class-balanced training to overcorrect against it.  Direction now predicts
+only ``LONG_SUCCESS`` / ``SHORT_SUCCESS`` / ``NO_TRADE_OR_FAIL``; the tier is
+still computed here (and still trains the Risk model's continuous score via
+``target_risk_score``) and is turned back into a discrete tier for gating and
+sizing purposes by :func:`risk_tier_from_score`, which the Risk model uses at
+inference time.
 """
 
 from __future__ import annotations
@@ -54,14 +70,22 @@ _EPSILON: Final[float] = 1e-12
 #: Rows processed per vectorised chunk, bounding peak memory on long histories.
 _CHUNK_ROWS: Final[int] = 20_000
 
+#: Exit-target clamp rails.  Mirror the hard sanity rails the Exit model's
+#: ``_assemble`` applies at inference time (``module_c_ml.ml_models``) so the
+#: training target is never wider than what a trade could ever actually use -
+#: without this, rare extreme-excursion candles blow up the regressor's loss
+#: and its predictions on ordinary rows along with it.
+_MIN_TP_PCT: Final[float] = 0.0020
+_MAX_TP_PCT: Final[float] = 0.1500
+_MIN_SL_PCT: Final[float] = 0.0015
+_MAX_SL_PCT: Final[float] = 0.0800
+
 
 class LabelClass(str, Enum):
     """The multi-class target consumed by the Market Direction model."""
 
-    LONG_SUCCESS_LOW_RISK = "LONG_SUCCESS_LOW_RISK"
-    LONG_SUCCESS_HIGH_RISK = "LONG_SUCCESS_HIGH_RISK"
-    SHORT_SUCCESS_LOW_RISK = "SHORT_SUCCESS_LOW_RISK"
-    SHORT_SUCCESS_HIGH_RISK = "SHORT_SUCCESS_HIGH_RISK"
+    LONG_SUCCESS = "LONG_SUCCESS"
+    SHORT_SUCCESS = "SHORT_SUCCESS"
     NO_TRADE_OR_FAIL = "NO_TRADE_OR_FAIL"
 
 
@@ -86,22 +110,16 @@ class TradeOutcome(str, Enum):
 
 #: Stable class ordering shared by the labeler and the Direction model.
 LABEL_ORDER: Final[tuple[str, ...]] = (
-    LabelClass.LONG_SUCCESS_LOW_RISK.value,
-    LabelClass.LONG_SUCCESS_HIGH_RISK.value,
-    LabelClass.SHORT_SUCCESS_LOW_RISK.value,
-    LabelClass.SHORT_SUCCESS_HIGH_RISK.value,
+    LabelClass.LONG_SUCCESS.value,
+    LabelClass.SHORT_SUCCESS.value,
     LabelClass.NO_TRADE_OR_FAIL.value,
 )
 
 LABEL_TO_INDEX: Final[dict[str, int]] = {name: index for index, name in enumerate(LABEL_ORDER)}
 
 #: Which labels represent a tradeable long / short opportunity.
-LONG_LABELS: Final[frozenset[str]] = frozenset(
-    {LabelClass.LONG_SUCCESS_LOW_RISK.value, LabelClass.LONG_SUCCESS_HIGH_RISK.value}
-)
-SHORT_LABELS: Final[frozenset[str]] = frozenset(
-    {LabelClass.SHORT_SUCCESS_LOW_RISK.value, LabelClass.SHORT_SUCCESS_HIGH_RISK.value}
-)
+LONG_LABELS: Final[frozenset[str]] = frozenset({LabelClass.LONG_SUCCESS.value})
+SHORT_LABELS: Final[frozenset[str]] = frozenset({LabelClass.SHORT_SUCCESS.value})
 
 _TIER_ORDER: Final[tuple[str, ...]] = (
     RiskTier.LOW.value,
@@ -109,6 +127,38 @@ _TIER_ORDER: Final[tuple[str, ...]] = (
     RiskTier.HIGH.value,
     RiskTier.VERY_HIGH.value,
 )
+
+#: ``0.5 + 0.5 * volatility_component`` at a neutral (median, 0.5) volatility
+#: reading - the same multiplier :meth:`TradeLabeler._attach_model_targets`
+#: applies to ``heat_component`` when building ``target_risk_score``.
+_NEUTRAL_SCORE_MULTIPLIER: Final[float] = 0.75
+
+
+def risk_tier_from_score(score: float, config: LabelSettings) -> str:
+    """Map the Risk model's continuous opportunity score back onto a tier.
+
+    At inference time there is no simulated path to measure a real MAE ratio
+    from, so the Risk model's tier can no longer be read off the Direction
+    label the way earlier revisions did (see the module docstring).  Instead
+    this inverts the training-time score formula -
+    ``heat_component * (0.5 + 0.5 * volatility_component)`` where
+    ``heat_component = 1 - mae_ratio`` - at a neutral (median) volatility
+    reading, which turns each of the labeler's own MAE-ratio tier boundaries
+    into an equivalent score cut point.  The cut points therefore move
+    automatically with ``config`` instead of being separately hand-tuned
+    constants.
+    """
+    low_boundary: float = (1.0 - config.low_risk_mae_ratio) * _NEUTRAL_SCORE_MULTIPLIER
+    medium_boundary: float = (1.0 - config.medium_risk_mae_ratio) * _NEUTRAL_SCORE_MULTIPLIER
+    high_boundary: float = (1.0 - config.high_risk_mae_ratio) * _NEUTRAL_SCORE_MULTIPLIER
+
+    if score >= low_boundary:
+        return RiskTier.LOW.value
+    if score >= medium_boundary:
+        return RiskTier.MEDIUM.value
+    if score >= high_boundary:
+        return RiskTier.HIGH.value
+    return RiskTier.VERY_HIGH.value
 
 
 class _SideSimulation:
@@ -422,6 +472,20 @@ class TradeLabeler:
         floor_sl: np.ndarray = 0.5 * sl_dist / np.maximum(entry, _EPSILON)
         optimal_sl = np.maximum(optimal_sl, floor_sl)
 
+        # A handful of altcoin candles carry genuine >50%-in-4h excursions
+        # (flash pumps, thin-book dumps).  Left unclipped, those rare rows
+        # dominate the L2 loss the exit regressors are fit with and drag their
+        # predictions into the same blown-up range on ordinary rows too - the
+        # exact failure mode the ML diagnostic report's exit-model R^2 (deeply
+        # negative, predictions reaching into the thousands of percent) was
+        # pointing at.  Clamping to the same hard rails the trading engine
+        # already enforces on every exit geometry (see
+        # ``module_c_ml.ml_models._MIN_TP_PCT`` / ``_MAX_TP_PCT`` / etc.) keeps
+        # the *label* consistent with what a trade could ever actually use,
+        # instead of training the regressor to chase unusable outliers.
+        optimal_tp = np.clip(optimal_tp, _MIN_TP_PCT, _MAX_TP_PCT)
+        optimal_sl = np.clip(optimal_sl, _MIN_SL_PCT, _MAX_SL_PCT)
+
         target = slice(chunk_start, chunk_end)
         simulation.outcome[target] = outcome
         simulation.mae_ratio[target] = np.clip(
@@ -461,7 +525,9 @@ class TradeLabeler:
            lower MAE ratio, i.e. the less painful path.
         3. The winner's tier is derived from its MAE ratio, then escalated by the
            volatility regime.  A ``VERY_HIGH`` tier collapses to
-           ``NO_TRADE_OR_FAIL`` when ``discard_very_high_risk`` is set.
+           ``NO_TRADE_OR_FAIL`` when ``discard_very_high_risk`` is set.  The
+           tier is recorded (for the Risk model target) but no longer changes
+           *which* label the Direction model sees - see the module docstring.
         """
         rows: int = long_side.outcome.size
         labels: list[str] = []
@@ -508,20 +574,11 @@ class TradeLabeler:
                 tiers.append(tier)
                 continue
 
-            is_low_risk: bool = tier in (RiskTier.LOW.value, RiskTier.MEDIUM.value)
             if take_long:
-                labels.append(
-                    LabelClass.LONG_SUCCESS_LOW_RISK.value
-                    if is_low_risk
-                    else LabelClass.LONG_SUCCESS_HIGH_RISK.value
-                )
+                labels.append(LabelClass.LONG_SUCCESS.value)
                 chosen[index] = 1
             else:
-                labels.append(
-                    LabelClass.SHORT_SUCCESS_LOW_RISK.value
-                    if is_low_risk
-                    else LabelClass.SHORT_SUCCESS_HIGH_RISK.value
-                )
+                labels.append(LabelClass.SHORT_SUCCESS.value)
                 chosen[index] = -1
             tiers.append(tier)
 

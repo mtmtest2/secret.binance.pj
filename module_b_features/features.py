@@ -26,10 +26,12 @@ to a worker thread (or a process pool) so the asyncio event loop that drives the
 from __future__ import annotations
 
 import asyncio
+import logging
 import warnings
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import contextmanager
 from enum import IntEnum
-from typing import Any, Final, Sequence
+from typing import Any, Final, Iterator, Sequence
 
 import numpy as np
 import pandas as pd
@@ -44,6 +46,28 @@ _LOGGER = get_logger(__name__)
 _EPSILON: Final[float] = 1e-12
 #: arch works best on percent-scaled returns; we divide the result back out.
 _GARCH_SCALE: Final[float] = 100.0
+
+
+@contextmanager
+def _muted_logger(name: str) -> Iterator[None]:
+    """Temporarily silence a third-party logger.
+
+    ``hmmlearn``'s EM convergence monitor reports a stalled fit through
+    ``logging.warning`` rather than the ``warnings`` module, so it slips past
+    the ``warnings.catch_warnings()`` guard already used around every HMM fit
+    below.  A short window failing to fully converge is expected and benign -
+    the fit still returns its best estimate - so this is pure log noise on a
+    hot path called on every rolling refit; muting the logger for the
+    duration of the fit call is what the surrounding ``catch_warnings`` block
+    already intended to do.
+    """
+    logger: logging.Logger = logging.getLogger(name)
+    previous_level: int = logger.level
+    logger.setLevel(logging.ERROR)
+    try:
+        yield
+    finally:
+        logger.setLevel(previous_level)
 
 
 class HMMRegime(IntEnum):
@@ -635,7 +659,7 @@ class FeatureEngineer:
         standardised: np.ndarray = (sample - mean) / std
 
         try:
-            with warnings.catch_warnings():
+            with warnings.catch_warnings(), _muted_logger("hmmlearn.base"):
                 warnings.simplefilter("ignore")
                 model = gaussian_hmm(
                     n_components=config.hmm_states,

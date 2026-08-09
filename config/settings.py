@@ -83,6 +83,15 @@ class ExchangeSettings(BaseModel):
 
     max_concurrent_requests: int = Field(default=8, ge=1, le=64)
 
+    #: Throttle every request to this fraction of ccxt's default pacing, so the
+    #: exchange's per-IP weight budget is never approached under normal load.
+    #: ccxt's built-in throttler paces *dispatch* of every call (independent of
+    #: ``max_concurrent_requests``, which only bounds in-flight I/O) by sleeping
+    #: ``exchange.rateLimit`` ms between weight-1 requests; dividing that budget
+    #: by this fraction is what actually slows the request rate to 80 % of the
+    #: exchange's default speed - 1.0 keeps ccxt's own default pacing.
+    request_rate_scale: float = Field(default=0.8, gt=0.0, le=1.0)
+
 
 class DataSettings(BaseModel):
     """Data-ingestion parameters for the 5-minute pipeline."""
@@ -94,8 +103,8 @@ class DataSettings(BaseModel):
     timeframe: Literal["5m"] = Field(default="5m")
     timeframe_ms: int = Field(default=5 * 60 * 1_000)
 
-    ohlcv_limit: int = Field(default=500, ge=50, le=1_500)
-    history_bootstrap_candles: int = Field(default=6_000, ge=500)
+    ohlcv_limit: int = Field(default=1_500, ge=50, le=1_500)
+    history_bootstrap_candles: int = Field(default=105_120, ge=500)
     orderbook_depth: int = Field(default=20, ge=5, le=100)
     orderbook_levels_for_imbalance: int = Field(default=10, ge=1, le=100)
 
@@ -125,7 +134,7 @@ class UniverseSettings(BaseModel):
     #: Bid/ask spread ceiling in basis points, measured at discovery time.
     max_spread_bps: float = Field(default=6.0, gt=0.0)
     #: Days since listing.  Below this there is not enough 5m history to train.
-    min_history_days: int = Field(default=90, ge=1)
+    min_history_days: int = Field(default=365, ge=1)
 
     #: Account size the small-capital screens are calibrated against.
     reference_equity: float = Field(default=1_000.0, gt=0.0)
@@ -150,6 +159,23 @@ class QCSettings(BaseModel):
 
     max_heal_attempts: int = Field(default=4, ge=1, le=10)
     heal_backoff_seconds: float = Field(default=2.0, gt=0.0)
+    #: Hard wall-clock ceiling on one symbol's total heal loop, regardless of how
+    #: many attempts remain in the budget.  Bounds worst-case latency so a symbol
+    #: stuck healing cannot indefinitely hold the shared request-rate budget and
+    #: starve every other symbol's cycle.
+    max_heal_duration_seconds: float = Field(default=90.0, gt=0.0)
+    #: Suspicious timestamps within this many bars of each other are healed as
+    #: one contiguous re-fetch window instead of two separate ones.
+    heal_merge_gap_bars: int = Field(default=3, ge=0)
+    #: When a heal attempt would otherwise need more distinct windows than this,
+    #: it falls back to batched windows spanning the damaged range - fragmenting
+    #: further would trade a handful of extra requests for no real precision.
+    max_heal_window_groups: int = Field(default=12, ge=1)
+    #: Hard cap, in bars, on the span of any single fallback batch window. Without
+    #: this, widespread damage across a long history could otherwise collapse
+    #: into one unbounded re-fetch of tens of thousands of candles; instead the
+    #: full damaged range is split into controlled, bounded-size batches.
+    max_heal_window_bars: int = Field(default=2_000, ge=50)
 
     #: A candle whose volume exceeds ``median * this`` is flagged as an anomaly.
     volume_spike_median_multiple: float = Field(default=50.0, gt=1.0)
@@ -236,6 +262,13 @@ class MLSettings(BaseModel):
     #: Bars removed between train and validation blocks to kill label leakage.
     purge_bars: int = Field(default=60, ge=0)
     early_stopping_rounds: int = Field(default=50, ge=0)
+
+    #: Exponential time-decay half-life (days) for training sample weights: a
+    #: row this many days behind the most recent training row gets half the
+    #: weight, one that far again gets a quarter, and so on.  Crypto regimes
+    #: drift, so a year-old candle should not vote as loudly as yesterday's.
+    #: ``0`` disables recency weighting (every row weighted equally).
+    recency_half_life_days: float = Field(default=45.0, ge=0.0)
 
     inference_workers: int = Field(default=2, ge=1, le=16)
 

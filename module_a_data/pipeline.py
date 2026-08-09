@@ -22,6 +22,7 @@ from module_a_data.db_handler import DatabaseHandler
 from module_a_data.fetcher import BinanceDataFetcher
 from module_a_data.models import (
     FuturesMetrics,
+    HealAttempt,
     MarketDataBundle,
     OHLCVCandle,
     OrderBookSnapshot,
@@ -34,6 +35,16 @@ _LOGGER = get_logger(__name__)
 
 #: Extra candles fetched beyond the strict minimum, so rolling windows warm up.
 _LOOKBACK_SAFETY_BARS: Final[int] = 50
+
+#: Rolling history caps for QC/healing telemetry persisted to durable state -
+#: enough for a meaningful diagnostic report without the state blob growing
+#: unbounded across the life of a long-running deployment.
+_MAX_STORED_HEAL_ATTEMPTS: Final[int] = 500
+_MAX_STORED_EXCLUSIONS: Final[int] = 500
+
+#: Durable state keys (see ``DatabaseHandler.set_state``/``get_state``).
+HEAL_TELEMETRY_STATE_KEY: Final[str] = "qc_heal_telemetry"
+SYMBOL_EXCLUSION_STATE_KEY: Final[str] = "qc_symbol_exclusions"
 
 #: ``(symbol, completed, total) -> None`` progress reporter for long backfills.
 ProgressCallback = Callable[[str, int, int], None]
@@ -59,6 +70,11 @@ class DataPipeline:
         self.last_cycle_ms: int = 0
         self.last_cycle_symbols_ok: int = 0
         self.last_cycle_symbols_failed: int = 0
+        #: Every heal round attempted in the most recent cycle, and every
+        #: symbol excluded from it with the reason - both also persisted to
+        #: durable state (bounded history) for the ML diagnostic report.
+        self.last_cycle_heal_attempts: list[dict[str, object]] = []
+        self.last_cycle_exclusions: list[dict[str, object]] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -110,8 +126,12 @@ class DataPipeline:
 
                     report: QCReport = self._validator.validate_candles(symbol, candles)
                     if not report.passed:
-                        healed, _ = await self._validator.validate_and_heal(
-                            symbol, candles, self._refetch
+                        # Quarantine rather than discard: a permanently unfetchable
+                        # window (an exchange halt, a pre-listing gap) must not
+                        # cost the whole symbol its otherwise-clean history on
+                        # every single bootstrap run.
+                        healed, _, _ = await self._validator.validate_and_heal(
+                            symbol, candles, self._refetch, quarantine_unhealable=True
                         )
                         candles = healed
 
@@ -151,6 +171,8 @@ class DataPipeline:
         """
         universe: list[str] = symbols if symbols is not None else list(self._settings.data.symbols)
         started_ms: int = utc_now_ms()
+        self.last_cycle_heal_attempts = []
+        self.last_cycle_exclusions = []
 
         bundles: list[MarketDataBundle | None] = await asyncio.gather(
             *(self._process_symbol(symbol) for symbol in universe)
@@ -169,7 +191,35 @@ class DataPipeline:
             len(valid),
             len(universe),
         )
+        await self._persist_qc_telemetry()
         return valid
+
+    async def _persist_qc_telemetry(self) -> None:
+        """Append this cycle's heal telemetry and exclusions to durable state.
+
+        Stored as a bounded rolling history (see ``_MAX_STORED_*``) so the ML
+        diagnostic report can show real healing/exclusion history across many
+        cycles without the state blob growing without bound. Persistence
+        failures are logged, never raised - telemetry must not be able to
+        break the ingestion cycle it is describing.
+        """
+        if not self.last_cycle_heal_attempts and not self.last_cycle_exclusions:
+            return
+        try:
+            if self.last_cycle_heal_attempts:
+                stored = await self._db.get_state(HEAL_TELEMETRY_STATE_KEY)
+                history: list[object] = list((stored or {}).get("records", []))
+                history.extend(self.last_cycle_heal_attempts)
+                history = history[-_MAX_STORED_HEAL_ATTEMPTS:]
+                await self._db.set_state(HEAL_TELEMETRY_STATE_KEY, {"records": history})
+            if self.last_cycle_exclusions:
+                stored = await self._db.get_state(SYMBOL_EXCLUSION_STATE_KEY)
+                history = list((stored or {}).get("records", []))
+                history.extend(self.last_cycle_exclusions)
+                history = history[-_MAX_STORED_EXCLUSIONS:]
+                await self._db.set_state(SYMBOL_EXCLUSION_STATE_KEY, {"records": history})
+        except DatabaseError as error:
+            _LOGGER.error("Failed to persist QC/heal telemetry: %s", error)
 
     # ------------------------------------------------------------------
     # Internals
@@ -209,14 +259,40 @@ class DataPipeline:
 
             # --- QC gatekeeper (with auto-healing) ------------------------
             try:
-                healed, report = await self._validator.validate_and_heal(
+                healed: list[OHLCVCandle]
+                report: QCReport
+                heal_attempts: list[HealAttempt]
+                healed, report, heal_attempts = await self._validator.validate_and_heal(
                     symbol, candles, self._refetch
                 )
+                if heal_attempts:
+                    self.last_cycle_heal_attempts.extend(
+                        record.model_dump(mode="json") for record in heal_attempts
+                    )
             except DataIntegrityError as error:
                 _LOGGER.error("QC rejected %s and healing failed: %s", symbol, error)
+                self.last_cycle_heal_attempts.extend(error.context.get("heal_attempts", []))
+                self.last_cycle_exclusions.append(
+                    {
+                        "symbol": symbol,
+                        "cycle": "live",
+                        "reason": error.message,
+                        "codes": list(error.context.get("codes", ())),
+                        "excluded_at_ms": utc_now_ms(),
+                    }
+                )
                 return None
             except DataFetchError as error:
                 _LOGGER.error("Re-fetch during healing failed for %s: %s", symbol, error)
+                self.last_cycle_exclusions.append(
+                    {
+                        "symbol": symbol,
+                        "cycle": "live",
+                        "reason": f"re-fetch failed during healing: {error}",
+                        "codes": [],
+                        "excluded_at_ms": utc_now_ms(),
+                    }
+                )
                 return None
 
             side_issues: list[QCIssue] = [

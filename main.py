@@ -42,6 +42,7 @@ import argparse
 import asyncio
 import signal
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Final, Sequence
@@ -70,6 +71,7 @@ from module_e_execution.executor import LiveExecutor
 from module_e_execution.models import AccountState, ExecutionReport
 from module_e_execution.paper_trader import PaperTrader
 from module_e_execution.risk_guard import RiskGuard, SystemState
+from module_f_panel import diagnostics
 from module_f_panel.audit_engine import AuditEngine
 from module_f_panel.setup_state import SetupProgress, SystemPhase
 from module_f_panel.web_app import build_app
@@ -77,6 +79,41 @@ from module_f_panel.web_app import build_app
 _LOGGER = get_logger("main")
 
 _CYCLE_MINUTES: Final[str] = "0,5,10,15,20,25,30,35,40,45,50,55"
+
+#: Rolling history cap for persisted per-cycle timing telemetry.
+_MAX_STORED_CYCLE_TIMINGS: Final[int] = 500
+
+
+def _headline_metrics(report: dict[str, Any]) -> dict[str, Any]:
+    """Small, fixed-size summary of a training report for frequent polling.
+
+    ``report`` (from ``MLSubsystem.train_all``) now carries full per-head
+    metrics - confusion matrices, threshold sweeps, feature importance - which
+    is exactly what the ML diagnostic report needs but is far too large to
+    push through the ``/api/setup/status`` endpoint on every poll. The full
+    report is always available via the diagnostic report export instead.
+    """
+    headline: dict[str, Any] = {}
+    for head, metrics in report.items():
+        if "error" in metrics:
+            headline[head] = {"error": metrics["error"]}
+            continue
+        keys = {
+            "direction": ("accuracy", "balanced_accuracy", "log_loss"),
+            "entry": ("precision", "recall", "roc_auc"),
+            "risk": ("mae", "r2"),
+        }.get(head)
+        if keys is not None:
+            headline[head] = {key: metrics[key] for key in keys if key in metrics}
+        elif head == "exit":
+            headline[head] = {
+                target: {"mae": target_metrics.get("mae")}
+                for target, target_metrics in metrics.items()
+                if isinstance(target_metrics, dict)
+            }
+        else:  # pragma: no cover - defensive default
+            headline[head] = {}
+    return headline
 
 #: Either concrete engine satisfies the same interface; the loop never branches.
 ExecutionEngine = PaperTrader | LiveExecutor
@@ -134,6 +171,17 @@ class TradingSystem:
         self.last_cycle_executed: int = 0
         self.last_cycle_error: str = ""
         self.cycles_completed: int = 0
+        #: Per-stage wall-clock timings (seconds) for the most recently
+        #: completed cycle - ingestion, features, prediction, decision,
+        #: execution and database/audit, plus the overall total. Surfaced on
+        #: the ML diagnostic report's Pipeline Timing section.
+        self.last_cycle_timings: dict[str, float] = {}
+        #: Cycles skipped because the previous one was still running when the
+        #: next 5m slot fired - direct evidence for whether cycles are
+        #: overrunning their scheduling interval.
+        self.cycles_skipped_overlap: int = 0
+        #: Run ID of the most recently generated ML diagnostic report, if any.
+        self.latest_ml_report_id: str | None = None
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -333,13 +381,31 @@ class TradingSystem:
         self.progress.training_summary = {
             "rows": len(dataset),
             "distribution": dataset.class_distribution(),
-            "metrics": report,
+            "metrics": _headline_metrics(report),
         }
         await self.database.set_state(
             "trained_universe",
             {"symbols": symbols, "trained_ms": utc_now_ms(), "rows": len(dataset)},
         )
-        _LOGGER.info("Training complete: %s", report)
+        _LOGGER.info("Training complete: %s", _headline_metrics(report))
+
+        run_id: str = str(uuid.uuid4())
+        try:
+            diagnostic_report: dict[str, Any] = await diagnostics.build_report(
+                settings=self.settings,
+                database=self.database,
+                ml=self.ml,
+                dataset=dataset,
+                run_id=run_id,
+            )
+            self.latest_ml_report_id = run_id
+            _LOGGER.info(
+                "ML diagnostic report %s: status=%s",
+                run_id,
+                diagnostic_report["ai_summary"]["overall_status"],
+            )
+        except Exception as error:  # pragma: no cover - reporting must not break training
+            _LOGGER.error("Could not build the ML diagnostic report: %s", error, exc_info=True)
 
     async def _trained_universe(self) -> list[str]:
         """Universe the current artifacts were trained on (empty when unknown)."""
@@ -483,7 +549,11 @@ class TradingSystem:
         previous one.
         """
         if self._cycle_lock.locked():
-            _LOGGER.warning("Previous cycle is still running - skipping this slot")
+            self.cycles_skipped_overlap += 1
+            _LOGGER.warning(
+                "Previous cycle is still running - skipping this slot (%d skipped so far)",
+                self.cycles_skipped_overlap,
+            )
             return {"skipped": True}
 
         async with self._cycle_lock:
@@ -513,6 +583,8 @@ class TradingSystem:
             _LOGGER.info(
                 "--- cycle %s done in %.2fs ---", cycle_id[:8], self.last_cycle_duration_s
             )
+            if self.last_cycle_timings:
+                await self._persist_cycle_timings(cycle_id, self.last_cycle_timings)
             return summary
 
     async def _run_cycle(self, cycle_id: str) -> dict[str, Any]:
@@ -527,13 +599,27 @@ class TradingSystem:
             _LOGGER.debug("Cycle skipped: no universe selected")
             return {"skipped": "no universe"}
 
+        timings: dict[str, float] = {}
+        cycle_started: float = time.perf_counter()
+
+        def _mark(stage: str, since: float) -> float:
+            """Record ``stage``'s duration and return a fresh checkpoint."""
+            now: float = time.perf_counter()
+            timings[stage] = now - since
+            return now
+
+        checkpoint: float = cycle_started
+
         # --- A: ingestion + QC -------------------------------------------
         bundles: dict[str, MarketDataBundle] = await self.pipeline.run_cycle(self.active_symbols)
+        checkpoint = _mark("ingestion_and_qc", checkpoint)
         self.last_cycle_symbols_ok = len(bundles)
         if not bundles:
             await self.audit.log_system_event(
                 cycle_id, "NO_TRADE", "no symbol passed QC this cycle", rule="QC_ALL_FAILED"
             )
+            timings["total"] = time.perf_counter() - cycle_started
+            self.last_cycle_timings = timings
             return {"symbols": 0}
 
         if not self.phase.is_trading or not self.trading_enabled:
@@ -542,26 +628,33 @@ class TradingSystem:
                 len(bundles),
                 self.phase.value,
             )
+            timings["total"] = time.perf_counter() - cycle_started
+            self.last_cycle_timings = timings
             return {"symbols": len(bundles), "trading": False, "phase": self.phase.value}
 
         # --- Equity refresh + Risk Guard evaluation -----------------------
         account: AccountState = await self._account_state()
         state: SystemState = await self.risk_guard.update_equity(account.equity)
+        checkpoint = _mark("risk_guard", checkpoint)
 
         # --- B: features ---------------------------------------------------
         payloads: dict[str, InferencePayload] = await self.processor.build_inference_payloads(
             list(bundles)
         )
+        checkpoint = _mark("feature_generation", checkpoint)
         if not payloads:
             await self.audit.log_system_event(
                 cycle_id, "NO_TRADE", "no symbol produced a warm feature row", rule="FEATURES_COLD"
             )
+            timings["total"] = time.perf_counter() - cycle_started
+            self.last_cycle_timings = timings
             return {"symbols": len(bundles), "payloads": 0}
 
         # --- C: inference ---------------------------------------------------
         inferences: dict[str, ModelInferenceResult] = await self.ml.infer_many(
             list(payloads.values())
         )
+        checkpoint = _mark("prediction", checkpoint)
 
         # --- D: decisions ----------------------------------------------------
         context = DecisionContext(
@@ -577,6 +670,7 @@ class TradingSystem:
             list(inferences.values()), context
         )
         self.last_cycle_decisions = len(decisions)
+        checkpoint = _mark("decision", checkpoint)
 
         # --- E: execution -----------------------------------------------------
         executed: int = 0
@@ -594,17 +688,24 @@ class TradingSystem:
                 execution_detail=execution_detail,
             )
         self.last_cycle_executed = executed
+        checkpoint = _mark("execution_and_audit", checkpoint)
 
         # --- Post-cycle bookkeeping ---------------------------------------------
         await self._record_equity()
+        checkpoint = _mark("database", checkpoint)
+
+        timings["total"] = time.perf_counter() - cycle_started
+        self.last_cycle_timings = timings
 
         _LOGGER.info(
-            "Cycle summary: %d symbols | %d decisions | %d executed | guard=%s | equity=%.2f",
+            "Cycle summary: %d symbols | %d decisions | %d executed | guard=%s | equity=%.2f | "
+            "timings=%s",
             len(bundles),
             len(decisions),
             executed,
             state.value,
             account.equity,
+            {key: round(value, 3) for key, value in timings.items()},
         )
         return {
             "cycle_id": cycle_id,
@@ -613,6 +714,7 @@ class TradingSystem:
             "executed": executed,
             "risk_guard": state.value,
             "equity": account.equity,
+            "timings": timings,
         }
 
     async def _execute(self, decision: DecisionResult) -> dict[str, Any]:
@@ -667,6 +769,22 @@ class TradingSystem:
             )
         except Exception as error:  # pragma: no cover
             _LOGGER.error("Could not record the equity point: %s", error)
+
+    async def _persist_cycle_timings(self, cycle_id: str, timings: dict[str, float]) -> None:
+        """Append this cycle's per-stage timings to a bounded rolling history.
+
+        Feeds the ML diagnostic report's Pipeline Timing section with real,
+        measured durations across many cycles rather than just the latest one.
+        Best-effort: a persistence failure must not affect trading.
+        """
+        try:
+            stored: dict[str, Any] | None = await self.database.get_state("cycle_timings_history")
+            history: list[Any] = list((stored or {}).get("records", []))
+            history.append({"cycle_id": cycle_id, "at": utc_now_ms(), **timings})
+            history = history[-_MAX_STORED_CYCLE_TIMINGS:]
+            await self.database.set_state("cycle_timings_history", {"records": history})
+        except Exception as error:  # pragma: no cover - telemetry must not break the loop
+            _LOGGER.error("Could not persist cycle timings: %s", error)
 
     # ------------------------------------------------------------------
     # SystemController implementation (consumed by the web panel)
@@ -827,6 +945,26 @@ class TradingSystem:
         """Proxy to the trades table."""
         return await self.database.fetch_trades(status=status_filter, limit=limit)
 
+    async def ml_diagnostics(self) -> dict[str, Any]:
+        """The full ML diagnostic report for the most recent training run.
+
+        Read back from the durable state pointer + JSON file written by
+        :func:`module_f_panel.diagnostics.build_report`, so this reflects the
+        real last-completed run even across a panel restart - never
+        recomputed or approximated here.
+        """
+        report: dict[str, Any] | None = await diagnostics.load_latest_report(self.database)
+        if report is None:
+            return {"status": "NOT_AVAILABLE", "reason": "no training run has completed yet"}
+        return report
+
+    async def ml_diagnostics_markdown(self) -> str:
+        """The same report, rendered as human-readable Markdown."""
+        report: dict[str, Any] = await self.ml_diagnostics()
+        if report.get("status") == "NOT_AVAILABLE":
+            return "# ML Diagnostic Report\n\nNo training run has completed yet."
+        return diagnostics.render_markdown(report)
+
     # ------------------------------------------------------------------
     # Runners
     # ------------------------------------------------------------------
@@ -971,8 +1109,21 @@ class TradingSystem:
 
         _LOGGER.info("Dataset: %d rows | %s", len(dataset), dataset.class_distribution())
         report: dict[str, Any] = await self.ml.train_all(dataset)
-        for head, metrics in report.items():
+        for head, metrics in _headline_metrics(report).items():
             _LOGGER.info("%-10s -> %s", head, metrics)
+
+        run_id: str = str(uuid.uuid4())
+        try:
+            diagnostic_report: dict[str, Any] = await diagnostics.build_report(
+                settings=self.settings, database=self.database, ml=self.ml, dataset=dataset, run_id=run_id
+            )
+            self.latest_ml_report_id = run_id
+            reports_dir = self.settings.ml.model_dir.parent / diagnostics.REPORTS_DIR_NAME
+            print(f"\nML diagnostic report: {reports_dir / f'ml_diagnostic_{run_id}.json'}")
+            print(f"Overall status: {diagnostic_report['ai_summary']['overall_status']}")
+        except Exception as error:  # pragma: no cover - reporting must not break the CLI
+            _LOGGER.error("Could not build the ML diagnostic report: %s", error, exc_info=True)
+
         await self.features.shutdown()
         await self.database.close()
 
