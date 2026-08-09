@@ -23,6 +23,7 @@ import pandas as pd
 from config.settings import Settings
 from core.exceptions import FeatureEngineeringError, InsufficientDataError
 from core.logger import get_logger
+from core.utils import longest_clean_trailing_run
 from module_a_data.db_handler import DatabaseHandler
 from module_a_data.models import QCIssue, QCSeverity
 from module_a_data.qc_validator import QCValidator
@@ -355,29 +356,22 @@ class DatasetProcessor:
     ) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None]:
         """Load OHLCV, futures metrics and order-book history for one symbol.
 
+        The OHLCV window is trimmed to its longest clean trailing run (see
+        :meth:`_trim_to_clean_window`) before anything downstream sees it.
+
         Raises:
             InsufficientDataError: When the stored OHLCV window fails the
-                structural integrity check (gaps, duplicates, misaligned or
-                unsorted timestamps, non-finite/illogical prices).  A symbol in
-                this state must not reach feature engineering or the ML
-                pipeline, whether the call originates from training or from
-                live inference.
+                structural integrity check and nothing usable survives
+                trimming to the newest clean run.  A symbol in this state
+                must not reach feature engineering or the ML pipeline,
+                whether the call originates from training or from live
+                inference.
         """
         ohlcv: pd.DataFrame = await self._db.load_ohlcv_dataframe(symbol, limit=depth)
         if ohlcv.empty:
             return ohlcv, None, None
 
-        integrity_issues: list[QCIssue] = self._validator.validate_stored_frame(symbol, ohlcv)
-        critical: list[QCIssue] = [
-            issue for issue in integrity_issues if issue.severity is QCSeverity.CRITICAL
-        ]
-        if critical:
-            codes: tuple[str, ...] = tuple(sorted({issue.code.value for issue in critical}))
-            raise InsufficientDataError(
-                "stored candle window failed integrity validation",
-                symbol=symbol,
-                codes=codes,
-            )
+        ohlcv = self._trim_to_clean_window(symbol, ohlcv)
 
         futures: pd.DataFrame = await self._db.load_futures_metrics_frame(symbol, limit=depth)
         book: pd.DataFrame = await self._load_order_book_frame(symbol, depth)
@@ -386,6 +380,74 @@ class DatasetProcessor:
             futures if not futures.empty else None,
             book if not book.empty else None,
         )
+
+    def _trim_to_clean_window(self, symbol: str, ohlcv: pd.DataFrame) -> pd.DataFrame:
+        """Validate a stored OHLCV window and trim it to its clean trailing run.
+
+        A gap or corrupt row anywhere in a symbol's stored history must never
+        silently reach feature engineering - but a symbol should not lose its
+        *entire* history over one old, already-superseded defect either (this
+        is exactly what a symbol whose data predates a validator improvement,
+        or was written by a less careful earlier ingestion run, looks like).
+        The same "keep the newest clean run" rule Module A applies when
+        quarantining an unhealable window at ingestion time
+        (:meth:`module_a_data.qc_validator.QCValidator._longest_clean_trailing_run`)
+        is applied here on read, via the shared
+        :func:`core.utils.longest_clean_trailing_run`, so a symbol only loses
+        the pipeline entirely when nothing usable survives trimming.
+        """
+        issues: list[QCIssue] = self._validator.validate_stored_frame(symbol, ohlcv)
+        critical: list[QCIssue] = [
+            issue for issue in issues if issue.severity is QCSeverity.CRITICAL
+        ]
+        if not critical:
+            return ohlcv
+
+        bad: set[int] = set()
+        for issue in critical:
+            bad.update(issue.timestamps)
+
+        timestamps: list[int] = ohlcv["timestamp"].astype("int64").tolist()
+        kept: set[int] = set(
+            longest_clean_trailing_run(timestamps, bad, self._settings.data.timeframe_ms)
+        )
+        trimmed: pd.DataFrame = (
+            ohlcv[ohlcv["timestamp"].isin(kept)].sort_values("timestamp").reset_index(drop=True)
+        )
+
+        codes: tuple[str, ...] = tuple(sorted({issue.code.value for issue in critical}))
+        if trimmed.empty:
+            raise InsufficientDataError(
+                "stored candle window failed integrity validation and nothing "
+                "clean survived trimming",
+                symbol=symbol,
+                codes=codes,
+            )
+
+        # Defensive re-check: guarantees the returned frame is truly clean
+        # rather than trusting the trim logic blindly.
+        residual: list[QCIssue] = self._validator.validate_stored_frame(symbol, trimmed)
+        if any(issue.severity is QCSeverity.CRITICAL for issue in residual):
+            raise InsufficientDataError(
+                "stored candle window failed integrity validation even after "
+                "trimming to the clean trailing run",
+                symbol=symbol,
+                codes=codes,
+            )
+
+        dropped: int = len(ohlcv) - len(trimmed)
+        if dropped:
+            _LOGGER.warning(
+                "%s: %d stored candle(s) failed integrity validation (%s) - "
+                "using the clean trailing run of %d candle(s) from %d to %d",
+                symbol,
+                dropped,
+                ", ".join(codes),
+                len(trimmed),
+                int(trimmed["timestamp"].iloc[0]),
+                int(trimmed["timestamp"].iloc[-1]),
+            )
+        return trimmed
 
     async def _load_order_book_frame(self, symbol: str, depth: int) -> pd.DataFrame:
         """Load recent order-book snapshots into a timestamp-keyed frame."""

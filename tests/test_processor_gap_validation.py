@@ -101,13 +101,35 @@ def test_validate_stored_frame_flags_empty() -> None:
 
 # ---------------------------------------------------------------------------
 # DatasetProcessor wiring: a gappy/corrupt symbol must never reach Module B
+# uncleaned, but a symbol should not lose its *entire* history over one old,
+# already-superseded defect either - it should trim to the clean trailing run
+# and only be rejected outright when nothing usable survives that trim.
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_load_symbol_inputs_rejects_gappy_storage() -> None:
+async def test_load_symbol_inputs_trims_to_clean_trailing_run_on_gap() -> None:
     settings = Settings()
     frame = clean_frame(50)
     gapped = pd.concat([frame.iloc[:20], frame.iloc[30:]], ignore_index=True)
     processor = DatasetProcessor(settings, FakeDatabase(gapped))
+    processor._load_order_book_frame = _empty_book_frame  # avoid touching a real DB
+
+    ohlcv, futures, book = await processor._load_symbol_inputs("BTC/USDT:USDT", depth=50)
+
+    # The pre-gap segment (candles 0..19) is dropped; only the clean trailing
+    # run after the gap (candles 30..49) survives - not an outright rejection.
+    assert len(ohlcv) == 20
+    assert int(ohlcv["timestamp"].iloc[0]) == int(frame["timestamp"].iloc[30])
+    assert int(ohlcv["timestamp"].iloc[-1]) == int(frame["timestamp"].iloc[-1])
+
+
+@pytest.mark.asyncio
+async def test_load_symbol_inputs_raises_when_nothing_survives_trimming() -> None:
+    """When corruption spans the whole window, there is no clean run to fall
+    back to, so the symbol must still be rejected outright."""
+    settings = Settings()
+    frame = clean_frame(50)
+    frame["high"] = frame["low"] - 1.0  # every row violates OHLC geometry
+    processor = DatasetProcessor(settings, FakeDatabase(frame))
 
     with pytest.raises(InsufficientDataError):
         await processor._load_symbol_inputs("BTC/USDT:USDT", depth=50)
@@ -130,12 +152,13 @@ async def _empty_book_frame(symbol: str, depth: int) -> pd.DataFrame:
 
 
 @pytest.mark.asyncio
-async def test_build_inference_payload_skips_symbol_with_corrupt_storage() -> None:
-    """End-to-end: the live-inference entry point must never see a bad symbol."""
+async def test_build_inference_payload_skips_symbol_when_nothing_survives_trimming() -> None:
+    """End-to-end: a symbol corrupt everywhere - no clean trailing run to fall
+    back to - must still be refused by the live-inference entry point."""
     settings = Settings()
     frame = clean_frame(50)
-    gapped = pd.concat([frame.iloc[:20], frame.iloc[30:]], ignore_index=True)
-    processor = DatasetProcessor(settings, FakeDatabase(gapped))
+    frame["close"] = float("nan")  # every row fails validation; nothing to trim to
+    processor = DatasetProcessor(settings, FakeDatabase(frame))
 
     payload = await processor.build_inference_payload("BTC/USDT:USDT", lookback_candles=50)
     assert payload is None

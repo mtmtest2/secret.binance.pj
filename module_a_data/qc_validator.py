@@ -46,7 +46,13 @@ import pandas as pd
 from config.settings import Settings
 from core.exceptions import DataIntegrityError
 from core.logger import get_logger
-from core.utils import backoff_delay, expected_timestamps, last_closed_candle_open_ms, utc_now_ms
+from core.utils import (
+    backoff_delay,
+    expected_timestamps,
+    last_closed_candle_open_ms,
+    longest_clean_trailing_run,
+    utc_now_ms,
+)
 from module_a_data.models import (
     FuturesMetrics,
     OHLCVCandle,
@@ -308,32 +314,24 @@ class QCValidator:
         """Drop every candle tied to a surviving CRITICAL issue, then keep only
         the contiguous run ending at the newest candle.
 
-        A candle flagged as corrupt (bad price/volume logic, a NaN, a return
-        outlier) is removed outright.  A candle that was never fetched in the
-        first place (``MISSING_CANDLES``) is already absent, so it naturally
-        opens a gap in the sorted timestamp sequence.  Either way, the first
-        gap counted back from the end marks where the last *unhealable* damage
-        sits; everything from there forward - the newest, most relevant history
-        - is what gets kept, since every downstream consumer expects a single
-        contiguous grid rather than history with a hole punched in the middle.
+        See :func:`core.utils.longest_clean_trailing_run` for the shared rule
+        this and :class:`module_b_features.processor.DatasetProcessor` both
+        apply.
         """
         bad: set[int] = set()
         for issue in report.issues:
             if issue.severity is QCSeverity.CRITICAL:
                 bad.update(issue.timestamps)
 
-        cleaned: list[OHLCVCandle] = sorted(
-            (candle for candle in working if candle.timestamp not in bad),
+        kept_timestamps: set[int] = set(
+            longest_clean_trailing_run(
+                (candle.timestamp for candle in working), bad, self._timeframe_ms
+            )
+        )
+        return sorted(
+            (candle for candle in working if candle.timestamp in kept_timestamps),
             key=lambda item: item.timestamp,
         )
-        if not cleaned:
-            return []
-
-        cut_index: int = 0
-        for index in range(1, len(cleaned)):
-            if cleaned[index].timestamp - cleaned[index - 1].timestamp > self._timeframe_ms:
-                cut_index = index
-        return cleaned[cut_index:]
 
     def validate_order_book(self, book: OrderBookSnapshot | None, symbol: str) -> list[QCIssue]:
         """Sanity-check a reduced order-book snapshot."""

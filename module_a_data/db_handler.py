@@ -16,6 +16,8 @@ Design notes
 
 from __future__ import annotations
 
+import asyncio
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from types import TracebackType
 from typing import Any, Final, Sequence
@@ -59,16 +61,57 @@ _OHLCV_COLUMNS: Final[tuple[str, ...]] = (
     "volume",
 )
 
-#: A single ``INSERT ... VALUES (...), (...), ...`` statement binds one SQL
-#: variable per column per row - unlike ``executemany``, ``.values(list)``
-#: builds one literal multi-row statement and is *not* auto-chunked by
-#: SQLAlchemy's "insertmanyvalues" machinery.  SQLite's compiled variable-count
-#: ceiling ranges from 999 (pre-3.32, still shipped on some distros) up to
-#: 32766 on modern builds; a full-history bootstrap easily produces tens of
-#: thousands of rows, so batching is mandatory rather than an optimisation.
-#: 8 columns/row * 100 rows = 800 bound parameters, safely under even the old
-#: 999-variable ceiling.
-_UPSERT_BATCH_ROWS: Final[int] = 100
+#: Columns bound per row in the :meth:`DatabaseHandler.upsert_candles` payload
+#: (symbol, timeframe, timestamp, open, high, low, close, volume).
+_OHLCV_UPSERT_COLUMNS: Final[int] = 8
+
+#: The historical (pre-SQLite-3.32) default variable-count ceiling.  Used only
+#: as a fallback if the real limit cannot be queried from this process's
+#: linked-in SQLite library - see :func:`_detect_upsert_batch_rows`.
+_FALLBACK_SQLITE_VARIABLE_LIMIT: Final[int] = 999
+
+
+def _detect_upsert_batch_rows(columns_per_row: int) -> int:
+    """Compute a per-statement row count that is safe under *this process's*
+    actual compiled SQLite variable-count ceiling.
+
+    A single ``INSERT ... VALUES (...), (...), ...`` statement binds one SQL
+    variable per column per row - unlike ``executemany``, ``.values(list)``
+    builds one literal multi-row statement and is *not* auto-chunked by
+    SQLAlchemy's "insertmanyvalues" machinery.  SQLite's compiled
+    ``SQLITE_MAX_VARIABLE_NUMBER`` has shipped as low as 999 (pre-3.32, still
+    the default on some distro-packaged builds) and as high as 32766+ on
+    modern ones, so guessing a fixed number risks either failing outright on
+    an older build or leaving needless round-trips on the table for a modern
+    one.  ``sqlite3.Connection.getlimit`` (Python 3.11+) reports the value
+    actually linked into this process, so it is queried once at import time
+    instead of assumed.
+    """
+    limit: int = 0
+    try:
+        probe = sqlite3.connect(":memory:")
+        try:
+            getlimit = getattr(probe, "getlimit", None)
+            if getlimit is not None:
+                limit = int(getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER))
+        finally:
+            probe.close()
+    except Exception:  # pragma: no cover - defensive: never let detection fail startup
+        limit = 0
+    if limit <= 0:
+        limit = _FALLBACK_SQLITE_VARIABLE_LIMIT
+
+    # Half the real ceiling, so this remains safe even if a future column is
+    # added to the payload without updating `columns_per_row`.
+    safe_params: int = max(columns_per_row, limit // 2)
+    rows: int = safe_params // columns_per_row
+    # A ceiling on top of that so one batch (and the write lock it holds,
+    # see `DatabaseHandler._write_lock`) never dominates a transaction.
+    return max(1, min(rows, 500))
+
+
+#: Rows per multi-row upsert statement - see :func:`_detect_upsert_batch_rows`.
+_UPSERT_BATCH_ROWS: Final[int] = _detect_upsert_batch_rows(_OHLCV_UPSERT_COLUMNS)
 
 
 class DatabaseHandler:
@@ -78,6 +121,16 @@ class DatabaseHandler:
         self._settings: Settings = settings
         self._engine: AsyncEngine | None = None
         self._session_factory: async_sessionmaker[AsyncSession] | None = None
+        #: SQLite allows exactly one writer at a time; without this, concurrent
+        #: writers (e.g. up to `max_concurrent_requests` symbols bootstrapping
+        #: in parallel, each holding a transaction open across many batched
+        #: upsert statements) contend for that single lock and can exceed
+        #: `busy_timeout_ms`, failing with "database is locked".  Serialising
+        #: writes at the application level turns that race into a queue that
+        #: always eventually succeeds instead of a race that sometimes times
+        #: out.  Reads are unaffected: WAL journalling lets them proceed
+        #: concurrently with a writer.
+        self._write_lock: asyncio.Lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -178,7 +231,7 @@ class DatabaseHandler:
         ]
 
         try:
-            async with self._factory()() as session:
+            async with self._write_lock, self._factory()() as session:
                 async with session.begin():
                     for batch in chunked(payload, _UPSERT_BATCH_ROWS):
                         statement = sqlite_insert(OHLCVRow).values(batch)
@@ -198,7 +251,9 @@ class DatabaseHandler:
                         )
                         await session.execute(statement)
         except SQLAlchemyError as error:
-            raise DatabaseError("candle upsert failed", rows=len(payload)) from error
+            raise DatabaseError(
+                "candle upsert failed", rows=len(payload), reason=str(error)
+            ) from error
         return len(payload)
 
     async def upsert_order_book(self, snapshot: OrderBookSnapshot) -> None:
@@ -222,11 +277,13 @@ class DatabaseHandler:
             set_={key: statement.excluded[key] for key in values if key not in ("symbol", "timestamp")},
         )
         try:
-            async with self._factory()() as session:
+            async with self._write_lock, self._factory()() as session:
                 async with session.begin():
                     await session.execute(statement)
         except SQLAlchemyError as error:
-            raise DatabaseError("order book upsert failed", symbol=snapshot.symbol) from error
+            raise DatabaseError(
+                "order book upsert failed", symbol=snapshot.symbol, reason=str(error)
+            ) from error
 
     async def upsert_futures_metrics(self, metrics: FuturesMetrics) -> None:
         """Persist funding / OI / positioning / liquidation metrics."""
@@ -255,11 +312,13 @@ class DatabaseHandler:
             },
         )
         try:
-            async with self._factory()() as session:
+            async with self._write_lock, self._factory()() as session:
                 async with session.begin():
                     await session.execute(statement)
         except SQLAlchemyError as error:
-            raise DatabaseError("futures metrics upsert failed", symbol=metrics.symbol) from error
+            raise DatabaseError(
+                "futures metrics upsert failed", symbol=metrics.symbol, reason=str(error)
+            ) from error
 
     # ------------------------------------------------------------------
     # Market-data reads
@@ -429,22 +488,24 @@ class DatabaseHandler:
     async def insert_audit_log(self, record: dict[str, Any]) -> None:
         """Insert one audit record (already flattened by the Audit Engine)."""
         try:
-            async with self._factory()() as session:
+            async with self._write_lock, self._factory()() as session:
                 async with session.begin():
                     session.add(AuditLogRow(**record))
         except SQLAlchemyError as error:
-            raise DatabaseError("audit log insert failed") from error
+            raise DatabaseError("audit log insert failed", reason=str(error)) from error
 
     async def insert_audit_logs(self, records: Sequence[dict[str, Any]]) -> int:
         """Bulk-insert audit records in a single transaction."""
         if not records:
             return 0
         try:
-            async with self._factory()() as session:
+            async with self._write_lock, self._factory()() as session:
                 async with session.begin():
                     session.add_all([AuditLogRow(**record) for record in records])
         except SQLAlchemyError as error:
-            raise DatabaseError("audit log bulk insert failed", rows=len(records)) from error
+            raise DatabaseError(
+                "audit log bulk insert failed", rows=len(records), reason=str(error)
+            ) from error
         return len(records)
 
     async def fetch_audit_logs(
@@ -505,11 +566,14 @@ class DatabaseHandler:
     async def purge_audit_logs(self, older_than_days: int) -> int:
         """Delete audit rows older than ``older_than_days``; returns rows removed."""
         cutoff: datetime = datetime.now(tz=timezone.utc) - timedelta(days=older_than_days)
-        async with self._factory()() as session:
-            async with session.begin():
-                result: Result[Any] = await session.execute(
-                    delete(AuditLogRow).where(AuditLogRow.created_at < cutoff)
-                )
+        try:
+            async with self._write_lock, self._factory()() as session:
+                async with session.begin():
+                    result: Result[Any] = await session.execute(
+                        delete(AuditLogRow).where(AuditLogRow.created_at < cutoff)
+                    )
+        except SQLAlchemyError as error:
+            raise DatabaseError("audit log purge failed", reason=str(error)) from error
         return int(result.rowcount or 0)
 
     # ------------------------------------------------------------------
@@ -518,19 +582,21 @@ class DatabaseHandler:
     async def insert_trade(self, record: dict[str, Any]) -> int:
         """Insert a newly opened trade; returns its primary key."""
         try:
-            async with self._factory()() as session:
+            async with self._write_lock, self._factory()() as session:
                 async with session.begin():
                     row: TradeRow = TradeRow(**record)
                     session.add(row)
                 await session.refresh(row)
                 return int(row.id)
         except SQLAlchemyError as error:
-            raise DatabaseError("trade insert failed", decision_id=record.get("decision_id")) from error
+            raise DatabaseError(
+                "trade insert failed", decision_id=record.get("decision_id"), reason=str(error)
+            ) from error
 
     async def update_trade(self, decision_id: str, updates: dict[str, Any]) -> bool:
         """Patch an existing trade row identified by its ``decision_id``."""
         try:
-            async with self._factory()() as session:
+            async with self._write_lock, self._factory()() as session:
                 async with session.begin():
                     result: Result[Any] = await session.execute(
                         select(TradeRow).where(TradeRow.decision_id == decision_id)
@@ -542,7 +608,9 @@ class DatabaseHandler:
                         setattr(row, key, value)
             return True
         except SQLAlchemyError as error:
-            raise DatabaseError("trade update failed", decision_id=decision_id) from error
+            raise DatabaseError(
+                "trade update failed", decision_id=decision_id, reason=str(error)
+            ) from error
 
     async def fetch_trades(
         self,
@@ -593,11 +661,11 @@ class DatabaseHandler:
     async def insert_equity_point(self, record: dict[str, Any]) -> None:
         """Append a point to the equity curve."""
         try:
-            async with self._factory()() as session:
+            async with self._write_lock, self._factory()() as session:
                 async with session.begin():
                     session.add(EquityRow(**record))
         except SQLAlchemyError as error:
-            raise DatabaseError("equity insert failed") from error
+            raise DatabaseError("equity insert failed", reason=str(error)) from error
 
     async def fetch_equity_curve(self, mode: str, limit: int = 500) -> list[dict[str, Any]]:
         """Return the most recent equity-curve points in chronological order."""
@@ -635,11 +703,11 @@ class DatabaseHandler:
             set_={"value": statement.excluded.value, "updated_at": datetime.now(tz=timezone.utc)},
         )
         try:
-            async with self._factory()() as session:
+            async with self._write_lock, self._factory()() as session:
                 async with session.begin():
                     await session.execute(statement)
         except SQLAlchemyError as error:
-            raise DatabaseError("state upsert failed", key=key) from error
+            raise DatabaseError("state upsert failed", key=key, reason=str(error)) from error
 
     async def get_state(self, key: str) -> dict[str, Any] | None:
         """Read a durable state blob, or ``None`` when the key is absent."""
