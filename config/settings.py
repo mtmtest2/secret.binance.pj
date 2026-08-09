@@ -263,6 +263,13 @@ class MLSettings(BaseModel):
     purge_bars: int = Field(default=60, ge=0)
     early_stopping_rounds: int = Field(default=50, ge=0)
 
+    #: Exponential time-decay half-life (days) for training sample weights: a
+    #: row this many days behind the most recent training row gets half the
+    #: weight, one that far again gets a quarter, and so on.  Crypto regimes
+    #: drift, so a year-old candle should not vote as loudly as yesterday's.
+    #: ``0`` disables recency weighting (every row weighted equally).
+    recency_half_life_days: float = Field(default=45.0, ge=0.0)
+
     inference_workers: int = Field(default=2, ge=1, le=16)
 
 

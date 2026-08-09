@@ -292,6 +292,17 @@ def _label_configuration(settings: Settings) -> dict[str, Any]:
     }
 
 
+def _walk_forward_problem_summary(walk_forward: dict[str, Any]) -> str:
+    """One-line, measurement-derived read on walk-forward validation health."""
+    if not isinstance(walk_forward, dict) or walk_forward.get("status") != "AVAILABLE":
+        return "walk-forward evaluation not available (single train/validation split only)"
+    std = walk_forward.get("accuracy_std")
+    folds = walk_forward.get("n_folds", "?")
+    if isinstance(std, (int, float)):
+        return f"none measured (walk-forward across {folds} folds, accuracy std={std:.3f})"
+    return f"none measured (walk-forward across {folds} folds)"
+
+
 def _ai_summary(report: dict[str, Any], comparison: list[dict[str, Any]]) -> dict[str, Any]:
     """Rule-based AI-ready summary - every field is derived from measured
     values already present in ``report``, never invented (spec Part 29)."""
@@ -356,9 +367,7 @@ def _ai_summary(report: dict[str, Any], comparison: list[dict[str, Any]]) -> dic
             else "none measured"
         ),
         "biggest_ml_problem": f"{weakest} is the weakest scored component" if scored else NOT_AVAILABLE,
-        "biggest_validation_problem": (
-            "walk-forward evaluation not available (single train/validation split only)"
-        ),
+        "biggest_validation_problem": _walk_forward_problem_summary(report.get("walk_forward", {})),
         "biggest_trading_problem": (
             "backtest not available for this run" if report.get("backtest", {}).get("status") == NOT_AVAILABLE
             else NOT_AVAILABLE
@@ -481,13 +490,11 @@ async def build_report(
         "entry": _head_section(ml, "entry"),
         "exit": _head_section(ml, "exit"),
         "risk": _head_section(ml, "risk"),
-        "walk_forward": {
-            "status": NOT_AVAILABLE,
-            "reason": (
-                "only a single temporal train/validation split is currently performed; "
-                "walk-forward evaluation across multiple rolling folds is not implemented"
-            ),
-        },
+        "walk_forward": (
+            ml.direction.walk_forward(dataset)
+            if ml.direction.is_loaded
+            else {"status": NOT_AVAILABLE, "reason": "direction model is not trained"}
+        ),
         "backtest": backtest.to_dict() if backtest is not None else {"status": NOT_AVAILABLE},
         "regimes": {
             "status": NOT_AVAILABLE,
@@ -576,7 +583,13 @@ def _recommendations(report: dict[str, Any], comparison: list[dict[str, Any]]) -
     for name in ("direction", "entry"):
         calib = report.get("calibration", {}).get(name, {})
         if calib.get("status") == "AVAILABLE" and calib.get("improved"):
-            low.append(f"{name} isotonic calibration measurably improves log loss - consider wiring it into inference")
+            if report.get(name, {}).get("production_calibration") == "isotonic":
+                low.append(f"{name} isotonic calibration measurably improves log loss and is wired into inference")
+            else:
+                low.append(
+                    f"{name} isotonic calibration measurably improves log loss but is not yet "
+                    "wired into inference (not enough held-out rows to fit a production calibrator)"
+                )
 
     if not (critical or high or medium or low):
         low.append("No issues detected from measured results this run")

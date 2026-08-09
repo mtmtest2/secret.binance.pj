@@ -266,7 +266,7 @@ class DecisionEngine:
             )
 
         # --- R7: risk tier ----------------------------------------------------
-        tier: str = risk.risk_tier or direction.implied_risk_tier
+        tier: str = risk.risk_tier
         tier_accepted: bool = tier in self._config.accepted_risk_tiers
         self._record(
             checks,

@@ -43,7 +43,7 @@ from core.exceptions import ModelNotLoadedError, ModelTrainingError
 from core.logger import get_logger
 from core.utils import clamp, git_commit_hash
 from module_b_features.features import FEATURE_COLUMNS, HMMRegime
-from module_b_features.labeler import LABEL_ORDER, LabelClass
+from module_b_features.labeler import LABEL_ORDER, LabelClass, risk_tier_from_score
 from module_b_features.processor import InferencePayload, ProcessedDataset
 from module_c_ml import metrics as ml_metrics
 from module_c_ml.schemas import (
@@ -79,6 +79,9 @@ _HYPERPARAMETER_FIELDS: Final[tuple[str, ...]] = (
 )
 
 # Hard sanity rails applied to every exit geometry, trained or heuristic.
+# Mirrored in module_b_features/labeler.py so the training targets are
+# clamped to the same range these rails allow at inference time - keep the
+# two sets of constants in sync if either changes.
 _MIN_TP_PCT: Final[float] = 0.0020
 _MAX_TP_PCT: Final[float] = 0.1500
 _MIN_SL_PCT: Final[float] = 0.0015
@@ -302,8 +305,18 @@ class BaseModelHead(ABC):
             verbose=-1,
         )
 
-    def _make_regressor(self) -> Any:
-        """Build an untrained gradient-boosted regressor."""
+    def _make_regressor(self, *, robust: bool = False) -> Any:
+        """Build an untrained gradient-boosted regressor.
+
+        Args:
+            robust: When ``True``, fit an L1 (least-absolute-deviation)
+                objective instead of the default L2 one.  L2 lets a handful of
+                extreme-outlier rows dominate the loss and drag every
+                prediction toward them; L1 is the standard fix when the
+                target is heavy-tailed (as the exit-geometry percentages are)
+                and matches the ``l1`` eval metric already used to early-stop
+                these heads.
+        """
         config: MLSettings = self._config
         if config.booster == "xgboost":
             from xgboost import XGBRegressor
@@ -316,7 +329,7 @@ class BaseModelHead(ABC):
                 colsample_bytree=config.colsample_bytree,
                 reg_lambda=config.reg_lambda,
                 min_child_weight=config.min_child_samples,
-                objective="reg:squarederror",
+                objective="reg:absoluteerror" if robust else "reg:squarederror",
                 random_state=config.random_state,
                 n_jobs=self._n_jobs(),
                 tree_method="hist",
@@ -335,7 +348,7 @@ class BaseModelHead(ABC):
             colsample_bytree=config.colsample_bytree,
             reg_lambda=config.reg_lambda,
             min_child_samples=config.min_child_samples,
-            objective="regression",
+            objective="regression_l1" if robust else "regression",
             random_state=config.random_state,
             n_jobs=self._n_jobs(),
             verbose=-1,
@@ -349,11 +362,21 @@ class BaseModelHead(ABC):
         x_validation: pd.DataFrame,
         y_validation: pd.Series,
         eval_metric: str,
+        sample_weight: np.ndarray | None = None,
     ) -> Any:
-        """Fit with early stopping when a non-empty validation block exists."""
+        """Fit with early stopping when a non-empty validation block exists.
+
+        ``sample_weight`` (when given) applies only to the training rows, not
+        the early-stopping validation block - early stopping should keep
+        judging genuine, uniformly-weighted held-out performance rather than
+        a recency-tilted one.
+        """
         rounds: int = self._config.early_stopping_rounds
+        fit_kwargs: dict[str, Any] = {}
+        if sample_weight is not None:
+            fit_kwargs["sample_weight"] = sample_weight
         if x_validation.empty or rounds <= 0:
-            estimator.fit(x_train, y_train)
+            estimator.fit(x_train, y_train, **fit_kwargs)
             return estimator
 
         if self._config.booster == "lightgbm":
@@ -377,6 +400,7 @@ class BaseModelHead(ABC):
                     eval_y=y_validation,
                     eval_metric=eval_metric,
                     callbacks=callbacks,
+                    **fit_kwargs,
                 )
             else:
                 estimator.fit(
@@ -385,12 +409,97 @@ class BaseModelHead(ABC):
                     eval_set=[(x_validation, y_validation)],
                     eval_metric=eval_metric,
                     callbacks=callbacks,
+                    **fit_kwargs,
                 )
             return estimator
 
         estimator.set_params(early_stopping_rounds=rounds, eval_metric=eval_metric)
-        estimator.fit(x_train, y_train, eval_set=[(x_validation, y_validation)], verbose=False)
+        estimator.fit(
+            x_train, y_train, eval_set=[(x_validation, y_validation)], verbose=False, **fit_kwargs
+        )
         return estimator
+
+    # ------------------------------------------------------------------
+    # Sample weighting
+    # ------------------------------------------------------------------
+    def _recency_weights(self, timestamps: np.ndarray) -> np.ndarray | None:
+        """Exponential time-decay training weights: recent bars vote louder.
+
+        Crypto regimes drift - a candle from a year ago is not as informative
+        about tomorrow as one from yesterday.  Weight halves every
+        ``recency_half_life_days`` days behind the most recent row in the
+        slice being fit.  Returns ``None`` (uniform weighting) when the
+        feature is disabled via config or no timestamps are available, so
+        callers can pass the result straight through as an optional
+        ``sample_weight``.
+        """
+        half_life_days: float = self._config.recency_half_life_days
+        if half_life_days <= 0.0 or timestamps.size == 0:
+            return None
+        age_days: np.ndarray = (
+            timestamps.astype(np.float64).max() - timestamps.astype(np.float64)
+        ) / 86_400_000.0
+        return np.power(0.5, age_days / half_life_days)
+
+    @staticmethod
+    def _timestamps_for(dataset: ProcessedDataset, index: np.ndarray) -> np.ndarray:
+        """Row timestamps aligned to a positional index into ``dataset.features``.
+
+        ``dataset.metadata`` and ``dataset.features`` are built from the same
+        reset-index frame in :meth:`DatasetProcessor._to_dataset`, so a
+        positional index into one is a positional index into the other.
+        """
+        if "timestamp" not in dataset.metadata.columns:
+            return np.array([], dtype=np.float64)
+        return dataset.metadata["timestamp"].to_numpy(dtype=np.float64)[index]
+
+    # ------------------------------------------------------------------
+    # Calibration
+    # ------------------------------------------------------------------
+    def _fit_production_calibrator(
+        self,
+        estimator: Any,
+        calibration_features: pd.DataFrame,
+        calibration_target: pd.Series,
+        *,
+        min_rows: int = 200,
+    ) -> Any | None:
+        """Wrap a fitted estimator with isotonic calibration for live inference.
+
+        ``module_c_ml.metrics.calibrate_classifier`` already measures whether
+        isotonic calibration improves log loss, on a temporal half-split of
+        the validation block held out purely for that honest before/after
+        comparison.  This is the separate, production-facing step: fit the
+        calibrator that will actually be used for inference, on the *entire*
+        validation block (every held-out row available, not half of it),
+        since a shipped artifact should not throw away data the diagnostic
+        report doesn't need.
+
+        Returns ``None`` - never raises - when there is not enough data or
+        the fit fails; the caller then keeps using the raw estimator.
+        Calibration is always a refinement, never a requirement.
+        """
+        if len(calibration_features) < min_rows:
+            return None
+
+        from sklearn.calibration import CalibratedClassifierCV
+
+        try:
+            try:
+                from sklearn.frozen import FrozenEstimator
+
+                calibrated = CalibratedClassifierCV(FrozenEstimator(estimator), method="isotonic")
+            except ImportError:  # pragma: no cover - exercised only on sklearn < 1.6
+                calibrated = CalibratedClassifierCV(estimator, method="isotonic", cv="prefit")
+            calibrated.fit(calibration_features, calibration_target)
+        except Exception as error:  # noqa: BLE001 - calibration is best-effort, never fatal
+            _LOGGER.warning(
+                "%s: production calibration fit failed, using the raw estimator: %s",
+                self.name,
+                error,
+            )
+            return None
+        return calibrated
 
     # ------------------------------------------------------------------
     # Feature alignment
@@ -425,9 +534,12 @@ class BaseModelHead(ABC):
 class DirectionModel(BaseModelHead):
     """Model 1 - multi-class market direction.
 
-    Predicts the probability distribution over the five label classes produced by
-    :class:`~module_b_features.labeler.TradeLabeler`, which the schema then
-    aggregates into LONG / SHORT / NO_TRADE mass.
+    Predicts the probability distribution over the three label classes
+    (``LONG_SUCCESS`` / ``SHORT_SUCCESS`` / ``NO_TRADE_OR_FAIL``) produced by
+    :class:`~module_b_features.labeler.TradeLabeler`.  Risk tiering is
+    deliberately *not* fused into this target - see the labeler module
+    docstring - so the schema's LONG / SHORT / NO_TRADE aggregation is just
+    this model's raw output.
     """
 
     name = "direction_model"
@@ -458,6 +570,7 @@ class DirectionModel(BaseModelHead):
             features.iloc[validation_index],
             encoded.iloc[validation_index].astype(int),
             eval_metric="multi_logloss",
+            sample_weight=self._recency_weights(self._timestamps_for(dataset, train_index)),
         )
 
         self._model = estimator
@@ -469,6 +582,7 @@ class DirectionModel(BaseModelHead):
         importance: dict[str, Any] = {"status": "NOT_AVAILABLE", "reason": "no validation rows"}
         calibration: dict[str, Any] = {"status": "NOT_AVAILABLE", "reason": "no validation rows"}
         per_symbol: dict[str, Any] = {}
+        production_calibration: str = "raw"
         if not validation_features.empty:
             probabilities: np.ndarray = np.asarray(estimator.predict_proba(validation_features))
             full_metrics = ml_metrics.direction_metrics(validation_target, probabilities, LABEL_ORDER)
@@ -482,6 +596,16 @@ class DirectionModel(BaseModelHead):
                 per_symbol = ml_metrics.per_symbol_direction_accuracy(
                     validation_target, probabilities.argmax(axis=1), symbols_validation
                 )
+            # Calibration measurably improves log loss (see `calibration` above);
+            # wire it into the model that will actually serve inference, fit on
+            # every held-out row rather than the half reserved for that report.
+            if calibration.get("status") == "AVAILABLE" and calibration.get("improved"):
+                calibrated_model: Any = self._fit_production_calibrator(
+                    estimator, validation_features, validation_target
+                )
+                if calibrated_model is not None:
+                    self._model = calibrated_model
+                    production_calibration = "isotonic"
 
         self._metadata = {
             "trained_at": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
@@ -494,6 +618,7 @@ class DirectionModel(BaseModelHead):
             "metrics": full_metrics,
             "feature_importance": importance,
             "calibration": calibration,
+            "production_calibration": production_calibration,
             "per_symbol": per_symbol,
         }
         headline: dict[str, Any] = {
@@ -528,6 +653,107 @@ class DirectionModel(BaseModelHead):
 
         return DirectionPrediction(probabilities=probabilities, source=ModelSource.TRAINED)
 
+    def walk_forward(self, dataset: ProcessedDataset, n_folds: int = 4) -> dict[str, Any]:
+        """Expanding-window walk-forward evaluation across multiple rolling folds.
+
+        :meth:`train` fits and scores one production model on a single
+        temporal train/validation split - the ML diagnostic report's own
+        recommendations flag that as the single biggest validation gap ("only
+        a single split is currently performed"), since a lucky split can make
+        a model look better than it generalises.  This fits ``n_folds``
+        independent classifiers, each trained only on data strictly preceding
+        its own validation block (with the same purge gap used in
+        production), and reports per-fold plus aggregate accuracy so a wide
+        spread across folds - not just the headline number - is visible.
+
+        Every fold is a genuinely separate fit (no artifact is mutated or
+        reused): this never touches ``self._model``.
+
+        Returns ``{"status": "NOT_AVAILABLE", "reason": ...}`` when the
+        dataset is too small to carve out ``n_folds`` honest folds, rather
+        than fabricating a result from folds too small to mean anything.
+        """
+        rows: int = len(dataset.features)
+        min_rows_per_fold: int = 200
+        if rows < (n_folds + 1) * min_rows_per_fold:
+            return {
+                "status": "NOT_AVAILABLE",
+                "reason": (
+                    f"only {rows} rows available; walk-forward needs at least "
+                    f"{(n_folds + 1) * min_rows_per_fold} for {n_folds} honest folds"
+                ),
+            }
+
+        class_index: dict[str, int] = {name: index for index, name in enumerate(LABEL_ORDER)}
+        encoded: pd.Series = dataset.direction_target.map(class_index)
+        if encoded.isna().any():
+            return {"status": "NOT_AVAILABLE", "reason": "direction labels contain unknown classes"}
+
+        features: pd.DataFrame = dataset.features
+        purge: int = self._config.purge_bars
+        # n_folds+1 expanding blocks: block 0 is a seed reserved purely for
+        # the first fold's training data (there is nothing before it to
+        # validate against), and each of the remaining n_folds blocks is one
+        # validation fold, trained on everything strictly before it.
+        boundaries: np.ndarray = np.linspace(0, rows, n_folds + 2, dtype=int)
+
+        folds: list[dict[str, Any]] = []
+        for fold_number in range(1, n_folds + 1):
+            val_start, val_end = int(boundaries[fold_number]), int(boundaries[fold_number + 1])
+            train_end: int = max(1, val_start - purge)
+            if train_end < min_rows_per_fold or (val_end - val_start) < min_rows_per_fold // 2:
+                continue
+
+            fold_target: pd.Series = encoded.iloc[:train_end].astype(int)
+            if fold_target.nunique() < 2:
+                continue
+
+            estimator: Any = self._make_classifier(num_class=len(LABEL_ORDER))
+            sample_weight = self._recency_weights(
+                self._timestamps_for(dataset, np.arange(train_end))
+            )
+            fit_kwargs: dict[str, Any] = {} if sample_weight is None else {"sample_weight": sample_weight}
+            estimator.fit(features.iloc[:train_end], fold_target, **fit_kwargs)
+
+            val_features: pd.DataFrame = features.iloc[val_start:val_end]
+            val_target: pd.Series = encoded.iloc[val_start:val_end].astype(int)
+            probabilities: np.ndarray = np.asarray(estimator.predict_proba(val_features))
+            fold_metrics: dict[str, Any] = ml_metrics.direction_metrics(
+                val_target, probabilities, LABEL_ORDER
+            )
+            folds.append(
+                {
+                    "fold": fold_number,
+                    "train_rows": int(train_end),
+                    "validation_rows": int(val_end - val_start),
+                    "accuracy": fold_metrics.get("accuracy"),
+                    "balanced_accuracy": fold_metrics.get("balanced_accuracy"),
+                    "log_loss": fold_metrics.get("log_loss"),
+                    "macro_f1": fold_metrics.get("macro_f1"),
+                }
+            )
+
+        if not folds:
+            return {"status": "NOT_AVAILABLE", "reason": "no fold had enough rows on both sides"}
+
+        accuracies: list[float] = [f["accuracy"] for f in folds if f["accuracy"] is not None]
+        balanced: list[float] = [f["balanced_accuracy"] for f in folds if f["balanced_accuracy"] is not None]
+        return {
+            "status": "AVAILABLE",
+            "method": "expanding_window",
+            "n_folds": len(folds),
+            "folds": folds,
+            "accuracy_mean": float(np.mean(accuracies)) if accuracies else None,
+            "accuracy_std": float(np.std(accuracies)) if accuracies else None,
+            "balanced_accuracy_mean": float(np.mean(balanced)) if balanced else None,
+            "balanced_accuracy_std": float(np.std(balanced)) if balanced else None,
+            "note": (
+                "Each fold fits an independent classifier (not the production "
+                "model) purely to measure how much accuracy varies across "
+                "different time periods."
+            ),
+        }
+
     @staticmethod
     def _heuristic(features: pd.DataFrame) -> DirectionPrediction:
         """Documented fallback: KAMA slope + DI spread, gated by the FDI regime.
@@ -556,10 +782,8 @@ class DirectionModel(BaseModelHead):
 
         return DirectionPrediction(
             probabilities={
-                LabelClass.LONG_SUCCESS_LOW_RISK.value: long_mass * 0.6,
-                LabelClass.LONG_SUCCESS_HIGH_RISK.value: long_mass * 0.4,
-                LabelClass.SHORT_SUCCESS_LOW_RISK.value: short_mass * 0.6,
-                LabelClass.SHORT_SUCCESS_HIGH_RISK.value: short_mass * 0.4,
+                LabelClass.LONG_SUCCESS.value: long_mass,
+                LabelClass.SHORT_SUCCESS.value: short_mass,
                 LabelClass.NO_TRADE_OR_FAIL.value: max(1e-6, 1.0 - long_mass - short_mass),
             },
             source=ModelSource.HEURISTIC,
@@ -598,6 +822,7 @@ class EntryModel(BaseModelHead):
             features.iloc[validation_index],
             target.iloc[validation_index],
             eval_metric="binary_logloss",
+            sample_weight=self._recency_weights(self._timestamps_for(dataset, train_index)),
         )
 
         self._model = estimator
@@ -607,6 +832,7 @@ class EntryModel(BaseModelHead):
         threshold_sweep: list[dict[str, Any]] = []
         importance: dict[str, Any] = {"status": "NOT_AVAILABLE", "reason": "no validation rows"}
         calibration: dict[str, Any] = {"status": "NOT_AVAILABLE", "reason": "no validation rows"}
+        production_calibration: str = "raw"
         cutoff: float = self._settings.decision.min_entry_probability
         if len(validation_index) > 0:
             validation_features: pd.DataFrame = features.iloc[validation_index]
@@ -623,6 +849,13 @@ class EntryModel(BaseModelHead):
             calibration = ml_metrics.calibrate_classifier(
                 estimator, calib_x, calib_y, eval_x, eval_y, n_classes=2
             )
+            if calibration.get("status") == "AVAILABLE" and calibration.get("improved"):
+                calibrated_model: Any = self._fit_production_calibrator(
+                    estimator, validation_features, validation_target
+                )
+                if calibrated_model is not None:
+                    self._model = calibrated_model
+                    production_calibration = "isotonic"
 
         self._metadata = {
             "trained_at": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
@@ -636,6 +869,7 @@ class EntryModel(BaseModelHead):
             "threshold_sweep": threshold_sweep,
             "feature_importance": importance,
             "calibration": calibration,
+            "production_calibration": production_calibration,
         }
         headline: dict[str, Any] = {
             key: full_metrics[key] for key in ("precision", "recall", "roc_auc") if key in full_metrics
@@ -735,6 +969,7 @@ class ExitModel(BaseModelHead):
 
         features: pd.DataFrame = dataset.features[usable].reset_index(drop=True)
         targets: pd.DataFrame = dataset.exit_targets[usable].reset_index(drop=True)
+        metadata_usable: pd.DataFrame = dataset.metadata[usable].reset_index(drop=True)
 
         split_point: int = max(1, int(len(features) * (1.0 - self._config.validation_fraction)))
         train_end: int = max(1, split_point - self._config.purge_bars)
@@ -745,9 +980,15 @@ class ExitModel(BaseModelHead):
 
         validation_features: pd.DataFrame = features.iloc[split_point:]
         baseline: dict[str, np.ndarray] = self._baseline_predictions(validation_features)
+        train_timestamps: np.ndarray = (
+            metadata_usable["timestamp"].to_numpy(dtype=np.float64)[:train_end]
+            if "timestamp" in metadata_usable.columns
+            else np.array([], dtype=np.float64)
+        )
+        sample_weight: np.ndarray | None = self._recency_weights(train_timestamps)
 
         for column in self._TARGETS:
-            estimator: Any = self._make_regressor()
+            estimator: Any = self._make_regressor(robust=True)
             estimator = self._fit_estimator(
                 estimator,
                 features.iloc[:train_end],
@@ -755,6 +996,7 @@ class ExitModel(BaseModelHead):
                 validation_features,
                 targets[column].iloc[split_point:],
                 eval_metric="l1",
+                sample_weight=sample_weight,
             )
             estimators[column] = estimator
             if split_point < len(features):
@@ -931,6 +1173,7 @@ class RiskModel(BaseModelHead):
             features.iloc[validation_index],
             target.iloc[validation_index],
             eval_metric="l2",
+            sample_weight=self._recency_weights(self._timestamps_for(dataset, train_index)),
         )
 
         self._model = estimator
@@ -964,14 +1207,12 @@ class RiskModel(BaseModelHead):
         self,
         features: pd.DataFrame,
         direction_confidence: float,
-        risk_tier: str = "UNKNOWN",
     ) -> RiskAllocation:
         """Size the trade, or abort it.
 
         Args:
             features: One feature row.
             direction_confidence: Winning probability mass from Model 1.
-            risk_tier: Tier implied by the direction model's top class.
 
         Returns:
             A :class:`RiskAllocation`; ``leverage == 0`` means "do not trade".
@@ -986,6 +1227,11 @@ class RiskModel(BaseModelHead):
             aligned: pd.DataFrame = self._align(features)
             score = clamp(float(self._model.predict(aligned)[0]), 0.0, 1.0)
             source = ModelSource.TRAINED
+
+        # The tier is derived from the score itself rather than taken from the
+        # Direction model - see labeler.risk_tier_from_score for why the two
+        # questions ("which way" and "how clean is the path") are kept apart.
+        risk_tier: str = risk_tier_from_score(score, self._settings.labels)
 
         decision = self._settings.decision
         risk = self._settings.risk
@@ -1166,7 +1412,6 @@ class MLSubsystem:
         risk: RiskAllocation = self.risk.predict(
             features,
             direction_confidence=direction.confidence,
-            risk_tier=direction.implied_risk_tier,
         )
 
         return ModelInferenceResult(
