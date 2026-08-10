@@ -75,6 +75,29 @@ _CHUNK_ROWS: Final[int] = 20_000
 #: training target is never wider than what a trade could ever actually use -
 #: without this, rare extreme-excursion candles blow up the regressor's loss
 #: and its predictions on ordinary rows along with it.
+#:
+#: Investigated (task 7b) but deliberately left unchanged: a production
+#: diagnostic report showed the SL target's median sitting exactly at
+#: _MIN_SL_PCT, and a synthetic-data check here confirmed it - for typical
+#: liquid-5m ATR (~0.2% of price) and sl_atr_multiple=1.0, the ATR-scaled
+#: floor_sl computed just above this constant (0.5 * sl_dist) already lands
+#: below 0.0015 for a large share of rows (any trade whose actual heat was
+#: small - e.g. a clean winner - naturally wants a much tighter stop), so
+#: this absolute floor - not the ATR-relative one - is what actually binds
+#: and collapses their true, smaller optimal_sl values into one constant,
+#: destroying the variance the regressor needs (matches the reported
+#: r^2 ~= 0.065, far below TP/trailing's ~0.31).
+#:
+#: Lowering _MIN_SL_PCT was considered and rejected without real data: at
+#: ExecutionSettings defaults (taker_fee=0.05%, slippage_bps=0.05%), a round
+#: trip already costs ~0.2% in fees + slippage alone - *above* the current
+#: 0.15% floor. A stop any tighter would be economically closer to (or
+#: past) a guaranteed net loss purely from trading costs, independent of
+#: whether the price move itself was adverse. Trading a statistically
+#: stronger-looking label for an economically unsound live stop-loss is not
+#: a confident net-positive change on synthetic data alone - left as-is
+#: pending a real retrain + backtest the operator can actually validate
+#: against live fee/slippage reality.
 _MIN_TP_PCT: Final[float] = 0.0020
 _MAX_TP_PCT: Final[float] = 0.1500
 _MIN_SL_PCT: Final[float] = 0.0015
