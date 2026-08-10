@@ -1451,20 +1451,37 @@ class EntryModel(BaseModelHead):
 
         Three additive components, each in ``[-0.15, +0.15]``:
 
-        * order-book imbalance pointing the same way as the intended trade,
+        * taker buy/sell flow pointing the same way as the intended trade,
         * a trending (low-FDI) structure rather than chop,
-        * a spread that is not in the top decile of its own history.
+        * a volatility percentile that is not in the top decile of its own
+          history (a proxy for "conditions are not adverse/wide").
+
+        Substitution note: ``ob_imbalance`` and ``ob_spread_rank`` were
+        removed from ``FEATURE_COLUMNS`` entirely (Binance has no historical
+        order-book depth endpoint, so those columns could never be
+        backfilled for training - see the commit that removed them). This
+        fallback - only ever exercised when no trained booster is loaded -
+        is redesigned around two features that still exist:
+        ``taker_buy_sell_ratio`` (a log taker buy/sell volume ratio - a
+        genuine, if Binance-retention-limited, order-flow-alignment proxy)
+        replaces the order-book imbalance term, and ``atr_rank`` (realized
+        volatility percentile) replaces the spread-rank term as the closest
+        available proxy for "conditions are not adverse" absent any real
+        spread metric. Neither substitute is a measured equivalent of the
+        original - they are directionally reasonable stand-ins for a
+        heuristic that is itself only a documented fallback, not the
+        trained model's decision path.
         """
         row: pd.Series = features.iloc[0]
-        imbalance: float = float(row.get("ob_imbalance", 0.0) or 0.0)
+        order_flow: float = clamp(float(row.get("taker_buy_sell_ratio", 0.0) or 0.0), -1.0, 1.0)
         trending: float = float(row.get("fdi_trending", 0.0) or 0.0)
-        spread_rank: float = float(row.get("ob_spread_rank", 0.5) or 0.5)
+        volatility_rank: float = float(row.get("atr_rank", 0.5) or 0.5)
 
-        directional_flow: float = imbalance if action is TradeAction.LONG else -imbalance
+        directional_flow: float = order_flow if action is TradeAction.LONG else -order_flow
         score: float = 0.5
         score += clamp(directional_flow, -1.0, 1.0) * 0.15
         score += (trending - 0.5) * 0.20
-        score -= clamp(spread_rank - 0.5, -0.5, 0.5) * 0.20
+        score -= clamp(volatility_rank - 0.5, -0.5, 0.5) * 0.20
 
         probability: float = clamp(score, 0.0, 1.0)
         return EntryPrediction(

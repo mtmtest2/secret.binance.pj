@@ -184,12 +184,13 @@ class DataPipeline:
         work around) - see :meth:`module_a_data.fetcher.BinanceDataFetcher.
         fetch_open_interest_history` and friends for the per-source detail.
 
-        Order-book depth (``ob_imbalance``, ``ob_spread_bps``) and liquidation
-        flow (``liquidation_imbalance``) have no historical endpoint on
-        Binance at all - a snapshot is only ever "now". Those can only
-        accumulate real data from here forward via :meth:`run_cycle`, which
-        already persists a genuine snapshot every cycle; there is nothing to
-        backfill for them.
+        Order-book depth (``ob_imbalance``, ``ob_imbalance_delta``,
+        ``ob_spread_bps``, ``ob_spread_rank``) and liquidation flow
+        (``liquidation_imbalance``) had no historical endpoint on Binance at
+        all - a snapshot was only ever "now", with nothing to backfill - and
+        were therefore removed from ``FEATURE_COLUMNS`` entirely rather than
+        left permanently unpopulated. This method backfills only the four
+        features named above, which do have a real Binance history endpoint.
         """
         universe: list[str] = symbols if symbols is not None else list(self._settings.data.symbols)
         timeframe_ms: int = self._settings.data.timeframe_ms

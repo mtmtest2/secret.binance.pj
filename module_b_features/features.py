@@ -135,11 +135,16 @@ FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     "volume_rank",
     "volume_trend",
     "dollar_volume_rank",
-    # --- micro-structure ----------------------------------------------------
-    "ob_imbalance",
-    "ob_imbalance_delta",
-    "ob_spread_bps",
-    "ob_spread_rank",
+    # --- micro-structure / derivatives ---------------------------------------
+    # Order-book depth (ob_imbalance/ob_imbalance_delta/ob_spread_bps/
+    # ob_spread_rank) and liquidation flow (liquidation_imbalance) were removed
+    # entirely: Binance exposes no historical endpoint for either, ever - only
+    # a live snapshot going forward - so these five columns could never be
+    # backfilled and sat at their neutral default for nearly every training
+    # row. The seven below all have a real, working Binance history endpoint
+    # (funding_rate: full history; the rest: Binance-side ~30-day retention,
+    # so still sparse over a long training window, but genuinely real data
+    # where it exists) - see module_a_data/pipeline.py::backfill_futures_metrics.
     "funding_rate",
     "funding_rate_delta",
     "funding_rate_rank",
@@ -147,7 +152,6 @@ FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     "open_interest_rank",
     "long_short_ratio",
     "taker_buy_sell_ratio",
-    "liquidation_imbalance",
     # --- session ------------------------------------------------------------
     "hour_sin",
     "hour_cos",
@@ -198,8 +202,11 @@ class FeatureEngineer:
                 :meth:`DatabaseHandler.load_ohlcv_dataframe`).
             futures: Optional funding / open-interest / positioning history with
                 a ``timestamp`` column.  Joined backward-asof.
-            order_book: Optional order-book snapshot history with a ``timestamp``
-                column.  Joined backward-asof.
+            order_book: Accepted for backward compatibility but no longer
+                consumed - the order-book depth features it fed (ob_imbalance,
+                ob_imbalance_delta, ob_spread_bps, ob_spread_rank) were removed
+                from FEATURE_COLUMNS; Binance has no historical order-book
+                depth endpoint, so they could never be backfilled for training.
 
         Returns:
             The input frame plus every column in :data:`FEATURE_COLUMNS`.  Rows
@@ -845,28 +852,31 @@ class FeatureEngineer:
         futures: pd.DataFrame | None,
         order_book: pd.DataFrame | None,
     ) -> pd.DataFrame:
-        """Join order-book and futures snapshots backward-asof onto the candles.
+        """Join futures snapshots backward-asof onto the candles.
 
         ``direction="backward"`` is what enforces causality here: a candle can
         only be matched with a snapshot whose timestamp is ``<=`` its own open
-        time.  Missing feeds degrade to neutral constants (zero imbalance, zero
-        funding), never to forward-filled future values.
+        time.  Missing feeds degrade to neutral constants (zero funding, etc.),
+        never to forward-filled future values.
+
+        ``order_book`` is accepted but intentionally unused: the order-book
+        depth features it used to feed (``ob_imbalance``, ``ob_imbalance_delta``,
+        ``ob_spread_bps``, ``ob_spread_rank``) were removed from
+        ``FEATURE_COLUMNS`` - Binance exposes no historical order-book depth
+        endpoint at all, only a live snapshot going forward, so those columns
+        could never be backfilled and sat at their neutral default for nearly
+        every training row. The parameter is kept (rather than removed) purely
+        so this method's signature and every call site do not have to change
+        for a feature-side-only removal; Module A's own order-book snapshot
+        fetch/validate/persist pipeline (``module_a_data.pipeline``,
+        ``qc_validator.validate_order_book``) is untouched and keeps collecting
+        it for its own QC/audit purposes, independent of the ML feature set.
         """
         config: FeatureSettings = self._config
         frame = frame.copy()
         frame["timestamp"] = frame["timestamp"].astype("int64")
 
-        merged: pd.DataFrame = self._asof_join(frame, order_book, "book")
-        merged = self._asof_join(merged, futures, "futures")
-
-        imbalance: pd.Series = merged.get("imbalance", pd.Series(0.0, index=merged.index))
-        spread_bps: pd.Series = merged.get("spread_bps", pd.Series(0.0, index=merged.index))
-        merged["ob_imbalance"] = imbalance.astype(float).fillna(0.0).clip(-1.0, 1.0)
-        merged["ob_imbalance_delta"] = merged["ob_imbalance"].diff(3).fillna(0.0)
-        merged["ob_spread_bps"] = spread_bps.astype(float).fillna(0.0).clip(lower=0.0)
-        merged["ob_spread_rank"] = ind.rolling_percentile_rank(
-            merged["ob_spread_bps"], config.rank_window
-        ).fillna(0.5)
+        merged: pd.DataFrame = self._asof_join(frame, futures, "futures")
 
         funding: pd.Series = (
             merged.get("funding_rate", pd.Series(0.0, index=merged.index)).astype(float).fillna(0.0)
@@ -900,18 +910,9 @@ class FeatureEngineer:
         )
         merged["taker_buy_sell_ratio"] = np.log(taker.clip(lower=0.01))
 
-        liq_buy: pd.Series = (
-            merged.get("liquidation_buy_volume", pd.Series(0.0, index=merged.index))
-            .astype(float)
-            .fillna(0.0)
-        )
-        liq_sell: pd.Series = (
-            merged.get("liquidation_sell_volume", pd.Series(0.0, index=merged.index))
-            .astype(float)
-            .fillna(0.0)
-        )
-        liq_total: pd.Series = (liq_buy + liq_sell).replace(0.0, np.nan)
-        merged["liquidation_imbalance"] = ((liq_buy - liq_sell) / liq_total).fillna(0.0)
+        # liquidation_imbalance removed entirely - Binance has no historical
+        # liquidation-flow endpoint, only a live-forward feed, so it could
+        # never be backfilled for training (see FEATURE_COLUMNS comment above).
 
         merged.index = frame.index
         return merged

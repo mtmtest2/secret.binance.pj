@@ -347,8 +347,6 @@ class DatasetProcessor:
             "atr_pct",
             "adx",
             "rsi",
-            "ob_imbalance",
-            "ob_spread_bps",
             "funding_rate",
             "volume_zscore",
             "close",

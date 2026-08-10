@@ -95,10 +95,11 @@ FEATURE_GROUPS: Final[dict[str, str]] = {
     "volume_rank": "Volume",
     "volume_trend": "Volume",
     "dollar_volume_rank": "Volume",
-    "ob_imbalance": "Microstructure",
-    "ob_imbalance_delta": "Microstructure",
-    "ob_spread_bps": "Microstructure",
-    "ob_spread_rank": "Microstructure",
+    # Microstructure category removed entirely - ob_imbalance,
+    # ob_imbalance_delta, ob_spread_bps, ob_spread_rank and liquidation_imbalance
+    # (Derivatives) no longer exist as features: Binance has no historical
+    # endpoint for order-book depth or liquidation flow, only a live snapshot
+    # going forward, so they could never be backfilled for training.
     "funding_rate": "Derivatives",
     "funding_rate_delta": "Derivatives",
     "funding_rate_rank": "Derivatives",
@@ -106,7 +107,6 @@ FEATURE_GROUPS: Final[dict[str, str]] = {
     "open_interest_rank": "Derivatives",
     "long_short_ratio": "Derivatives",
     "taker_buy_sell_ratio": "Derivatives",
-    "liquidation_imbalance": "Derivatives",
     "hour_sin": "Time/Seasonality",
     "hour_cos": "Time/Seasonality",
     "dow_sin": "Time/Seasonality",
@@ -271,14 +271,18 @@ async def _qc_telemetry(database: DatabaseHandler) -> dict[str, Any]:
 #: parked at this value for nearly every row is a strong signal that source
 #: is not actually being collected for this run, not that the market was
 #: genuinely neutral on every single bar.
+#: ob_imbalance, ob_spread_bps and liquidation_imbalance removed - they no
+#: longer exist as features (see FEATURE_COLUMNS). funding_rate,
+#: open_interest_change, long_short_ratio and taker_buy_sell_ratio remain:
+#: all four have a real, working Binance history endpoint - funding_rate
+#: full-history, the other three Binance-side ~30-day-retention-limited but
+#: genuinely real where present - so it is still meaningful to measure what
+#: fraction of rows carry live data versus this neutral default.
 _NEUTRAL_MICROSTRUCTURE_DEFAULTS: Final[dict[str, float]] = {
-    "ob_imbalance": 0.0,
-    "ob_spread_bps": 0.0,
     "funding_rate": 0.0,
     "open_interest_change": 0.0,
     "long_short_ratio": 0.0,  # log(1.0)
     "taker_buy_sell_ratio": 0.0,  # log(1.0)
-    "liquidation_imbalance": 0.0,
 }
 
 
