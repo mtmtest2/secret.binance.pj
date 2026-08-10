@@ -1386,15 +1386,47 @@ class RiskModel(BaseModelHead):
     name = "risk_model"
 
     def train(self, dataset: ProcessedDataset) -> dict[str, Any]:
-        """Fit the opportunity-score regressor."""
+        """Fit the opportunity-score regressor.
+
+        Trained only on rows where a directional trade was actually selected
+        (``direction_target != NO_TRADE_OR_FAIL``) - the same restriction
+        :class:`ExitModel` already applies to its own targets, and for the
+        same underlying reason. ``target_risk_score`` is deterministically
+        ``0.0`` for every ``NO_TRADE_OR_FAIL`` row (see
+        ``module_b_features.labeler.TradeLabeler._attach_model_targets``),
+        which is roughly 46% of the pooled dataset in a typical run. Training
+        on the full, unfiltered population forced this regressor to also
+        re-learn Direction's own hard "will either side ever reach
+        take-profit" question on the same 55 features Direction itself only
+        solves at barely-above-random balanced accuracy - diluting the signal
+        this head actually needs (how clean is the path of a trade
+        Direction/Entry have *already* approved, which is the only question
+        :meth:`predict` is ever asked at inference time) and measuring R^2
+        against an out-of-distribution population it will never see live.
+        This was the single largest driver of this head's R^2 sitting far
+        below Exit's, despite identical hyperparameters and features.
+        """
         if dataset.is_empty:
             raise ModelTrainingError("risk model received an empty dataset")
 
-        target: pd.Series = dataset.risk_target.astype(float)
-        train_index, validation_index = dataset.train_validation_split(
-            self._config.validation_fraction, self._config.purge_bars
+        usable: pd.Series = dataset.direction_target != LabelClass.NO_TRADE_OR_FAIL.value
+        if int(usable.sum()) < 100:
+            raise ModelTrainingError(
+                "not enough directional rows to fit the risk model", rows=int(usable.sum())
+            )
+
+        features: pd.DataFrame = dataset.features[usable].reset_index(drop=True)
+        target: pd.Series = dataset.risk_target[usable].astype(float).reset_index(drop=True)
+        metadata_usable: pd.DataFrame = dataset.metadata[usable].reset_index(drop=True)
+
+        split_point: int = max(1, int(len(features) * (1.0 - self._config.validation_fraction)))
+        train_end: int = max(1, split_point - self._config.purge_bars)
+        validation_features: pd.DataFrame = features.iloc[split_point:]
+        train_timestamps: np.ndarray = (
+            metadata_usable["timestamp"].to_numpy(dtype=np.float64)[:train_end]
+            if "timestamp" in metadata_usable.columns
+            else np.array([], dtype=np.float64)
         )
-        features: pd.DataFrame = dataset.features
 
         # target_risk_score is right-skewed (mean 0.29, median 0.20 in the
         # first production run) the same way the exit-geometry percentages
@@ -1404,12 +1436,12 @@ class RiskModel(BaseModelHead):
         estimator: Any = self._make_regressor(robust=True)
         estimator = self._fit_estimator(
             estimator,
-            features.iloc[train_index],
-            target.iloc[train_index],
-            features.iloc[validation_index],
-            target.iloc[validation_index],
+            features.iloc[:train_end],
+            target.iloc[:train_end],
+            validation_features,
+            target.iloc[split_point:],
             eval_metric="l1",
-            sample_weight=self._recency_weights(self._timestamps_for(dataset, train_index)),
+            sample_weight=self._recency_weights(train_timestamps),
         )
 
         self._model = estimator
@@ -1417,21 +1449,24 @@ class RiskModel(BaseModelHead):
 
         full_metrics: dict[str, Any] = {}
         importance: dict[str, Any] = {"status": "NOT_AVAILABLE", "reason": "no validation rows"}
-        if len(validation_index) > 0:
-            predictions: np.ndarray = estimator.predict(features.iloc[validation_index])
+        if len(validation_features) > 0:
+            predictions: np.ndarray = estimator.predict(validation_features)
             full_metrics = ml_metrics.regression_metrics(
-                target.iloc[validation_index].to_numpy(), predictions
+                target.iloc[split_point:].to_numpy(), predictions
             )
             importance = ml_metrics.feature_importance(estimator, dataset.feature_columns)
 
         self._metadata = {
             "trained_at": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
             "git_commit": git_commit_hash(),
-            "rows": int(len(train_index)),
-            "validation_rows": int(len(validation_index)),
+            "rows": int(train_end),
+            "validation_rows": int(len(features) - split_point),
             "hyperparameters": _hyperparameter_snapshot(self._config),
             "metrics": full_metrics,
             "feature_importance": importance,
+            "training_row_filter": (
+                "direction_target != NO_TRADE_OR_FAIL - see RiskModel.train docstring"
+            ),
         }
         headline: dict[str, Any] = {
             key: full_metrics[key] for key in ("mae", "r2") if key in full_metrics

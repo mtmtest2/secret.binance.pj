@@ -104,6 +104,57 @@ def test_risk_model_uses_robust_l1_objective() -> None:
     assert model._model.get_params()["objective"] == "regression_l1"
 
 
+def test_risk_model_trains_only_on_selected_trade_rows() -> None:
+    """target_risk_score is deterministically 0.0 for every NO_TRADE_OR_FAIL
+    row (module_b_features.labeler._attach_model_targets); training on those
+    too forces the regressor to re-learn Direction's own hard "will any side
+    win" question instead of the path-quality question it is actually asked
+    at inference. RiskModel.train must filter them out the same way
+    ExitModel already does for its own targets.
+    """
+    rng = np.random.default_rng(7)
+    n = 600
+    dataset = _dataset_with_risk_target(rng, n=n)
+    no_trade_rows = int((dataset.direction_target == "NO_TRADE_OR_FAIL").sum())
+    assert 0 < no_trade_rows < n  # the synthetic fixture actually contains both
+
+    model = RiskModel(Settings(ml={"n_estimators": 15, "early_stopping_rounds": 5}))
+    model.train(dataset)
+
+    selected_rows = n - no_trade_rows
+    assert model.metadata["rows"] + model.metadata["validation_rows"] <= selected_rows
+    assert model.metadata["training_row_filter"]
+
+
+def test_risk_model_predict_clips_out_of_range_raw_predictions() -> None:
+    """The regression target is bounded to [0, 1]; a raw LightGBM prediction
+    can legitimately fall outside that (extrapolation past the training
+    range), as it did in production (prediction_stats min=-0.15, max=1.26).
+    `RiskModel.predict` must clamp before that value can reach position
+    sizing downstream.
+    """
+    settings = Settings()
+    model = RiskModel(settings)
+    model._feature_columns = tuple(FEATURE_COLUMNS)
+    features = pd.DataFrame([{column: 0.0 for column in FEATURE_COLUMNS}])
+    features["garch_vol_rank"] = 0.2
+
+    class _FakeEstimator:
+        def __init__(self, value: float) -> None:
+            self._value = value
+
+        def predict(self, x: pd.DataFrame) -> np.ndarray:
+            return np.array([self._value])
+
+    model._model = _FakeEstimator(1.5)
+    allocation_high = model.predict(features, direction_confidence=0.85)
+    assert 0.0 <= allocation_high.risk_score <= 1.0
+
+    model._model = _FakeEstimator(-0.3)
+    allocation_low = model.predict(features, direction_confidence=0.85)
+    assert 0.0 <= allocation_low.risk_score <= 1.0
+
+
 def test_direction_model_is_a_two_stage_cascade() -> None:
     settings = Settings(ml={"n_estimators": 15, "early_stopping_rounds": 5})
     dataset = _dataset_with_risk_target(np.random.default_rng(6))
