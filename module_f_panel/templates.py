@@ -161,7 +161,12 @@ _DASHBOARD_CONTENT: Final[
 </section>
 
 <section class="card">
-  <div class="font-bold mb-2">LIVE LOG</div>
+  <div class="flex items-center justify-between flex-wrap gap-3 mb-2">
+    <div class="font-bold">LIVE LOG</div>
+    <a href="/api/logs/download"
+       class="bg-slate-700 hover:bg-slate-600 rounded px-3 py-1 text-xs font-bold">
+      DOWNLOAD LOG FILE(S)</a>
+  </div>
   <pre id="logs" class="text-[11px] leading-relaxed muted whitespace-pre-wrap max-h-80 overflow-y-auto"></pre>
 </section>
 """
@@ -636,6 +641,12 @@ _ML_REPORT_CONTENT: Final[
       <a href="/api/ml/diagnostics/export.md"
          class="bg-slate-700 hover:bg-slate-600 rounded px-3 py-1 text-xs font-bold">
         DOWNLOAD HUMAN-READABLE REPORT (MD)</a>
+      <a href="/api/backtest/trades.csv?variant=strict"
+         class="bg-slate-700 hover:bg-slate-600 rounded px-3 py-1 text-xs font-bold">
+        DOWNLOAD BACKTEST TRADES (CSV)</a>
+      <a href="/api/backtest/trades.csv?variant=relaxed"
+         class="bg-slate-700 hover:bg-slate-600 rounded px-3 py-1 text-xs font-bold">
+        DOWNLOAD RELAXED BACKTEST TRADES (CSV)</a>
     </div>
   </div>
   <div id="ml-run-overview" class="muted text-xs mb-2"></div>
