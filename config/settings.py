@@ -104,7 +104,11 @@ class DataSettings(BaseModel):
     timeframe_ms: int = Field(default=5 * 60 * 1_000)
 
     ohlcv_limit: int = Field(default=1_500, ge=50, le=1_500)
-    history_bootstrap_candles: int = Field(default=105_120, ge=500)
+    #: ~1.5 years of 5-minute bars (1.5 * 365 * 24 * 12 = 157_680). Widened from
+    #: the prior ~1-year default (105_120) so training has more history to work
+    #: with, per the diagnostic report's recommendation to grow the backtest's
+    #: sample size (see also ``_DIAGNOSTIC_BACKTEST_BARS`` in ``main.py``).
+    history_bootstrap_candles: int = Field(default=157_680, ge=500)
     orderbook_depth: int = Field(default=20, ge=5, le=100)
     orderbook_levels_for_imbalance: int = Field(default=10, ge=1, le=100)
 
@@ -134,6 +138,15 @@ class UniverseSettings(BaseModel):
     #: Bid/ask spread ceiling in basis points, measured at discovery time.
     max_spread_bps: float = Field(default=6.0, gt=0.0)
     #: Days since listing.  Below this there is not enough 5m history to train.
+    #: Deliberately left at 365 rather than raised to 547 (1.5x, matching
+    #: ``DataSettings.history_bootstrap_candles``): several symbols already in
+    #: ``DEFAULT_SYMBOLS`` (e.g. APT, ARB, OP, SUI, SEI, TIA) listed well under
+    #: 1.5 years ago, so requiring 547 days would shrink the tradeable universe
+    #: for the sake of uniform series length. Per-symbol walk-forward splits
+    #: already tolerate ragged history lengths - a newer symbol simply
+    #: contributes a shorter, still-valid training/validation series rather
+    #: than being padded or excluded. Revisit if the universe should instead
+    #: favour fewer, longer-lived symbols.
     min_history_days: int = Field(default=365, ge=1)
 
     #: Account size the small-capital screens are calibrated against.
@@ -271,6 +284,21 @@ class MLSettings(BaseModel):
     recency_half_life_days: float = Field(default=45.0, ge=0.0)
 
     inference_workers: int = Field(default=2, ge=1, le=16)
+
+    #: Target replay length (bars, summed across the whole dataset - matching
+    #: how ``validation_fraction`` is measured - then divided evenly per
+    #: symbol) for the diagnostic backtest run after every training cycle -
+    #: see ``TradingSystem._run_validation_backtest``. Deliberately a new,
+    #: separately-named field rather than reusing ``validation_fraction`` or
+    #: ``history_bootstrap_candles``: the operator wants the diagnostic
+    #: backtest itself to span a full year (365 * 24 * 12 = 105_120 5m bars)
+    #: regardless of how large ``validation_fraction``'s own OOS tail is.
+    #: Only the portion of this window that falls inside the model's actual
+    #: validation split is genuinely out-of-sample; the rest overlaps rows the
+    #: model trained on - see the docstring on ``_run_validation_backtest``
+    #: and the report's ``backtest.oos_disclosure`` section for the exact
+    #: split every run measures.
+    diagnostic_backtest_bars: int = Field(default=105_120, ge=100)
 
     #: Experimental. Swaps the gate stage's (Direction model, stage 1) LightGBM
     #: objective for a focal-loss custom objective that down-weights the easy,
