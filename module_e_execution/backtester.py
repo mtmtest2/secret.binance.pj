@@ -67,6 +67,10 @@ class BacktestReport:
     symbols: tuple[str, ...] = field(default=())
     signals_generated: int = 0
     signals_rejected: int = 0
+    #: Count of rejected signals per Decision Engine rule (``Rule.*`` id ->
+    #: count), so "why were 99.9% of signals rejected" has a real, measured
+    #: answer instead of a guess - see ``module_c_ml.decision_engine.Rule``.
+    rejection_breakdown: dict[str, int] = field(default_factory=dict)
 
     def summary(self) -> str:
         """Multi-line, human-readable report for logs and the CLI."""
@@ -93,8 +97,15 @@ class BacktestReport:
             f"Funding paid      : {self.metrics.get('total_funding', 0.0):,.4f} USDT",
             f"Liquidations      : {int(self.metrics.get('liquidations', 0))}",
             f"Signals (gen/rej) : {self.signals_generated} / {self.signals_rejected}",
-            "=" * 66,
         ]
+        if self.rejection_breakdown:
+            lines.append("Rejected by rule  :")
+            for rule, count in sorted(
+                self.rejection_breakdown.items(), key=lambda item: item[1], reverse=True
+            ):
+                pct: float = count / self.signals_rejected if self.signals_rejected else 0.0
+                lines.append(f"  {rule:32s} {count:8d} ({pct:.1%})")
+        lines.append("=" * 66)
         return "\n".join(lines)
 
     def to_dict(self) -> dict[str, Any]:
@@ -108,6 +119,7 @@ class BacktestReport:
             "metrics": self.metrics,
             "signals_generated": self.signals_generated,
             "signals_rejected": self.signals_rejected,
+            "rejection_breakdown": self.rejection_breakdown,
             "trades": self.trades[-500:],
             "equity_curve": self.equity_curve[-2_000:],
         }
@@ -236,6 +248,7 @@ class Backtester:
         curve: list[dict[str, float]] = []
         generated: int = 0
         rejected: int = 0
+        rejection_breakdown: dict[str, int] = {}
 
         for timestamp in timeline:
             # --- 1. Resolve barriers on open positions with THIS bar ----------
@@ -292,6 +305,9 @@ class Backtester:
                     pending.append(decision.signal)
                 else:
                     rejected += 1
+                    rejection_breakdown[decision.rule_triggered] = (
+                        rejection_breakdown.get(decision.rule_triggered, 0) + 1
+                    )
 
             # --- 4. Mark to market -------------------------------------------
             equity = balance + self._unrealized(positions, indexed, timestamp)
@@ -331,6 +347,7 @@ class Backtester:
             symbols=tuple(featured),
             signals_generated=generated,
             signals_rejected=rejected,
+            rejection_breakdown=rejection_breakdown,
         )
         report.metrics = self._compute_metrics(report)
         return report

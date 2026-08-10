@@ -43,6 +43,15 @@ NOT_AVAILABLE: Final[str] = "NOT_AVAILABLE"
 LATEST_REPORT_STATE_KEY: Final[str] = "ml_diagnostic_latest_report"
 REPORTS_DIR_NAME: Final[str] = "reports"
 
+#: Below this trade count, ratio-based backtest metrics (win rate, profit
+#: factor, Sharpe/Sortino/Calmar, expectancy) are dominated by sampling noise
+#: rather than measuring anything about the strategy - a handful of trades can
+#: swing "profit factor" between 0 and infinity. 30 is a conventional rule-of-
+#: thumb floor for trusting a win-rate/ratio estimate at all, not a rigorous
+#: statistical bound; it exists so a report never presents an n=3 result as if
+#: it were a reliable performance read.
+_MIN_RELIABLE_BACKTEST_TRADES: Final[int] = 30
+
 #: Feature -> group, matching the feature inventory
 #: (module_b_features/features.py::FEATURE_COLUMNS). Kept here rather than in
 #: the feature module itself since grouping is purely a reporting concern.
@@ -301,6 +310,34 @@ def _microstructure_coverage(dataset: ProcessedDataset) -> dict[str, Any]:
     return {"status": "AVAILABLE", "features": coverage}
 
 
+def _backtest_reliability(backtest: dict[str, Any] | None) -> dict[str, Any]:
+    """Flag whether a backtest's trade count is large enough to trust its
+    ratio-based metrics (win rate, profit factor, expectancy, Sharpe, Sortino,
+    Calmar) at all - see :data:`_MIN_RELIABLE_BACKTEST_TRADES`.
+
+    A backtest that rejects nearly every candidate signal (a very selective
+    decision cascade, a short validation window, or both) can produce a
+    headline profit factor of 20+ from two winning trades; without this check
+    that reads identically to a genuinely robust result.
+    """
+    if not backtest or backtest.get("status") == NOT_AVAILABLE:
+        return {"status": NOT_AVAILABLE}
+    total_trades = backtest.get("metrics", {}).get("total_trades")
+    if not isinstance(total_trades, (int, float)):
+        return {"status": NOT_AVAILABLE}
+    total_trades = int(total_trades)
+    reliable: bool = total_trades >= _MIN_RELIABLE_BACKTEST_TRADES
+    return {
+        "status": "AVAILABLE",
+        "total_trades": total_trades,
+        "minimum_trades_for_reliability": _MIN_RELIABLE_BACKTEST_TRADES,
+        "statistically_reliable": reliable,
+        "signals_generated": backtest.get("signals_generated"),
+        "signals_rejected": backtest.get("signals_rejected"),
+        "rejection_breakdown": backtest.get("rejection_breakdown", {}),
+    }
+
+
 async def _cycle_timings(database: DatabaseHandler) -> dict[str, Any]:
     """Real, persisted per-stage cycle timing history - see main.TradingSystem."""
     stored: dict[str, Any] | None = await database.get_state("cycle_timings_history")
@@ -370,6 +407,17 @@ def _ai_summary(report: dict[str, Any], comparison: list[dict[str, Any]]) -> dic
     if isinstance(dq.get("symbol_exclusions_total"), int) and dq["symbol_exclusions_total"] > 0:
         warnings.append(f"{dq['symbol_exclusions_total']} symbol-cycle exclusion(s) recorded")
 
+    reliability: dict[str, Any] = report.get("backtest_reliability", {})
+    backtest_unreliable: bool = (
+        reliability.get("status") == "AVAILABLE" and not reliability.get("statistically_reliable", True)
+    )
+    if backtest_unreliable:
+        warnings.append(
+            f"backtest ran only {reliability.get('total_trades')} trade(s) - below the "
+            f"{reliability.get('minimum_trades_for_reliability')}-trade floor for trusting "
+            "win rate/profit factor/Sharpe as a performance estimate"
+        )
+
     direction_metrics: dict[str, Any] = heads["direction"].get("metrics", {}) or {}
     entry_metrics: dict[str, Any] = heads["entry"].get("metrics", {}) or {}
     scored: dict[str, float] = {}
@@ -416,8 +464,17 @@ def _ai_summary(report: dict[str, Any], comparison: list[dict[str, Any]]) -> dic
         "biggest_ml_problem": f"{weakest} is the weakest scored component" if scored else NOT_AVAILABLE,
         "biggest_validation_problem": _walk_forward_problem_summary(report.get("walk_forward", {})),
         "biggest_trading_problem": (
-            "backtest not available for this run" if report.get("backtest", {}).get("status") == NOT_AVAILABLE
-            else NOT_AVAILABLE
+            "backtest not available for this run"
+            if report.get("backtest", {}).get("status") == NOT_AVAILABLE
+            else (
+                f"backtest metrics are not statistically reliable: only "
+                f"{reliability.get('total_trades')} trade(s) generated from "
+                f"{reliability.get('signals_generated')} candidate signal(s) "
+                f"({reliability.get('signals_rejected')} rejected) - treat win rate/profit "
+                "factor/Sharpe as noise, not a performance estimate"
+                if backtest_unreliable
+                else NOT_AVAILABLE
+            )
         ),
         "most_important_metric_improvement": improvements[0] if improvements else NOT_AVAILABLE,
         "most_important_metric_degradation": regressions[0] if regressions else NOT_AVAILABLE,
@@ -471,6 +528,7 @@ async def build_report(
     dataset: ProcessedDataset,
     run_id: str,
     backtest: Any | None = None,
+    relaxed_backtest: Any | None = None,
     warnings: list[str] | None = None,
     errors: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -544,6 +602,23 @@ async def build_report(
             else {"status": NOT_AVAILABLE, "reason": "direction model is not trained"}
         ),
         "backtest": backtest.to_dict() if backtest is not None else {"status": NOT_AVAILABLE},
+        "backtest_reliability": _backtest_reliability(
+            backtest.to_dict() if backtest is not None else None
+        ),
+        "backtest_diagnostic_relaxed": (
+            {
+                "disclaimer": (
+                    "Same out-of-sample window as `backtest`, replayed with the Decision "
+                    "Engine's confidence/probability/reward-risk thresholds loosened "
+                    "(see main._RELAXED_DECISION_SETTINGS) to gather a larger trade count. "
+                    "Diagnostic only - never reflects live-configured thresholds and must "
+                    "not be read as a performance estimate."
+                ),
+                **relaxed_backtest.to_dict(),
+            }
+            if relaxed_backtest is not None
+            else {"status": NOT_AVAILABLE}
+        ),
         "regimes": {
             "status": NOT_AVAILABLE,
             "reason": "per-regime performance breakdown is not computed by this run",
@@ -614,6 +689,40 @@ def _recommendations(report: dict[str, Any], comparison: list[dict[str, Any]]) -
         high.append("Add walk-forward evaluation across multiple rolling folds before trusting a single split")
     if report.get("backtest", {}).get("status") == NOT_AVAILABLE:
         high.append("Run a backtest for this artifact set before considering it for paper/live trading")
+
+    reliability = report.get("backtest_reliability", {})
+    if reliability.get("status") == "AVAILABLE" and not reliability.get("statistically_reliable", True):
+        breakdown: dict[str, Any] = reliability.get("rejection_breakdown", {}) or {}
+        top_rule: str = (
+            max(breakdown, key=breakdown.get) if breakdown else "not recorded for this run"
+        )
+        high.append(
+            f"Backtest produced only {reliability.get('total_trades')} trade(s) from "
+            f"{reliability.get('signals_generated')} candidate signal(s) "
+            f"({reliability.get('signals_rejected')} rejected, top rejection reason: {top_rule}) - "
+            f"win rate/profit factor/Sharpe/expectancy are not statistically meaningful below "
+            f"{reliability.get('minimum_trades_for_reliability')} trades; widen the validation "
+            "window or run a walk-forward-style backtest across multiple periods before trusting "
+            "these numbers"
+        )
+        relaxed = report.get("backtest_diagnostic_relaxed", {})
+        relaxed_trades = relaxed.get("metrics", {}).get("total_trades") if isinstance(relaxed, dict) else None
+        if isinstance(relaxed_trades, (int, float)):
+            strict_trades = reliability.get("total_trades", 0) or 0
+            if relaxed_trades > strict_trades:
+                low.append(
+                    f"The same window with loosened decision thresholds (diagnostic only, see "
+                    f"backtest_diagnostic_relaxed) produced {int(relaxed_trades)} trade(s) vs "
+                    f"{strict_trades} under the live thresholds - the low live trade count looks "
+                    "like the cascade's intended selectivity rather than a data/signal-generation "
+                    "bug, though the relaxed run is too loosened to read as a performance estimate"
+                )
+            else:
+                medium.append(
+                    "The same window with loosened decision thresholds (diagnostic only) still "
+                    f"produced only {int(relaxed_trades)} trade(s) - worth checking for a genuine "
+                    "over-rejection bug rather than assuming intended selectivity"
+                )
 
     coverage = report.get("features", {}).get("microstructure_coverage", {})
     if coverage.get("status") == "AVAILABLE":
@@ -764,6 +873,12 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         "## Backtest",
         f"```json\n{json.dumps(_trim(report.get('backtest', {})), indent=2, default=str)}\n```",
+        "",
+        "## Backtest Reliability",
+        f"```json\n{json.dumps(report.get('backtest_reliability', {}), indent=2, default=str)}\n```",
+        "",
+        "## Backtest (Diagnostic, Relaxed Thresholds)",
+        f"```json\n{json.dumps(_trim(report.get('backtest_diagnostic_relaxed', {})), indent=2, default=str)}\n```",
         "",
         "## Symbols",
         f"```json\n{json.dumps(report.get('symbols', {}), indent=2, default=str)}\n```",

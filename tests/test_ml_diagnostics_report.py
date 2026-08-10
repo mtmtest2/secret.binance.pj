@@ -100,6 +100,74 @@ def test_ai_summary_is_good_with_no_issues_and_no_baseline() -> None:
     assert summary["strongest_component"] == "direction"
 
 
+def test_backtest_reliability_flags_low_trade_count() -> None:
+    backtest = {
+        "status": "AVAILABLE",
+        "metrics": {"total_trades": 3},
+        "signals_generated": 458372,
+        "signals_rejected": 458369,
+        "rejection_breakdown": {"R1_DIRECTION_CONFIDENCE_TOO_LOW": 400000},
+    }
+    result = diagnostics._backtest_reliability(backtest)
+    assert result["status"] == "AVAILABLE"
+    assert result["statistically_reliable"] is False
+    assert result["total_trades"] == 3
+    assert result["minimum_trades_for_reliability"] == diagnostics._MIN_RELIABLE_BACKTEST_TRADES
+
+
+def test_backtest_reliability_passes_with_enough_trades() -> None:
+    backtest = {"status": "AVAILABLE", "metrics": {"total_trades": 500}}
+    result = diagnostics._backtest_reliability(backtest)
+    assert result["statistically_reliable"] is True
+
+
+def test_backtest_reliability_not_available_without_a_backtest() -> None:
+    assert diagnostics._backtest_reliability(None)["status"] == "NOT_AVAILABLE"
+    assert diagnostics._backtest_reliability({"status": "NOT_AVAILABLE"})["status"] == "NOT_AVAILABLE"
+
+
+def test_ai_summary_warns_and_downgrades_status_on_unreliable_backtest() -> None:
+    backtest = {
+        "status": "AVAILABLE",
+        "metrics": {"total_trades": 3, "win_rate": 0.6667, "profit_factor": 23.99},
+        "signals_generated": 458372,
+        "signals_rejected": 458369,
+    }
+    report = {
+        "direction": {"status": "TRAINED", "metrics": {"balanced_accuracy": 0.7}},
+        "entry": {"status": "TRAINED", "metrics": {"roc_auc": 0.65}},
+        "exit": {"status": "TRAINED"},
+        "risk": {"status": "TRAINED", "metrics": {"r2": 0.6}},
+        "data_quality": {"symbol_exclusions_total": 0},
+        "backtest": backtest,
+        "backtest_reliability": diagnostics._backtest_reliability(backtest),
+    }
+    summary = diagnostics._ai_summary(report, comparison=[])
+    # A profit_factor of 23.99 from 3 trades must not read as "GOOD".
+    assert summary["overall_status"] == "WARNING"
+    assert "3 trade" in summary["biggest_trading_problem"]
+    assert "not statistically reliable" in summary["biggest_trading_problem"]
+
+
+def test_recommendations_flag_unreliable_backtest_with_top_rejection_reason() -> None:
+    backtest = {
+        "status": "AVAILABLE",
+        "metrics": {"total_trades": 3},
+        "signals_generated": 458372,
+        "signals_rejected": 458369,
+    }
+    reliability = diagnostics._backtest_reliability(backtest)
+    reliability["rejection_breakdown"] = {
+        "R1_DIRECTION_CONFIDENCE_TOO_LOW": 400000,
+        "R4_ENTRY_MODEL_SAYS_WAIT": 58369,
+    }
+    report = {"backtest": backtest, "backtest_reliability": reliability}
+    recommendations = diagnostics._recommendations(report, comparison=[])
+    joined = " ".join(recommendations["HIGH"])
+    assert "3 trade" in joined
+    assert "R1_DIRECTION_CONFIDENCE_TOO_LOW" in joined
+
+
 def _synthetic_dataset(rng: np.random.Generator, n: int = 900) -> ProcessedDataset:
     features = pd.DataFrame(rng.normal(size=(n, len(FEATURE_COLUMNS))), columns=list(FEATURE_COLUMNS))
     direction_target = pd.Series(rng.choice(LABEL_ORDER, size=n))
