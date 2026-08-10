@@ -127,6 +127,86 @@ def _hyperparameter_snapshot(config: MLSettings) -> dict[str, Any]:
     return {field: getattr(config, field) for field in _HYPERPARAMETER_FIELDS if hasattr(config, field)}
 
 
+def focal_loss_binary(
+    y_true: np.ndarray, y_pred_raw: np.ndarray, gamma: float = 2.0
+) -> tuple[np.ndarray, np.ndarray]:
+    """Experimental LightGBM custom objective for the gate stage. Down-weights
+    the easy, confidently-correct majority region and up-weights the ambiguous
+    near-0.5 region the gate gets wrong most, where the standard log-loss
+    objective currently spends most of its gradient on already-easy rows.
+
+    NOT validated against production log-loss - needs a real gamma sweep and
+    A/B comparison against the default objective before trusting it, and may
+    destabilize LightGBM's early stopping (which expects a smoothly
+    decreasing eval metric) if gamma is too aggressive. Disabled by default;
+    enable via MLSettings.use_focal_loss_for_gate for experimentation only.
+    """
+    p = 1.0 / (1.0 + np.exp(-y_pred_raw))
+    grad = (p - y_true) * ((1 - p) ** gamma * y_true + p ** gamma * (1 - y_true)) * gamma
+    hess = p * (1 - p) * gamma  # simplified - not a rigorous 2nd derivative, flagged as experimental
+    return grad, hess
+
+
+class _SigmoidScoreClassifier:
+    """Wraps a LightGBM estimator fit with a raw-margin custom objective.
+
+    LightGBM's own ``predict_proba`` cannot invert an arbitrary custom
+    objective back into a calibrated probability - with one set, it emits a
+    warning ("Cannot compute class probabilities... Returning raw scores
+    instead") and hands back a 1-D array of raw margins, which breaks every
+    downstream consumer expecting an ``(n, 2)`` probability matrix. This
+    manually applies the sigmoid :func:`focal_loss_binary` itself assumes
+    when computing gradients, using LightGBM's own ``raw_score=True`` predict
+    path (stable regardless of objective). Every other attribute delegates
+    straight through to the wrapped estimator.
+    """
+
+    def __init__(self, estimator: Any) -> None:
+        self._estimator = estimator
+
+    def predict_proba(self, x: Any) -> np.ndarray:
+        raw: np.ndarray = np.asarray(self._estimator.predict(x, raw_score=True), dtype=np.float64)
+        positive: np.ndarray = 1.0 / (1.0 + np.exp(-raw))
+        return np.column_stack([1.0 - positive, positive])
+
+    def __getattr__(self, name: str) -> Any:
+        # Guard against infinite recursion when `_estimator` itself is not
+        # yet set (e.g. mid-unpickling, before `__init__`/state-restore runs).
+        if name == "_estimator":
+            raise AttributeError(name)
+        return getattr(self._estimator, name)
+
+
+class _FocalLossGateObjective:
+    """A picklable, 2-argument ``(y_true, y_pred_raw)`` callable binding ``gamma``.
+
+    Two independent constraints rule out the obvious alternatives:
+
+    * LightGBM's sklearn wrapper decides whether to pass sample weights into
+      a custom objective by counting ``inspect.signature(objective).
+      parameters`` - a ``functools.partial`` that binds ``gamma`` as a
+      keyword still reports 3 parameters (``y_true``, ``y_pred_raw``,
+      ``gamma``) even though one is pre-bound, so LightGBM tries to call it
+      with 3 positional arguments (labels, preds, sample_weight) and
+      collides with the already-bound ``gamma`` keyword. A callable class
+      instance's ``__call__`` reports the correct 2 parameters instead.
+    * A local closure is not picklable, which would break the joblib
+      artifact save the moment this experimental flag is enabled (the fitted
+      LightGBM estimator keeps its ``objective`` constructor argument as an
+      instance attribute). A class defined at module scope pickles fine.
+
+    Sample weights (e.g. recency weighting) are consequently not applied to
+    this objective's gradients while the experimental flag is on - a known,
+    documented limitation of this not-yet-validated feature.
+    """
+
+    def __init__(self, gamma: float) -> None:
+        self.gamma = gamma
+
+    def __call__(self, y_true: np.ndarray, y_pred_raw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        return focal_loss_binary(y_true, y_pred_raw, gamma=self.gamma)
+
+
 def _temporal_half_split(
     features: pd.DataFrame, target: pd.Series
 ) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]:
@@ -783,6 +863,20 @@ class DirectionModel(BaseModelHead):
         is_long: pd.Series = (encoded == long_index).astype(int)
 
         gate_estimator: Any = self._make_classifier(num_class=2)
+        using_focal_loss: bool = (
+            self._config.use_focal_loss_for_gate and self._config.booster == "lightgbm"
+        )
+        if self._config.use_focal_loss_for_gate:
+            if using_focal_loss:
+                gate_estimator.set_params(
+                    objective=_FocalLossGateObjective(self._config.focal_loss_gamma)
+                )
+            else:  # pragma: no cover - exercised only with booster="xgboost"
+                _LOGGER.warning(
+                    "use_focal_loss_for_gate is only implemented for the lightgbm booster; "
+                    "ignoring it for booster=%s",
+                    self._config.booster,
+                )
         if early_stopping:
             gate_estimator = self._fit_estimator(
                 gate_estimator,
@@ -796,6 +890,10 @@ class DirectionModel(BaseModelHead):
         else:
             fit_kwargs: dict[str, Any] = {} if sample_weight is None else {"sample_weight": sample_weight}
             gate_estimator.fit(features.iloc[train_positions], is_trade.iloc[train_positions], **fit_kwargs)
+        if using_focal_loss:
+            # LightGBM's own predict_proba cannot invert a custom objective -
+            # see _SigmoidScoreClassifier for why this wrap is needed.
+            gate_estimator = _SigmoidScoreClassifier(gate_estimator)
 
         trade_mask: np.ndarray = is_trade.to_numpy()[train_positions] == 1
         train_trade_positions: np.ndarray = train_positions[trade_mask]

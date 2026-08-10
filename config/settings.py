@@ -272,6 +272,16 @@ class MLSettings(BaseModel):
 
     inference_workers: int = Field(default=2, ge=1, le=16)
 
+    #: Experimental. Swaps the gate stage's (Direction model, stage 1) LightGBM
+    #: objective for a focal-loss custom objective that down-weights the easy,
+    #: confidently-correct majority region and up-weights the ambiguous
+    #: near-0.5 region - see ``module_c_ml.ml_models.focal_loss_binary`` for why
+    #: this is not yet validated against production log-loss. Off by default;
+    #: the direction (stage 2) estimator and every other head are unaffected
+    #: regardless of this flag.
+    use_focal_loss_for_gate: bool = Field(default=False)
+    focal_loss_gamma: float = Field(default=2.0, gt=0.0)
+
 
 class DecisionSettings(BaseModel):
     """Decision Engine thresholds (Module D)."""
