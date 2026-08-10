@@ -25,6 +25,8 @@ from typing import Final, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from core.logger import get_logger
+
 PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
 
 TradingMode = Literal["backtest", "paper", "live"]
@@ -104,11 +106,15 @@ class DataSettings(BaseModel):
     timeframe_ms: int = Field(default=5 * 60 * 1_000)
 
     ohlcv_limit: int = Field(default=1_500, ge=50, le=1_500)
-    #: ~1.5 years of 5-minute bars (1.5 * 365 * 24 * 12 = 157_680). Widened from
-    #: the prior ~1-year default (105_120) so training has more history to work
-    #: with, per the diagnostic report's recommendation to grow the backtest's
-    #: sample size (see also ``_DIAGNOSTIC_BACKTEST_BARS`` in ``main.py``).
-    history_bootstrap_candles: int = Field(default=157_680, ge=500)
+    #: 2 full years of 5-minute bars (24 months * 30.4375 days * 288 bars/day
+    #: = 210_384), plus a buffer for feature warm-up (the slowest feature -
+    #: the rolling HMM/GARCH windows - needs ~1_010 bars before it produces a
+    #: value) and QC trimming/gaps. Sized to exactly cover
+    #: ``MLSettings.train_months + validation_months + test_months`` (default
+    #: 12 + 6 + 6 = 24) with room to spare, so the model's held-out test
+    #: split is a genuine, full-width final backtest rather than a window
+    #: truncated by how much history was actually fetched.
+    history_bootstrap_candles: int = Field(default=212_400, ge=500)
     orderbook_depth: int = Field(default=20, ge=5, le=100)
     orderbook_levels_for_imbalance: int = Field(default=10, ge=1, le=100)
 
@@ -270,9 +276,26 @@ class MLSettings(BaseModel):
     min_child_samples: int = Field(default=40, ge=1)
     reg_lambda: float = Field(default=1.0, ge=0.0)
 
-    #: Purged, time-ordered validation split (fraction held out at the tail).
-    validation_fraction: float = Field(default=0.2, gt=0.0, lt=0.9)
-    #: Bars removed between train and validation blocks to kill label leakage.
+    #: Strict, chronological 3-way split (never a random shuffle). ``test`` is
+    #: anchored to the most recent data and is the model's final backtest
+    #: window: it is never touched by training, early stopping, calibration,
+    #: threshold selection or model selection - only by the one-shot backtest
+    #: replay run after everything else is already frozen. ``validation`` is
+    #: the block immediately before it, used for every development decision;
+    #: ``train`` is everything older. Defaults sum to 24 months (2 full years)
+    #: - see ``DataSettings.history_bootstrap_candles``.
+    train_months: float = Field(default=12.0, gt=0.0)
+    validation_months: float = Field(default=6.0, gt=0.0)
+    test_months: float = Field(default=6.0, gt=0.0)
+    #: Embargo gap (bars) cut from the trailing edge of train and of
+    #: validation, converted to a *time* duration (``purge_bars *
+    #: DataSettings.timeframe_ms``) and applied uniformly regardless of how
+    #: many symbols share a timestamp in the pooled dataset. Should stay >=
+    #: ``LabelSettings.max_holding_bars`` (flagged, if not, by
+    #: ``Settings._warn_if_purge_too_short_for_label_horizon``) - a label
+    #: simulated from a row inside the embargo can look forward past the
+    #: split boundary into the next block, which is exactly the leakage this
+    #: gap exists to prevent.
     purge_bars: int = Field(default=60, ge=0)
     early_stopping_rounds: int = Field(default=50, ge=0)
 
@@ -284,21 +307,6 @@ class MLSettings(BaseModel):
     recency_half_life_days: float = Field(default=45.0, ge=0.0)
 
     inference_workers: int = Field(default=2, ge=1, le=16)
-
-    #: Target replay length (bars, summed across the whole dataset - matching
-    #: how ``validation_fraction`` is measured - then divided evenly per
-    #: symbol) for the diagnostic backtest run after every training cycle -
-    #: see ``TradingSystem._run_validation_backtest``. Deliberately a new,
-    #: separately-named field rather than reusing ``validation_fraction`` or
-    #: ``history_bootstrap_candles``: the operator wants the diagnostic
-    #: backtest itself to span a full year (365 * 24 * 12 = 105_120 5m bars)
-    #: regardless of how large ``validation_fraction``'s own OOS tail is.
-    #: Only the portion of this window that falls inside the model's actual
-    #: validation split is genuinely out-of-sample; the rest overlaps rows the
-    #: model trained on - see the docstring on ``_run_validation_backtest``
-    #: and the report's ``backtest.oos_disclosure`` section for the exact
-    #: split every run measures.
-    diagnostic_backtest_bars: int = Field(default=105_120, ge=100)
 
     #: Experimental. Swaps the gate stage's (Direction model, stage 1) LightGBM
     #: objective for a focal-loss custom objective that down-weights the easy,
@@ -501,6 +509,33 @@ class Settings(BaseSettings):
         """Create the runtime directories eagerly so no I/O path can fail later."""
         for directory in (self.log_dir, self.ml.model_dir, self.db.path.parent):
             directory.mkdir(parents=True, exist_ok=True)
+        return self
+
+    @model_validator(mode="after")
+    def _warn_if_purge_too_short_for_label_horizon(self) -> "Settings":
+        """Flag (never raise on) a purge/embargo gap too short to cover the
+        label horizon.
+
+        A label simulated from a row at position ``t`` looks forward up to
+        ``labels.max_holding_bars`` candles to resolve. The purge/embargo gap
+        cut at every split boundary (``ml.purge_bars``) must therefore be at
+        least that wide, or a training/validation row just inside the gap
+        can have a label that peeks across the boundary into the next
+        block - reintroducing exactly the leakage the gap exists to
+        prevent. This only warns (rather than rejects the config) so small,
+        deliberately-scaled-down configurations in tests/experiments are not
+        blocked; production should never actually run with this warning
+        active.
+        """
+        if self.ml.purge_bars < self.labels.max_holding_bars:
+            get_logger(__name__).warning(
+                "ml.purge_bars=%d is smaller than labels.max_holding_bars=%d - the "
+                "train/validation/test embargo may not fully cover the label "
+                "horizon, risking leakage across split boundaries. Set "
+                "purge_bars >= max_holding_bars before training on real data.",
+                self.ml.purge_bars,
+                self.labels.max_holding_bars,
+            )
         return self
 
 

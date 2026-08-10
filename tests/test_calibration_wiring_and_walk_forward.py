@@ -61,7 +61,7 @@ def _structured_dataset(rng: np.random.Generator, n: int) -> ProcessedDataset:
 
 def test_direction_model_wires_calibrated_model_into_inference_when_it_helps() -> None:
     settings = Settings(
-        ml={"n_estimators": 50, "early_stopping_rounds": 10, "validation_fraction": 0.3, "purge_bars": 10}
+        ml={"n_estimators": 50, "early_stopping_rounds": 10, "purge_bars": 10}
     )
     dataset = _structured_dataset(np.random.default_rng(21), n=5000)
 
@@ -93,7 +93,7 @@ def test_direction_model_wires_calibrated_model_into_inference_when_it_helps() -
 
 def test_entry_model_predict_still_works_regardless_of_calibration_outcome() -> None:
     settings = Settings(
-        ml={"n_estimators": 50, "early_stopping_rounds": 10, "validation_fraction": 0.3, "purge_bars": 10}
+        ml={"n_estimators": 50, "early_stopping_rounds": 10, "purge_bars": 10}
     )
     dataset = _structured_dataset(np.random.default_rng(22), n=5000)
 

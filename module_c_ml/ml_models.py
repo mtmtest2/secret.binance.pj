@@ -44,7 +44,13 @@ from core.logger import get_logger
 from core.utils import clamp, git_commit_hash
 from module_b_features.features import FEATURE_COLUMNS, HMMRegime
 from module_b_features.labeler import LABEL_ORDER, LABEL_TO_INDEX, LabelClass, risk_tier_from_score
-from module_b_features.processor import InferencePayload, ProcessedDataset
+from module_b_features.processor import (
+    ChronologicalSplit,
+    InferencePayload,
+    ProcessedDataset,
+    SplitBoundaries,
+    assign_split,
+)
 from module_c_ml import metrics as ml_metrics
 from module_c_ml.schemas import (
     DirectionPrediction,
@@ -73,7 +79,9 @@ _HYPERPARAMETER_FIELDS: Final[tuple[str, ...]] = (
     "colsample_bytree",
     "reg_lambda",
     "random_state",
-    "validation_fraction",
+    "train_months",
+    "validation_months",
+    "test_months",
     "purge_bars",
     "early_stopping_rounds",
 )
@@ -511,6 +519,106 @@ class BaseModelHead(ABC):
         return estimator
 
     # ------------------------------------------------------------------
+    # Chronological train/validation/test split
+    # ------------------------------------------------------------------
+    def _split_boundaries(self, dataset: ProcessedDataset) -> SplitBoundaries | None:
+        """This head's train/validation/test cut points for ``dataset``.
+
+        Always computed from the *full* dataset's timestamp range (never a
+        filtered subset) so every head - even one that later restricts
+        itself to a row subset, like :class:`ExitModel`/:class:`RiskModel` -
+        agrees on exactly the same calendar boundaries. ``test`` is the
+        final backtest window: :meth:`train` must never fit, early-stop,
+        calibrate or threshold-tune against it.
+        """
+        return dataset.split_boundaries(
+            train_months=self._config.train_months,
+            validation_months=self._config.validation_months,
+            test_months=self._config.test_months,
+            purge_bars=self._config.purge_bars,
+            timeframe_ms=self._settings.data.timeframe_ms,
+        )
+
+    def _chronological_split(self, dataset: ProcessedDataset) -> ChronologicalSplit:
+        """Strict train/validation/test row positions over the full dataset."""
+        return dataset.chronological_split(self._split_boundaries(dataset))
+
+    @staticmethod
+    def _split_period_metadata(split: ChronologicalSplit) -> dict[str, Any]:
+        """Human-readable train/validation/test date ranges for the metrics sidecar.
+
+        ``test`` is recorded here purely as a date range / row count for
+        audit purposes - this head's ``train()`` never reads ``test_index``
+        for fitting, early stopping, calibration or threshold selection.
+        """
+
+        def _period(start_ms: int | None, end_ms: int | None, rows: int) -> dict[str, Any]:
+            return {
+                "start": datetime.fromtimestamp(start_ms / 1000.0, tz=timezone.utc).isoformat()
+                if start_ms is not None
+                else None,
+                "end": datetime.fromtimestamp(end_ms / 1000.0, tz=timezone.utc).isoformat()
+                if end_ms is not None
+                else None,
+                "rows": rows,
+            }
+
+        return {
+            "train": _period(split.train_start_ms, split.train_end_ms, int(len(split.train_index))),
+            "validation": _period(
+                split.validation_start_ms, split.validation_end_ms, int(len(split.validation_index))
+            ),
+            "test": _period(split.test_start_ms, split.test_end_ms, int(len(split.test_index))),
+            "embargo_ms": split.boundaries.embargo_ms,
+            "scaled_down_from_nominal_months": split.boundaries.scaled_down,
+        }
+
+    @classmethod
+    def _filtered_split_period_metadata(
+        cls,
+        timestamps: np.ndarray,
+        train_index: np.ndarray,
+        validation_index: np.ndarray,
+        test_index: np.ndarray,
+        boundaries: SplitBoundaries | None,
+    ) -> dict[str, Any]:
+        """:meth:`_split_period_metadata` for a head (Exit, Risk) that first
+        filters ``dataset`` down to a row subset before splitting it.
+
+        ``boundaries`` still comes from the full, unfiltered dataset (see
+        :meth:`_split_boundaries`), so the reported dates line up with every
+        other head's even though the row counts here only cover this head's
+        own filtered subset (e.g. only rows with a directional trade).
+        """
+        if boundaries is None:
+            empty: np.ndarray = np.array([], dtype=np.int64)
+            split = ChronologicalSplit(empty, empty, empty, None, None, None, None, None, None, None)  # type: ignore[arg-type]
+            return cls._split_period_metadata(split)
+
+        def _bounds(index: np.ndarray) -> tuple[int | None, int | None]:
+            if index.size == 0:
+                return None, None
+            subset: np.ndarray = timestamps[index]
+            return int(subset.min()), int(subset.max())
+
+        train_start, train_end = _bounds(train_index)
+        validation_start, validation_end = _bounds(validation_index)
+        test_start, test_end = _bounds(test_index)
+        split = ChronologicalSplit(
+            train_index=train_index,
+            validation_index=validation_index,
+            test_index=test_index,
+            train_start_ms=train_start,
+            train_end_ms=train_end,
+            validation_start_ms=validation_start,
+            validation_end_ms=validation_end,
+            test_start_ms=test_start,
+            test_end_ms=test_end,
+            boundaries=boundaries,
+        )
+        return cls._split_period_metadata(split)
+
+    # ------------------------------------------------------------------
     # Sample weighting
     # ------------------------------------------------------------------
     def _recency_weights(self, timestamps: np.ndarray) -> np.ndarray | None:
@@ -678,9 +786,8 @@ class DirectionModel(BaseModelHead):
         if encoded.isna().any():
             raise ModelTrainingError("direction labels contain unknown classes")
 
-        train_index, validation_index = dataset.train_validation_split(
-            self._config.validation_fraction, self._config.purge_bars
-        )
+        split: ChronologicalSplit = self._chronological_split(dataset)
+        train_index, validation_index = split.train_index, split.validation_index
         features: pd.DataFrame = dataset.features
         sample_weight: np.ndarray | None = self._recency_weights(
             self._timestamps_for(dataset, train_index)
@@ -777,6 +884,7 @@ class DirectionModel(BaseModelHead):
             "recommended_gate_threshold": recommended_gate_threshold,
             "direction_threshold_sweep": direction_sweep,
             "recommended_direction_threshold": recommended_direction_threshold,
+            "split": self._split_period_metadata(split),
         }
         headline: dict[str, Any] = {
             key: full_metrics[key]
@@ -1168,46 +1276,67 @@ class DirectionModel(BaseModelHead):
         Every fold is a genuinely separate fit (no artifact is mutated or
         reused): this never touches ``self._model``.
 
+        Restricted entirely to the train+validation region (everything
+        strictly before the held-out test split's start): walk-forward is a
+        development-time diagnostic, and the test split must stay unseen by
+        every development decision, not just the final production fit - see
+        the module's train/validation/test split discipline
+        (``BaseModelHead._split_boundaries``).
+
         Returns ``{"status": "NOT_AVAILABLE", "reason": ...}`` when the
         dataset is too small to carve out ``n_folds`` honest folds, rather
         than fabricating a result from folds too small to mean anything.
         """
-        rows: int = len(dataset.features)
         min_rows_per_fold: int = 200
+        boundaries: SplitBoundaries | None = self._split_boundaries(dataset)
+        if boundaries is None:
+            return {"status": "NOT_AVAILABLE", "reason": "no timestamps available"}
+
+        all_timestamps: np.ndarray = self._timestamps_for(dataset, np.arange(len(dataset.features)))
+        in_sample_positions: np.ndarray = np.nonzero(all_timestamps < boundaries.test_start_ms)[0]
+        rows: int = in_sample_positions.size
         if rows < (n_folds + 1) * min_rows_per_fold:
             return {
                 "status": "NOT_AVAILABLE",
                 "reason": (
-                    f"only {rows} rows available; walk-forward needs at least "
-                    f"{(n_folds + 1) * min_rows_per_fold} for {n_folds} honest folds"
+                    f"only {rows} train+validation rows available (test split excluded); "
+                    f"walk-forward needs at least {(n_folds + 1) * min_rows_per_fold} for "
+                    f"{n_folds} honest folds"
                 ),
             }
 
-        encoded: pd.Series = dataset.direction_target.map(LABEL_TO_INDEX)
-        if encoded.isna().any():
+        encoded_full: pd.Series = dataset.direction_target.map(LABEL_TO_INDEX)
+        if encoded_full.isna().any():
             return {"status": "NOT_AVAILABLE", "reason": "direction labels contain unknown classes"}
 
-        features: pd.DataFrame = dataset.features
-        purge: int = self._config.purge_bars
+        features: pd.DataFrame = dataset.features.iloc[in_sample_positions].reset_index(drop=True)
+        encoded: pd.Series = encoded_full.iloc[in_sample_positions].reset_index(drop=True)
+        timestamps: np.ndarray = all_timestamps[in_sample_positions]
+        embargo_ms: int = boundaries.embargo_ms
         # n_folds+1 expanding blocks: block 0 is a seed reserved purely for
         # the first fold's training data (there is nothing before it to
         # validate against), and each of the remaining n_folds blocks is one
         # validation fold, trained on everything strictly before it.
-        boundaries: np.ndarray = np.linspace(0, rows, n_folds + 2, dtype=int)
+        fold_boundaries: np.ndarray = np.linspace(0, rows, n_folds + 2, dtype=int)
 
         folds: list[dict[str, Any]] = []
         for fold_number in range(1, n_folds + 1):
-            val_start, val_end = int(boundaries[fold_number]), int(boundaries[fold_number + 1])
-            train_end: int = max(1, val_start - purge)
-            if train_end < min_rows_per_fold or (val_end - val_start) < min_rows_per_fold // 2:
+            val_start, val_end = int(fold_boundaries[fold_number]), int(fold_boundaries[fold_number + 1])
+            if val_start >= rows or val_end <= val_start:
                 continue
-
-            train_positions: np.ndarray = np.arange(train_end)
+            # Embargo is a *time* gap, not a row-count gap: the pooled
+            # dataset interleaves every symbol at each timestamp, so
+            # subtracting a fixed row count would purge far less real time
+            # than `purge_bars` once more than one symbol is present.
+            train_mask: np.ndarray = timestamps < (timestamps[val_start] - embargo_ms)
+            train_positions: np.ndarray = np.nonzero(train_mask)[0]
             validation_positions: np.ndarray = np.arange(val_start, val_end)
+            if train_positions.size < min_rows_per_fold or (val_end - val_start) < min_rows_per_fold // 2:
+                continue
             if encoded.iloc[train_positions].nunique() < 2:
                 continue
 
-            sample_weight = self._recency_weights(self._timestamps_for(dataset, train_positions))
+            sample_weight = self._recency_weights(timestamps[train_positions])
             gate_estimator, direction_estimator = self._fit_cascade(
                 features, encoded, train_positions, validation_positions, sample_weight, early_stopping=False
             )
@@ -1222,7 +1351,7 @@ class DirectionModel(BaseModelHead):
             folds.append(
                 {
                     "fold": fold_number,
-                    "train_rows": int(train_end),
+                    "train_rows": int(train_positions.size),
                     "validation_rows": int(val_end - val_start),
                     "accuracy": fold_metrics.get("accuracy"),
                     "balanced_accuracy": fold_metrics.get("balanced_accuracy"),
@@ -1310,9 +1439,8 @@ class EntryModel(BaseModelHead):
         if target.nunique() < 2:
             raise ModelTrainingError("entry target is degenerate (single class)")
 
-        train_index, validation_index = dataset.train_validation_split(
-            self._config.validation_fraction, self._config.purge_bars
-        )
+        split: ChronologicalSplit = self._chronological_split(dataset)
+        train_index, validation_index = split.train_index, split.validation_index
         features: pd.DataFrame = dataset.features
         estimator: Any = self._make_classifier(num_class=2)
         estimator = self._fit_estimator(
@@ -1378,6 +1506,7 @@ class EntryModel(BaseModelHead):
             "feature_importance": importance,
             "calibration": calibration,
             "production_calibration": production_calibration,
+            "split": self._split_period_metadata(split),
         }
         headline: dict[str, Any] = {
             key: full_metrics[key] for key in ("precision", "recall", "roc_auc") if key in full_metrics
@@ -1528,37 +1657,45 @@ class ExitModel(BaseModelHead):
         targets: pd.DataFrame = dataset.exit_targets[usable].reset_index(drop=True)
         metadata_usable: pd.DataFrame = dataset.metadata[usable].reset_index(drop=True)
 
-        split_point: int = max(1, int(len(features) * (1.0 - self._config.validation_fraction)))
-        train_end: int = max(1, split_point - self._config.purge_bars)
+        # Boundaries come from the *full* dataset (not this filtered subset)
+        # so Exit shares the exact same train/validation/test calendar cut
+        # points as every other head - see BaseModelHead._split_boundaries.
+        boundaries: SplitBoundaries | None = self._split_boundaries(dataset)
+        usable_timestamps: np.ndarray = (
+            metadata_usable["timestamp"].to_numpy(dtype=np.int64)
+            if "timestamp" in metadata_usable.columns
+            else np.array([], dtype=np.int64)
+        )
+        if boundaries is not None and usable_timestamps.size > 0:
+            train_index, validation_index, test_index = assign_split(usable_timestamps, boundaries)
+        else:
+            train_index = np.arange(len(features), dtype=np.int64)
+            validation_index = np.array([], dtype=np.int64)
+            test_index = np.array([], dtype=np.int64)
 
         estimators: dict[str, Any] = {}
         full_metrics: dict[str, Any] = {}
         importance: dict[str, Any] = {}
 
-        validation_features: pd.DataFrame = features.iloc[split_point:]
+        validation_features: pd.DataFrame = features.iloc[validation_index]
         baseline: dict[str, np.ndarray] = self._baseline_predictions(validation_features)
-        train_timestamps: np.ndarray = (
-            metadata_usable["timestamp"].to_numpy(dtype=np.float64)[:train_end]
-            if "timestamp" in metadata_usable.columns
-            else np.array([], dtype=np.float64)
-        )
-        sample_weight: np.ndarray | None = self._recency_weights(train_timestamps)
+        sample_weight: np.ndarray | None = self._recency_weights(usable_timestamps[train_index])
 
         for column in self._TARGETS:
             estimator: Any = self._make_regressor(robust=True)
             estimator = self._fit_estimator(
                 estimator,
-                features.iloc[:train_end],
-                targets[column].iloc[:train_end],
+                features.iloc[train_index],
+                targets[column].iloc[train_index],
                 validation_features,
-                targets[column].iloc[split_point:],
+                targets[column].iloc[validation_index],
                 eval_metric="l1",
                 sample_weight=sample_weight,
             )
             estimators[column] = estimator
-            if split_point < len(features):
+            if len(validation_index) > 0:
                 predictions: np.ndarray = estimator.predict(validation_features)
-                validation_target: np.ndarray = targets[column].iloc[split_point:].to_numpy()
+                validation_target: np.ndarray = targets[column].iloc[validation_index].to_numpy()
                 target_metrics: dict[str, Any] = ml_metrics.regression_metrics(
                     validation_target, predictions
                 )
@@ -1577,11 +1714,14 @@ class ExitModel(BaseModelHead):
         self._metadata = {
             "trained_at": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
             "git_commit": git_commit_hash(),
-            "rows": int(train_end),
-            "validation_rows": int(len(features) - split_point),
+            "rows": int(len(train_index)),
+            "validation_rows": int(len(validation_index)),
             "hyperparameters": _hyperparameter_snapshot(self._config),
             "metrics": full_metrics,
             "feature_importance": importance,
+            "split": self._filtered_split_period_metadata(
+                usable_timestamps, train_index, validation_index, test_index, boundaries
+            ),
         }
         headline: dict[str, Any] = {
             column: full_metrics[column].get("mae") for column in full_metrics
@@ -1745,14 +1885,21 @@ class RiskModel(BaseModelHead):
         target: pd.Series = dataset.risk_target[usable].astype(float).reset_index(drop=True)
         metadata_usable: pd.DataFrame = dataset.metadata[usable].reset_index(drop=True)
 
-        split_point: int = max(1, int(len(features) * (1.0 - self._config.validation_fraction)))
-        train_end: int = max(1, split_point - self._config.purge_bars)
-        validation_features: pd.DataFrame = features.iloc[split_point:]
-        train_timestamps: np.ndarray = (
-            metadata_usable["timestamp"].to_numpy(dtype=np.float64)[:train_end]
+        # Boundaries come from the *full* dataset, matching every other head -
+        # see BaseModelHead._split_boundaries.
+        boundaries: SplitBoundaries | None = self._split_boundaries(dataset)
+        usable_timestamps: np.ndarray = (
+            metadata_usable["timestamp"].to_numpy(dtype=np.int64)
             if "timestamp" in metadata_usable.columns
-            else np.array([], dtype=np.float64)
+            else np.array([], dtype=np.int64)
         )
+        if boundaries is not None and usable_timestamps.size > 0:
+            train_index, validation_index, test_index = assign_split(usable_timestamps, boundaries)
+        else:
+            train_index = np.arange(len(features), dtype=np.int64)
+            validation_index = np.array([], dtype=np.int64)
+            test_index = np.array([], dtype=np.int64)
+        validation_features: pd.DataFrame = features.iloc[validation_index]
 
         # target_risk_score is right-skewed (mean 0.29, median 0.20 in the
         # first production run) the same way the exit-geometry percentages
@@ -1762,12 +1909,12 @@ class RiskModel(BaseModelHead):
         estimator: Any = self._make_regressor(robust=True)
         estimator = self._fit_estimator(
             estimator,
-            features.iloc[:train_end],
-            target.iloc[:train_end],
+            features.iloc[train_index],
+            target.iloc[train_index],
             validation_features,
-            target.iloc[split_point:],
+            target.iloc[validation_index],
             eval_metric="l1",
-            sample_weight=self._recency_weights(train_timestamps),
+            sample_weight=self._recency_weights(usable_timestamps[train_index]),
         )
 
         self._model = estimator
@@ -1778,20 +1925,23 @@ class RiskModel(BaseModelHead):
         if len(validation_features) > 0:
             predictions: np.ndarray = estimator.predict(validation_features)
             full_metrics = ml_metrics.regression_metrics(
-                target.iloc[split_point:].to_numpy(), predictions
+                target.iloc[validation_index].to_numpy(), predictions
             )
             importance = ml_metrics.feature_importance(estimator, dataset.feature_columns)
 
         self._metadata = {
             "trained_at": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
             "git_commit": git_commit_hash(),
-            "rows": int(train_end),
-            "validation_rows": int(len(features) - split_point),
+            "rows": int(len(train_index)),
+            "validation_rows": int(len(validation_index)),
             "hyperparameters": _hyperparameter_snapshot(self._config),
             "metrics": full_metrics,
             "feature_importance": importance,
             "training_row_filter": (
                 "direction_target != NO_TRADE_OR_FAIL - see RiskModel.train docstring"
+            ),
+            "split": self._filtered_split_period_metadata(
+                usable_timestamps, train_index, validation_index, test_index, boundaries
             ),
         }
         headline: dict[str, Any] = {

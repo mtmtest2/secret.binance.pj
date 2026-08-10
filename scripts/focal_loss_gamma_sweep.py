@@ -79,9 +79,15 @@ def _gate_metrics_at(dataset: ProcessedDataset, settings: Settings) -> dict[str,
     model = DirectionModel(settings)
     model.train(dataset)
 
-    train_index, validation_index = dataset.train_validation_split(
-        settings.ml.validation_fraction, settings.ml.purge_bars
+    boundaries = dataset.split_boundaries(
+        train_months=settings.ml.train_months,
+        validation_months=settings.ml.validation_months,
+        test_months=settings.ml.test_months,
+        purge_bars=settings.ml.purge_bars,
+        timeframe_ms=settings.data.timeframe_ms,
     )
+    split = dataset.chronological_split(boundaries)
+    validation_index = split.validation_index
     validation_features = dataset.features.iloc[validation_index]
     no_trade_index_label = LabelClass.NO_TRADE_OR_FAIL.value
     is_trade_true = (dataset.direction_target.iloc[validation_index] != no_trade_index_label).astype(int)
@@ -109,7 +115,6 @@ def main() -> None:
         ml={
             "n_estimators": 60,
             "early_stopping_rounds": 10,
-            "validation_fraction": 0.3,
             "purge_bars": 10,
             "use_focal_loss_for_gate": False,
         }
@@ -131,7 +136,6 @@ def main() -> None:
             ml={
                 "n_estimators": 60,
                 "early_stopping_rounds": 10,
-                "validation_fraction": 0.3,
                 "purge_bars": 10,
                 "use_focal_loss_for_gate": True,
                 "focal_loss_gamma": gamma,

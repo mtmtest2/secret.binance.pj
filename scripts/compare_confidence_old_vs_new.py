@@ -94,9 +94,7 @@ def main() -> None:
     rng = np.random.default_rng(7)
     dataset = _synthetic_dataset(rng)
 
-    settings = Settings(
-        ml={"n_estimators": 60, "early_stopping_rounds": 10, "validation_fraction": 0.3, "purge_bars": 10}
-    )
+    settings = Settings(ml={"n_estimators": 60, "early_stopping_rounds": 10, "purge_bars": 10})
     min_gate = settings.decision.min_gate_confidence
     min_direction = settings.decision.min_direction_given_trade_confidence
 
@@ -104,9 +102,15 @@ def main() -> None:
     model = DirectionModel(settings)
     model.train(dataset)
 
-    train_index, validation_index = dataset.train_validation_split(
-        settings.ml.validation_fraction, settings.ml.purge_bars
+    boundaries = dataset.split_boundaries(
+        train_months=settings.ml.train_months,
+        validation_months=settings.ml.validation_months,
+        test_months=settings.ml.test_months,
+        purge_bars=settings.ml.purge_bars,
+        timeframe_ms=settings.data.timeframe_ms,
     )
+    split = dataset.chronological_split(boundaries)
+    validation_index = split.validation_index
     validation_features = dataset.features.iloc[validation_index]
     if validation_features.empty:
         print("No validation rows produced by this synthetic split - nothing to compare.")

@@ -54,7 +54,7 @@ from apscheduler.triggers.cron import CronTrigger
 from config.settings import DecisionSettings, Settings, get_settings
 from core.exceptions import KillSwitchEngaged, QuantSystemError
 from core.logger import configure_logging, get_logger
-from core.utils import utc_now, utc_now_ms
+from core.utils import ms_to_datetime, utc_now, utc_now_ms
 from module_a_data.db_handler import DatabaseHandler
 from module_a_data.fetcher import BinanceDataFetcher
 from module_a_data.models import MarketDataBundle
@@ -84,7 +84,7 @@ _CYCLE_MINUTES: Final[str] = "0,5,10,15,20,25,30,35,40,45,50,55"
 _MAX_STORED_CYCLE_TIMINGS: Final[int] = 500
 
 #: Decision-cascade thresholds for the *diagnostic-only* relaxed backtest run
-#: by ``TradingSystem._run_validation_backtest`` - never used for real trading.
+#: by ``TradingSystem._run_final_backtest`` - never used for real trading.
 #: The live ``DecisionSettings`` defaults (min_gate_confidence=0.55,
 #: min_direction_given_trade_confidence=0.60, min_entry_probability=0.55, ...)
 #: are intentionally strict and, combined with a single ~8-week out-of-sample
@@ -102,52 +102,21 @@ _RELAXED_DECISION_SETTINGS: Final[DecisionSettings] = DecisionSettings(
 )
 
 
-def _diagnostic_backtest_window(
-    *, oos_validation_rows: int, diagnostic_backtest_bars: int, symbol_count: int
-) -> tuple[int, dict[str, Any]]:
-    """Compute the diagnostic backtest's per-symbol replay depth and the
-    genuinely-out-of-sample-vs-in-sample split for that window.
+def _final_backtest_window(
+    *, test_start_ms: int, test_end_ms: int, timeframe_ms: int, warmup_padding: int
+) -> int:
+    """Per-symbol replay depth (in candles) covering exactly the held-out test split.
 
     Pure and side-effect free (no DB/network) so it is directly unit
-    testable - see ``TradingSystem._run_validation_backtest`` for the caller
-    and its docstring for why this split matters and must never be hidden.
-
-    Returns ``(diagnostic_bars_per_symbol, oos_disclosure)``.
+    testable - see ``TradingSystem._run_final_backtest`` for the caller.
+    ``Backtester.run`` loads the *most recent* ``max_candles`` bars per
+    symbol from the database; since this replay always runs immediately
+    after training on the same dataset, "most recent N candles" and "the
+    test split's own date range" are the same window, so a plain bar count
+    is sufficient - no per-symbol date-range query is needed.
     """
-    if symbol_count <= 0:
-        raise ValueError("symbol_count must be positive")
-    # Genuinely out-of-sample tail, per symbol (the model's own
-    # train/validation split boundary), spread evenly like validation_index
-    # itself is spread across the combined multi-symbol dataset.
-    oos_bars_per_symbol: int = -(-oos_validation_rows // symbol_count)  # ceil
-    # Target diagnostic replay length, per symbol - decoupled from the OOS
-    # tail above, see MLSettings.diagnostic_backtest_bars.
-    diagnostic_bars_per_symbol: int = -(-diagnostic_backtest_bars // symbol_count)  # ceil
-
-    out_of_sample_bars_per_symbol: int = min(oos_bars_per_symbol, diagnostic_bars_per_symbol)
-    in_sample_bars_per_symbol: int = max(
-        diagnostic_bars_per_symbol - out_of_sample_bars_per_symbol, 0
-    )
-    oos_fraction: float = (
-        out_of_sample_bars_per_symbol / diagnostic_bars_per_symbol
-        if diagnostic_bars_per_symbol > 0
-        else 0.0
-    )
-    oos_disclosure: dict[str, Any] = {
-        "note": (
-            "Only the out_of_sample_bars_per_symbol portion of this replay window "
-            "was never seen in training (the model's own validation_fraction tail, "
-            "purged by purge_bars). The remaining in_sample_bars_per_symbol bars "
-            "overlap the training set and will tend to read better than genuine "
-            "live performance - treat this backtest as a blend, not a clean "
-            "holdout, whenever oos_fraction < 1.0."
-        ),
-        "diagnostic_backtest_bars_per_symbol": diagnostic_bars_per_symbol,
-        "out_of_sample_bars_per_symbol": out_of_sample_bars_per_symbol,
-        "in_sample_bars_per_symbol": in_sample_bars_per_symbol,
-        "oos_fraction": oos_fraction,
-    }
-    return diagnostic_bars_per_symbol, oos_disclosure
+    test_bars: int = max(0, -(-(test_end_ms - test_start_ms) // timeframe_ms) + 1)  # ceil, inclusive
+    return test_bars + warmup_padding
 
 
 def _headline_metrics(report: dict[str, Any]) -> dict[str, Any]:
@@ -420,44 +389,24 @@ class TradingSystem:
             len(futures_written),
         )
 
-    async def _run_validation_backtest(
+    async def _run_final_backtest(
         self, dataset: ProcessedDataset
     ) -> tuple[BacktestReport | None, BacktestReport | None]:
-        """Replay the out-of-sample validation window through the full pipeline.
+        """Replay the held-out test split - and *only* the held-out test split -
+        through the full pipeline.
 
-        The ML diagnostic report's trading-level fields (win rate, profit
-        factor, expectancy, max drawdown, Sharpe) were previously always
-        ``NOT_AVAILABLE`` because nothing ever ran a backtest and passed it
-        in. The replay window's length is controlled by
-        ``MLSettings.diagnostic_backtest_bars`` (default: a full year of 5m
-        bars, 105_120) - a deliberately separate, explicitly-named setting
-        from ``validation_fraction`` (see its docstring). Decoupling the two
-        lets the diagnostic backtest span a full year for a large enough
-        sample size, independent of how large the model's own OOS validation
-        tail happens to be.
-
-        Honesty requirement - READ BEFORE TRUSTING THIS NUMBER: only the
-        portion of the replay window that falls inside the model's actual
-        validation split (``validation_fraction``'s tail, purged by
-        ``purge_bars``) is genuinely out-of-sample. When
-        ``diagnostic_backtest_bars`` exceeds that validation tail's bar
-        count (e.g. a full-year window against ``validation_fraction=0.2``
-        over a 1.5-year collection, whose OOS tail is only ~0.3 years), the
-        remainder of the replay overlaps rows the model was actually trained
-        on - an in-sample replay, not a real holdout test, that will tend to
-        read *better* than genuine live performance. This function computes
-        and returns that split explicitly (see ``oos_disclosure`` below) so
-        it is measured and logged on every run, not silently implied away by
-        a big, good-looking window. Treat metrics from the in-sample portion
-        as inflated; only the OOS-tail portion is a trustworthy estimate.
-
-        Caveat, stated honestly rather than hidden: when the Direction/Entry
-        heads' production isotonic calibrators are wired in
-        (``BaseModelHead._fit_production_calibrator``), they are fit on this
-        same validation block. This is therefore the best available
-        approximation of a clean holdout, not a third, fully untouched split -
-        treat the resulting numbers as directionally informative rather than
-        a certified live-performance estimate.
+        This is the model's one genuine final backtest. The test window
+        (``MLSettings.test_months``, 6 months by default) is the newest
+        slice of the dataset's own timestamp range, carved out by
+        ``ProcessedDataset.split_boundaries``/``chronological_split`` - the
+        exact same boundaries every head's ``train()`` used to keep this
+        window out of fitting, early stopping, calibration and threshold
+        selection. Nothing here re-derives a different window: the replay
+        depth is read straight off the test split's own start/end
+        timestamps, so it is always 100% out-of-sample by construction
+        (unlike the previous "diagnostic backtest", which replayed a
+        fixed bar count that could overlap training data - see git history
+        for that design).
 
         Returns ``(strict, relaxed)``: ``strict`` replays with the live
         ``DecisionSettings`` and is the number that matters operationally. A
@@ -470,8 +419,6 @@ class TradingSystem:
         live config) purely to see whether the strategy's edge is
         directionally visible at all with a larger trade count - it is a
         diagnostic reference only, never a performance estimate to trade on.
-        Both reports carry identical ``oos_disclosure`` metadata since both
-        replay the same window.
 
         Never raises: a backtest failure must not block training or the
         diagnostic report it enriches.
@@ -479,30 +426,38 @@ class TradingSystem:
         if not dataset.symbols:
             return None, None
         try:
-            _, validation_index = dataset.train_validation_split(
-                self.settings.ml.validation_fraction, self.settings.ml.purge_bars
+            boundaries = dataset.split_boundaries(
+                train_months=self.settings.ml.train_months,
+                validation_months=self.settings.ml.validation_months,
+                test_months=self.settings.ml.test_months,
+                purge_bars=self.settings.ml.purge_bars,
+                timeframe_ms=self.settings.data.timeframe_ms,
             )
-            if len(validation_index) == 0:
+            split = dataset.chronological_split(boundaries)
+            if len(split.test_index) == 0 or split.test_start_ms is None or split.test_end_ms is None:
                 return None, None
 
             symbols: list[str] = list(dataset.symbols)
             warmup_padding: int = self.features.engineer.minimum_rows()
-            diagnostic_bars_per_symbol, oos_disclosure = _diagnostic_backtest_window(
-                oos_validation_rows=len(validation_index),
-                diagnostic_backtest_bars=self.settings.ml.diagnostic_backtest_bars,
-                symbol_count=len(symbols),
+            max_candles: int = _final_backtest_window(
+                test_start_ms=split.test_start_ms,
+                test_end_ms=split.test_end_ms,
+                timeframe_ms=self.settings.data.timeframe_ms,
+                warmup_padding=warmup_padding,
             )
-            max_candles: int = diagnostic_bars_per_symbol + warmup_padding
-            oos_fraction: float = oos_disclosure["oos_fraction"]
-            if oos_fraction < 1.0:
-                _LOGGER.warning(
-                    "Diagnostic backtest window (%d bars/symbol) exceeds the genuinely "
-                    "out-of-sample validation tail (%d bars/symbol) - only %.0f%% of the "
-                    "replay is true holdout; the rest overlaps training data.",
-                    diagnostic_bars_per_symbol,
-                    oos_disclosure["out_of_sample_bars_per_symbol"],
-                    oos_fraction * 100,
-                )
+            oos_disclosure: dict[str, Any] = {
+                "note": (
+                    "This replay is the model's held-out test split: it was never "
+                    "used for training, early stopping, calibration, threshold "
+                    "selection or model selection for any of the four heads - see "
+                    "ProcessedDataset.chronological_split. Always 100% "
+                    "out-of-sample by construction."
+                ),
+                "test_start": ms_to_datetime(split.test_start_ms).isoformat(),
+                "test_end": ms_to_datetime(split.test_end_ms).isoformat(),
+                "test_rows_in_training_dataset": int(len(split.test_index)),
+                "oos_fraction": 1.0,
+            }
 
             backtester = Backtester(
                 self.settings, self.database, self.features, self.ml, self.decisions
@@ -530,7 +485,7 @@ class TradingSystem:
 
             return strict, relaxed
         except Exception as error:  # noqa: BLE001 - a backtest failure must not block training
-            _LOGGER.error("Validation backtest failed: %s", error, exc_info=True)
+            _LOGGER.error("Final backtest failed: %s", error, exc_info=True)
             return None, None
 
     async def _setup_train(self, symbols: list[str], force_retrain: bool) -> None:
@@ -593,11 +548,11 @@ class TradingSystem:
         _LOGGER.info("Training complete: %s", _headline_metrics(report))
 
         run_id: str = str(uuid.uuid4())
-        self.progress.set_step("running validation backtest", "replaying out-of-sample bars")
+        self.progress.set_step("running final backtest", "replaying the held-out test split")
         backtest_report: BacktestReport | None
         relaxed_backtest_report: BacktestReport | None
-        backtest_report, relaxed_backtest_report = await self._run_validation_backtest(dataset)
-        self.progress.advance(3, 4, "validation backtest complete")
+        backtest_report, relaxed_backtest_report = await self._run_final_backtest(dataset)
+        self.progress.advance(3, 4, "final backtest complete")
         try:
             self.progress.set_step(
                 "generating diagnostic report", "walk-forward validation and feature analytics"
@@ -1334,7 +1289,7 @@ class TradingSystem:
         run_id: str = str(uuid.uuid4())
         backtest_report: BacktestReport | None
         relaxed_backtest_report: BacktestReport | None
-        backtest_report, relaxed_backtest_report = await self._run_validation_backtest(dataset)
+        backtest_report, relaxed_backtest_report = await self._run_final_backtest(dataset)
         try:
             diagnostic_report: dict[str, Any] = await diagnostics.build_report(
                 settings=self.settings,

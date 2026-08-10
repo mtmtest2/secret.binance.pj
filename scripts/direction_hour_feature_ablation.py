@@ -106,7 +106,7 @@ def _train_and_score(dataset: ProcessedDataset, settings: Settings) -> dict[str,
 
 def main() -> None:
     settings = Settings(
-        ml={"n_estimators": 60, "early_stopping_rounds": 10, "validation_fraction": 0.3, "purge_bars": 10}
+        ml={"n_estimators": 60, "early_stopping_rounds": 10, "purge_bars": 10}
     )
 
     # Same rng SEED for both datasets so every feature except hour/dow is

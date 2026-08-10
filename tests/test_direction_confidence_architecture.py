@@ -243,7 +243,7 @@ def test_direction_model_trains_with_measurable_joint_calibration_report() -> No
     )
 
     settings = Settings(
-        ml={"n_estimators": 50, "early_stopping_rounds": 10, "validation_fraction": 0.3, "purge_bars": 10}
+        ml={"n_estimators": 50, "early_stopping_rounds": 10, "purge_bars": 10}
     )
     model = DirectionModel(settings)
     model.train(dataset)

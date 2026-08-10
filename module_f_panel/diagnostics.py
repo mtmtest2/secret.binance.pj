@@ -189,20 +189,23 @@ def _feature_correlation(dataset: ProcessedDataset, top_n: int = 25) -> dict[str
     return {"status": "AVAILABLE", "top_correlated_pairs": pairs[:top_n]}
 
 
-def _feature_drift(dataset: ProcessedDataset, validation_index: np.ndarray) -> dict[str, Any]:
+def _feature_drift(
+    dataset: ProcessedDataset, train_index: np.ndarray, validation_index: np.ndarray
+) -> dict[str, Any]:
     """Train vs. validation distribution drift per feature (mean/std/quantile).
 
     A model can look worse purely because the validation period's market
     regime differs from training, not because the model got worse - this is
-    the check that tells the two apart (spec Part 24).
+    the check that tells the two apart (spec Part 24). Deliberately compares
+    only ``train_index`` vs ``validation_index`` (never the held-out test
+    split) - this report exists to explain validation behaviour, and must
+    not require looking at test data to do it.
     """
     features: pd.DataFrame = dataset.features
-    if features.empty or len(validation_index) == 0:
-        return {"status": NOT_AVAILABLE, "reason": "empty dataset or validation slice"}
+    if features.empty or len(validation_index) == 0 or len(train_index) == 0:
+        return {"status": NOT_AVAILABLE, "reason": "empty dataset or train/validation slice"}
 
-    train_mask: np.ndarray = np.ones(len(features), dtype=bool)
-    train_mask[validation_index] = False
-    train_frame: pd.DataFrame = features[train_mask]
+    train_frame: pd.DataFrame = features.iloc[train_index]
     validation_frame: pd.DataFrame = features.iloc[validation_index]
     if train_frame.empty or validation_frame.empty:
         return {"status": NOT_AVAILABLE, "reason": "empty train or validation slice"}
@@ -537,22 +540,18 @@ async def build_report(
     errors: list[str] | None = None,
 ) -> dict[str, Any]:
     """Assemble the full ML diagnostic report for a just-completed training run."""
-    train_index, validation_index = dataset.train_validation_split(
-        settings.ml.validation_fraction, settings.ml.purge_bars
+    boundaries = dataset.split_boundaries(
+        train_months=settings.ml.train_months,
+        validation_months=settings.ml.validation_months,
+        test_months=settings.ml.test_months,
+        purge_bars=settings.ml.purge_bars,
+        timeframe_ms=settings.data.timeframe_ms,
     )
-    timestamps: pd.Series = (
-        dataset.metadata["timestamp"] if "timestamp" in dataset.metadata.columns else pd.Series(dtype="int64")
-    )
+    split = dataset.chronological_split(boundaries)
+    train_index, validation_index, test_index = split.train_index, split.validation_index, split.test_index
 
-    def _period(index: np.ndarray) -> dict[str, Any]:
-        if len(index) == 0 or timestamps.empty:
-            return {"start": None, "end": None, "rows": 0}
-        subset = timestamps.iloc[index]
-        return {
-            "start": int(subset.min()),
-            "end": int(subset.max()),
-            "rows": int(len(index)),
-        }
+    def _period(start_ms: int | None, end_ms: int | None, rows: int) -> dict[str, Any]:
+        return {"start": start_ms, "end": end_ms, "rows": rows}
 
     per_symbol_rows: dict[str, int] = (
         dataset.metadata["symbol"].value_counts().to_dict() if "symbol" in dataset.metadata.columns else {}
@@ -566,11 +565,20 @@ async def build_report(
             "timeframe": settings.data.timeframe,
             "symbols": list(dataset.symbols),
             "model_versions": ml.versions(),
-            "training_period": _period(train_index),
-            "validation_period": _period(validation_index),
-            "test_period": {"start": None, "end": None, "rows": 0, "note": "no held-out test split configured"},
+            "training_period": _period(split.train_start_ms, split.train_end_ms, int(len(train_index))),
+            "validation_period": _period(
+                split.validation_start_ms, split.validation_end_ms, int(len(validation_index))
+            ),
+            "test_period": {
+                **_period(split.test_start_ms, split.test_end_ms, int(len(test_index))),
+                "note": (
+                    "Held-out final backtest window - never used for training, early "
+                    "stopping, calibration, threshold selection or model selection."
+                ),
+            },
             "purge_bars": settings.ml.purge_bars,
-            "embargo_bars": 0,
+            "embargo_ms": boundaries.embargo_ms if boundaries is not None else 0,
+            "scaled_down_from_nominal_months": boundaries.scaled_down if boundaries is not None else False,
         },
         "dataset": {
             "total_candidate_rows": dataset.total_candidate_rows,
@@ -580,7 +588,7 @@ async def build_report(
             "duplicate_feature_rows": dataset.duplicate_feature_rows,
             "training_samples": int(len(train_index)),
             "validation_samples": int(len(validation_index)),
-            "test_samples": 0,
+            "test_samples": int(len(test_index)),
             "feature_count": len(dataset.feature_columns),
             "feature_names": list(dataset.feature_columns),
             "per_symbol_rows": {str(k): int(v) for k, v in per_symbol_rows.items()},
@@ -589,7 +597,7 @@ async def build_report(
         "features": {
             "statistics": _feature_statistics(dataset),
             "correlation": _feature_correlation(dataset),
-            "drift": _feature_drift(dataset, validation_index),
+            "drift": _feature_drift(dataset, train_index, validation_index),
             "microstructure_coverage": _microstructure_coverage(dataset),
         },
         "labels": {
