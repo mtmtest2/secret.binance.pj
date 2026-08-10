@@ -202,17 +202,15 @@ class BaseModelHead(ABC):
 
         destination: Path = path or self.artifact_path
         destination.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump(
-            {
-                "artifact_version": _ARTIFACT_VERSION,
-                "head": self.name,
-                "model": self._model,
-                "feature_columns": list(self._feature_columns),
-                "metadata": self._metadata,
-            },
-            destination,
-            compress=3,
-        )
+        payload: dict[str, Any] = {
+            "artifact_version": _ARTIFACT_VERSION,
+            "head": self.name,
+            "model": self._model,
+            "feature_columns": list(self._feature_columns),
+            "metadata": self._metadata,
+        }
+        payload.update(self._extra_artifact_state())
+        joblib.dump(payload, destination, compress=3)
         sidecar: Path = destination.with_suffix(".metrics.json")
         try:
             sidecar.write_text(
@@ -248,6 +246,7 @@ class BaseModelHead(ABC):
         columns: Sequence[str] = payload.get("feature_columns") or FEATURE_COLUMNS
         self._feature_columns = tuple(str(column) for column in columns)
         self._metadata = dict(payload.get("metadata") or {})
+        self._restore_extra_artifact_state(payload)
         _LOGGER.info(
             "Loaded %s model (trained_at=%s, rows=%s)",
             self.name,
@@ -255,6 +254,18 @@ class BaseModelHead(ABC):
             self._metadata.get("rows", "?"),
         )
         return True
+
+    def _extra_artifact_state(self) -> dict[str, Any]:
+        """Extra per-head state to persist in the joblib artifact.
+
+        Override in a head that owns state beyond ``self._model`` /
+        ``self._metadata`` (e.g. :class:`DirectionModel`'s joint-probability
+        calibrators) that must survive a save/load round-trip.
+        """
+        return {}
+
+    def _restore_extra_artifact_state(self, payload: dict[str, Any]) -> None:
+        """Restore state written by :meth:`_extra_artifact_state`. No-op by default."""
 
     # ------------------------------------------------------------------
     # Estimator factories
@@ -549,6 +560,19 @@ class DirectionModel(BaseModelHead):
     #: trust, so stage 2 is skipped and long/short are left at 50/50.
     _MIN_DIRECTION_TRAIN_ROWS: Final[int] = 50
 
+    def __init__(self, settings: Settings) -> None:
+        super().__init__(settings)
+        #: One isotonic regressor per class (LABEL_ORDER order), calibrating
+        #: the *joint* probability directly. ``None`` until training finds it
+        #: measurably improves log loss - see :meth:`_calibrate_cascade`.
+        self._joint_calibrators: list[Any] | None = None
+
+    def _extra_artifact_state(self) -> dict[str, Any]:
+        return {"joint_calibrators": self._joint_calibrators}
+
+    def _restore_extra_artifact_state(self, payload: dict[str, Any]) -> None:
+        self._joint_calibrators = payload.get("joint_calibrators")
+
     def train(self, dataset: ProcessedDataset) -> dict[str, Any]:
         """Fit the two-stage cascade on the pooled, purged dataset.
 
@@ -707,6 +731,18 @@ class DirectionModel(BaseModelHead):
         long_probability: float = trade_probability * long_given_trade
         short_probability: float = trade_probability * (1.0 - long_given_trade)
         no_trade_probability: float = max(0.0, 1.0 - long_probability - short_probability)
+
+        if self._joint_calibrators is not None:
+            # Adjusts only the *reported* joint distribution (R3's consistency
+            # check, audit logging) - trade_probability/direction_given_trade_
+            # probability below stay the raw per-stage values R1a/R1b gate on.
+            raw_matrix: np.ndarray = np.array([[long_probability, short_probability, no_trade_probability]])
+            calibrated_matrix: np.ndarray = self._apply_joint_calibrators(self._joint_calibrators, raw_matrix)
+            long_probability, short_probability, no_trade_probability = (
+                float(calibrated_matrix[0, LABEL_TO_INDEX[LabelClass.LONG_SUCCESS.value]]),
+                float(calibrated_matrix[0, LABEL_TO_INDEX[LabelClass.SHORT_SUCCESS.value]]),
+                float(calibrated_matrix[0, LABEL_TO_INDEX[LabelClass.NO_TRADE_OR_FAIL.value]]),
+            )
 
         return DirectionPrediction(
             probabilities={
@@ -881,8 +917,140 @@ class DirectionModel(BaseModelHead):
                     "reason": "not enough trade rows in validation for a calibration split",
                 }
 
-        calibration: dict[str, Any] = {"gate": gate_calibration, "direction": direction_calibration}
+        joint_calibration: dict[str, Any] = self._evaluate_joint_calibration(
+            gate_estimator, direction_estimator, validation_features, validation_target
+        )
+        self._joint_calibrators = (
+            self._calibrate_joint_probabilities(
+                self._combined_probabilities(gate_estimator, direction_estimator, validation_features),
+                validation_target.to_numpy(),
+                len(LABEL_ORDER),
+            )
+            if joint_calibration.get("status") == "AVAILABLE" and joint_calibration.get("improved")
+            else None
+        )
+
+        calibration: dict[str, Any] = {
+            "gate": gate_calibration,
+            "direction": direction_calibration,
+            "joint": joint_calibration,
+        }
         return calibration, model, production_calibration
+
+    def _evaluate_joint_calibration(
+        self,
+        gate_estimator: Any,
+        direction_estimator: Any | None,
+        validation_features: pd.DataFrame,
+        validation_target: pd.Series,
+        *,
+        min_calibration_rows: int = 50,
+        min_eval_rows: int = 20,
+    ) -> dict[str, Any]:
+        """Honestly measure whether calibrating the joint probability helps.
+
+        Mirrors :func:`module_c_ml.metrics.calibrate_classifier`'s temporal
+        half-split discipline (fit on the earlier half, score on the later
+        one) but operates on the *joint* long/short/no_trade matrix the
+        two-stage cascade produces, since there is no single sklearn
+        estimator here to hand to that function.
+        """
+        n_classes: int = len(LABEL_ORDER)
+        midpoint: int = len(validation_features) // 2
+        calib_probs: np.ndarray = self._combined_probabilities(
+            gate_estimator, direction_estimator, validation_features.iloc[:midpoint]
+        )
+        eval_probs: np.ndarray = self._combined_probabilities(
+            gate_estimator, direction_estimator, validation_features.iloc[midpoint:]
+        )
+        calib_target: np.ndarray = validation_target.iloc[:midpoint].to_numpy()
+        eval_target: np.ndarray = validation_target.iloc[midpoint:].to_numpy()
+
+        if len(calib_probs) < min_calibration_rows or len(eval_probs) < min_eval_rows:
+            return {
+                "status": "NOT_AVAILABLE",
+                "reason": (
+                    f"insufficient rows for a temporally safe calibration split "
+                    f"(calibration={len(calib_probs)}, eval={len(eval_probs)})"
+                ),
+            }
+
+        from sklearn.metrics import log_loss
+
+        labels: list[int] = list(range(n_classes))
+        one_hot_eval: np.ndarray = np.eye(n_classes)[eval_target]
+        raw_brier: float = float(np.mean(np.sum((eval_probs - one_hot_eval) ** 2, axis=1)))
+        try:
+            raw_logloss: float = float(log_loss(eval_target, eval_probs, labels=labels))
+        except ValueError:  # pragma: no cover - degenerate eval slice
+            raw_logloss = float("nan")
+
+        calibrators: list[Any] = self._calibrate_joint_probabilities(calib_probs, calib_target, n_classes)
+        calibrated_eval_probs: np.ndarray = self._apply_joint_calibrators(calibrators, eval_probs)
+        calibrated_brier: float = float(
+            np.mean(np.sum((calibrated_eval_probs - one_hot_eval) ** 2, axis=1))
+        )
+        try:
+            calibrated_logloss: float = float(log_loss(eval_target, calibrated_eval_probs, labels=labels))
+        except ValueError:  # pragma: no cover - degenerate eval slice
+            calibrated_logloss = float("nan")
+
+        improved: bool = calibrated_logloss < raw_logloss
+        return {
+            "status": "AVAILABLE",
+            "method": "isotonic_per_class",
+            "calibration_rows": int(len(calib_probs)),
+            "eval_rows": int(len(eval_probs)),
+            "brier_score_raw": raw_brier,
+            "brier_score_calibrated": calibrated_brier,
+            "log_loss_raw": raw_logloss,
+            "log_loss_calibrated": calibrated_logloss,
+            "improved": bool(improved),
+            "recommended_for_production": bool(improved),
+            "note": (
+                "Calibrates the joint long/short/no_trade probability directly, "
+                "on top of whatever per-stage calibration already happened above - "
+                "corrects residual miscalibration that the product of two "
+                "independently-calibrated probabilities can still leave behind, "
+                "which per-stage calibration alone cannot see. Applied only to "
+                "the reported `probabilities` dict at inference (R3's consistency "
+                "check, audit logging); trade_probability and "
+                "direction_given_trade_probability, which R1a/R1b gate on, are "
+                "never touched by this."
+            ),
+        }
+
+    @staticmethod
+    def _calibrate_joint_probabilities(
+        calib_raw_probs: np.ndarray, calib_target: np.ndarray, n_classes: int
+    ) -> list[Any]:
+        """One isotonic regressor per class, fit directly on the joint
+        long/short/no_trade probability vs. the true one-hot outcome - corrects
+        residual miscalibration the product of two per-stage-calibrated
+        probabilities leaves behind, which per-stage calibration alone cannot see.
+        """
+        from sklearn.isotonic import IsotonicRegression
+
+        calibrators: list[Any] = []
+        for class_index in range(n_classes):
+            y_binary = (calib_target == class_index).astype(float)
+            iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+            iso.fit(calib_raw_probs[:, class_index], y_binary)
+            calibrators.append(iso)
+        return calibrators
+
+    @staticmethod
+    def _apply_joint_calibrators(calibrators: list[Any], raw_probs: np.ndarray) -> np.ndarray:
+        """Map each class column through its isotonic calibrator and renormalise to 1."""
+        calibrated: np.ndarray = np.column_stack(
+            [
+                calibrator.predict(raw_probs[:, class_index])
+                for class_index, calibrator in enumerate(calibrators)
+            ]
+        )
+        row_sums: np.ndarray = calibrated.sum(axis=1, keepdims=True)
+        row_sums = np.where(row_sums <= 0.0, 1.0, row_sums)
+        return calibrated / row_sums
 
     def walk_forward(self, dataset: ProcessedDataset, n_folds: int = 4) -> dict[str, Any]:
         """Expanding-window walk-forward evaluation across multiple rolling folds.
