@@ -103,6 +103,54 @@ _RELAXED_DECISION_SETTINGS: Final[DecisionSettings] = DecisionSettings(
 )
 
 
+def _diagnostic_backtest_window(
+    *, oos_validation_rows: int, diagnostic_backtest_bars: int, symbol_count: int
+) -> tuple[int, dict[str, Any]]:
+    """Compute the diagnostic backtest's per-symbol replay depth and the
+    genuinely-out-of-sample-vs-in-sample split for that window.
+
+    Pure and side-effect free (no DB/network) so it is directly unit
+    testable - see ``TradingSystem._run_validation_backtest`` for the caller
+    and its docstring for why this split matters and must never be hidden.
+
+    Returns ``(diagnostic_bars_per_symbol, oos_disclosure)``.
+    """
+    if symbol_count <= 0:
+        raise ValueError("symbol_count must be positive")
+    # Genuinely out-of-sample tail, per symbol (the model's own
+    # train/validation split boundary), spread evenly like validation_index
+    # itself is spread across the combined multi-symbol dataset.
+    oos_bars_per_symbol: int = -(-oos_validation_rows // symbol_count)  # ceil
+    # Target diagnostic replay length, per symbol - decoupled from the OOS
+    # tail above, see MLSettings.diagnostic_backtest_bars.
+    diagnostic_bars_per_symbol: int = -(-diagnostic_backtest_bars // symbol_count)  # ceil
+
+    out_of_sample_bars_per_symbol: int = min(oos_bars_per_symbol, diagnostic_bars_per_symbol)
+    in_sample_bars_per_symbol: int = max(
+        diagnostic_bars_per_symbol - out_of_sample_bars_per_symbol, 0
+    )
+    oos_fraction: float = (
+        out_of_sample_bars_per_symbol / diagnostic_bars_per_symbol
+        if diagnostic_bars_per_symbol > 0
+        else 0.0
+    )
+    oos_disclosure: dict[str, Any] = {
+        "note": (
+            "Only the out_of_sample_bars_per_symbol portion of this replay window "
+            "was never seen in training (the model's own validation_fraction tail, "
+            "purged by purge_bars). The remaining in_sample_bars_per_symbol bars "
+            "overlap the training set and will tend to read better than genuine "
+            "live performance - treat this backtest as a blend, not a clean "
+            "holdout, whenever oos_fraction < 1.0."
+        ),
+        "diagnostic_backtest_bars_per_symbol": diagnostic_bars_per_symbol,
+        "out_of_sample_bars_per_symbol": out_of_sample_bars_per_symbol,
+        "in_sample_bars_per_symbol": in_sample_bars_per_symbol,
+        "oos_fraction": oos_fraction,
+    }
+    return diagnostic_bars_per_symbol, oos_disclosure
+
+
 def _headline_metrics(report: dict[str, Any]) -> dict[str, Any]:
     """Small, fixed-size summary of a training report for frequent polling.
 
@@ -381,10 +429,28 @@ class TradingSystem:
         The ML diagnostic report's trading-level fields (win rate, profit
         factor, expectancy, max drawdown, Sharpe) were previously always
         ``NOT_AVAILABLE`` because nothing ever ran a backtest and passed it
-        in. Bounding the replay to roughly the same tail window the four
-        heads were validated on - rather than the full multi-year history -
-        keeps it genuinely out-of-sample and fast enough to run on every
-        training cycle (the bar-by-bar simulator is O(bars x symbols)).
+        in. The replay window's length is controlled by
+        ``MLSettings.diagnostic_backtest_bars`` (default: a full year of 5m
+        bars, 105_120) - a deliberately separate, explicitly-named setting
+        from ``validation_fraction`` (see its docstring). Decoupling the two
+        lets the diagnostic backtest span a full year for a large enough
+        sample size, independent of how large the model's own OOS validation
+        tail happens to be.
+
+        Honesty requirement - READ BEFORE TRUSTING THIS NUMBER: only the
+        portion of the replay window that falls inside the model's actual
+        validation split (``validation_fraction``'s tail, purged by
+        ``purge_bars``) is genuinely out-of-sample. When
+        ``diagnostic_backtest_bars`` exceeds that validation tail's bar
+        count (e.g. a full-year window against ``validation_fraction=0.2``
+        over a 1.5-year collection, whose OOS tail is only ~0.3 years), the
+        remainder of the replay overlaps rows the model was actually trained
+        on - an in-sample replay, not a real holdout test, that will tend to
+        read *better* than genuine live performance. This function computes
+        and returns that split explicitly (see ``oos_disclosure`` below) so
+        it is measured and logged on every run, not silently implied away by
+        a big, good-looking window. Treat metrics from the in-sample portion
+        as inflated; only the OOS-tail portion is a trustworthy estimate.
 
         Caveat, stated honestly rather than hidden: when the Direction/Entry
         heads' production isotonic calibrators are wired in
@@ -397,14 +463,16 @@ class TradingSystem:
         Returns ``(strict, relaxed)``: ``strict`` replays with the live
         ``DecisionSettings`` and is the number that matters operationally. A
         highly selective cascade (min direction confidence, entry
-        probability, reward/risk floor, ...) combined with a single ~8-week
-        OOS window routinely leaves it with a single-digit trade count, which
-        is too small for its own win-rate/profit-factor/Sharpe to mean
-        anything (see ``module_f_panel.diagnostics._backtest_reliability``).
-        ``relaxed`` re-runs the *same* window with those thresholds loosened
-        (never the live config) purely to see whether the strategy's edge is
+        probability, reward/risk floor, ...) can still leave it with a
+        single-digit trade count, which is too small for its own
+        win-rate/profit-factor/Sharpe to mean anything (see
+        ``module_f_panel.diagnostics._backtest_reliability``). ``relaxed``
+        re-runs the *same* window with those thresholds loosened (never the
+        live config) purely to see whether the strategy's edge is
         directionally visible at all with a larger trade count - it is a
         diagnostic reference only, never a performance estimate to trade on.
+        Both reports carry identical ``oos_disclosure`` metadata since both
+        replay the same window.
 
         Never raises: a backtest failure must not block training or the
         diagnostic report it enriches.
@@ -419,9 +487,23 @@ class TradingSystem:
                 return None, None
 
             symbols: list[str] = list(dataset.symbols)
-            validation_bars_per_symbol: int = -(-len(validation_index) // len(symbols))  # ceil
             warmup_padding: int = self.features.engineer.minimum_rows()
-            max_candles: int = validation_bars_per_symbol + warmup_padding
+            diagnostic_bars_per_symbol, oos_disclosure = _diagnostic_backtest_window(
+                oos_validation_rows=len(validation_index),
+                diagnostic_backtest_bars=self.settings.ml.diagnostic_backtest_bars,
+                symbol_count=len(symbols),
+            )
+            max_candles: int = diagnostic_bars_per_symbol + warmup_padding
+            oos_fraction: float = oos_disclosure["oos_fraction"]
+            if oos_fraction < 1.0:
+                _LOGGER.warning(
+                    "Diagnostic backtest window (%d bars/symbol) exceeds the genuinely "
+                    "out-of-sample validation tail (%d bars/symbol) - only %.0f%% of the "
+                    "replay is true holdout; the rest overlaps training data.",
+                    diagnostic_bars_per_symbol,
+                    oos_disclosure["out_of_sample_bars_per_symbol"],
+                    oos_fraction * 100,
+                )
 
             backtester = Backtester(
                 self.settings, self.database, self.features, self.ml, self.decisions
@@ -429,6 +511,7 @@ class TradingSystem:
             strict: BacktestReport = await backtester.run(
                 symbols=symbols, max_candles=max_candles, warmup_bars=warmup_padding
             )
+            strict.oos_disclosure = oos_disclosure
 
             relaxed: BacktestReport | None = None
             try:
@@ -442,6 +525,7 @@ class TradingSystem:
                 relaxed = await relaxed_backtester.run(
                     symbols=symbols, max_candles=max_candles, warmup_bars=warmup_padding
                 )
+                relaxed.oos_disclosure = oos_disclosure
             except Exception as error:  # noqa: BLE001 - diagnostic-only pass, never fatal
                 _LOGGER.error("Relaxed diagnostic backtest failed: %s", error, exc_info=True)
 

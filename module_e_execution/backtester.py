@@ -71,6 +71,12 @@ class BacktestReport:
     #: count), so "why were 99.9% of signals rejected" has a real, measured
     #: answer instead of a guess - see ``module_c_ml.decision_engine.Rule``.
     rejection_breakdown: dict[str, int] = field(default_factory=dict)
+    #: Set by ``TradingSystem._run_validation_backtest`` (never by ``run()``
+    #: itself, which has no notion of a train/validation split) to disclose
+    #: what fraction of this replay window is genuinely out-of-sample versus
+    #: overlapping the model's own training data. ``None`` for a backtest run
+    #: outside that diagnostic path (e.g. the plain CLI ``backtest`` command).
+    oos_disclosure: dict[str, Any] | None = field(default=None)
 
     def summary(self) -> str:
         """Multi-line, human-readable report for logs and the CLI."""
@@ -120,6 +126,7 @@ class BacktestReport:
             "signals_generated": self.signals_generated,
             "signals_rejected": self.signals_rejected,
             "rejection_breakdown": self.rejection_breakdown,
+            "oos_disclosure": self.oos_disclosure,
             "trades": self.trades[-500:],
             "equity_curve": self.equity_curve[-2_000:],
         }
