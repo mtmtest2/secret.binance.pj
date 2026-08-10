@@ -85,16 +85,18 @@ _MAX_STORED_CYCLE_TIMINGS: Final[int] = 500
 
 #: Decision-cascade thresholds for the *diagnostic-only* relaxed backtest run
 #: by ``TradingSystem._run_validation_backtest`` - never used for real trading.
-#: The live ``DecisionSettings`` defaults (min_direction_confidence=0.70,
-#: min_entry_probability=0.55, ...) are intentionally strict and, combined
-#: with a single ~8-week out-of-sample window, routinely leave the strict
-#: backtest with a single-digit trade count - too small for win rate/profit
-#: factor/Sharpe to mean anything. This loosened copy replays the *same*
-#: window to check whether the strategy's edge is visible at all with a
-#: larger sample, without ever touching the thresholds that gate real orders.
+#: The live ``DecisionSettings`` defaults (min_gate_confidence=0.55,
+#: min_direction_given_trade_confidence=0.60, min_entry_probability=0.55, ...)
+#: are intentionally strict and, combined with a single ~8-week out-of-sample
+#: window, routinely leave the strict backtest with a single-digit trade
+#: count - too small for win rate/profit factor/Sharpe to mean anything. This
+#: loosened copy replays the *same* window to check whether the strategy's
+#: edge is visible at all with a larger sample, without ever touching the
+#: thresholds that gate real orders.
 _RELAXED_DECISION_SETTINGS: Final[DecisionSettings] = DecisionSettings(
     min_direction_confidence=0.55,
-    min_direction_margin=0.05,
+    min_gate_confidence=0.50,
+    min_direction_given_trade_confidence=0.52,
     max_no_trade_probability=0.50,
     min_entry_probability=0.50,
     min_reward_risk_ratio=1.0,
@@ -471,6 +473,13 @@ class TradingSystem:
         self.phase = SystemPhase.TRAINING
         self.progress.begin(SystemPhase.TRAINING, "building dataset", f"retraining ({reason})")
         self.progress.advance(0, 4, "engineering features and labels")
+
+        # Idempotent - only fetches the missing tail - but must run again here
+        # regardless of what `_setup_collect` already did upstream, so that any
+        # future call path that reaches `_setup_train` without first going
+        # through `_setup_collect` still gets funding_rate/open_interest/
+        # long_short_ratio/taker_buy_sell_ratio history before training reads it.
+        await self.pipeline.backfill_futures_metrics(symbols)
 
         dataset: ProcessedDataset = await self.processor.build_training_dataset(symbols=symbols)
         if dataset.is_empty:
@@ -1221,6 +1230,11 @@ class TradingSystem:
         """Build the training dataset and fit all four heads."""
         await self.database.initialize()
         symbols: list[str] = await self._resolve_cli_universe()
+        # `train` is a standalone CLI path - it never runs `_setup_collect`, so
+        # without this the funding_rate/open_interest/long_short_ratio/
+        # taker_buy_sell_ratio history stays at its neutral default no matter
+        # how many times the model is retrained from this entry point.
+        await self.pipeline.backfill_futures_metrics(symbols)
         dataset: ProcessedDataset = await self.processor.build_training_dataset(
             symbols=symbols, max_candles_per_symbol=max_candles
         )
