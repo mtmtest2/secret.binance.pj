@@ -596,6 +596,10 @@ class DirectionModel(BaseModelHead):
         calibration: dict[str, Any] = {"status": "NOT_AVAILABLE", "reason": "no validation rows"}
         per_symbol: dict[str, Any] = {}
         production_calibration: dict[str, str] = {"gate": "raw", "direction": "raw"}
+        gate_sweep: list[dict[str, Any]] = []
+        recommended_gate_threshold: float = self._settings.decision.min_gate_confidence
+        direction_sweep: list[dict[str, Any]] = []
+        recommended_direction_threshold: float = self._settings.decision.min_direction_given_trade_confidence
 
         if not validation_features.empty:
             probabilities: np.ndarray = self._combined_probabilities(
@@ -616,6 +620,37 @@ class DirectionModel(BaseModelHead):
                     validation_target, probabilities.argmax(axis=1), symbols_validation
                 )
 
+            # Auto-tune recommended gate/direction thresholds from the model's
+            # own validation sweep, the same way EntryModel already does for
+            # its decision threshold - reported for the operator to review,
+            # never auto-applied to the live DecisionSettings.
+            no_trade_index: int = LABEL_TO_INDEX[LabelClass.NO_TRADE_OR_FAIL.value]
+            long_index: int = LABEL_TO_INDEX[LabelClass.LONG_SUCCESS.value]
+            is_trade_validation: pd.Series = (validation_target != no_trade_index).astype(int)
+            gate_probabilities: np.ndarray = np.asarray(
+                gate_estimator.predict_proba(validation_features)
+            )[:, -1]
+            gate_sweep = ml_metrics.gate_threshold_sweep(is_trade_validation, gate_probabilities)
+            recommended_gate_threshold = EntryModel._select_recommended_threshold(
+                gate_sweep, self._settings.decision.min_gate_confidence
+            )
+
+            trade_mask_validation: pd.Series = is_trade_validation == 1
+            direction_validation_features: pd.DataFrame = validation_features[trade_mask_validation]
+            if direction_estimator is not None and not direction_validation_features.empty:
+                long_given_trade_validation: np.ndarray = np.asarray(
+                    direction_estimator.predict_proba(direction_validation_features)
+                )[:, -1]
+                is_long_validation: pd.Series = (
+                    validation_target[trade_mask_validation] == long_index
+                ).astype(int)
+                direction_sweep = ml_metrics.direction_threshold_sweep(
+                    is_long_validation, long_given_trade_validation
+                )
+                recommended_direction_threshold = EntryModel._select_recommended_threshold(
+                    direction_sweep, self._settings.decision.min_direction_given_trade_confidence
+                )
+
             calibration, self._model, production_calibration = self._calibrate_cascade(
                 gate_estimator, direction_estimator, validation_features, validation_target
             )
@@ -634,6 +669,10 @@ class DirectionModel(BaseModelHead):
             "production_calibration": production_calibration,
             "per_symbol": per_symbol,
             "architecture": "two_stage_cascade",
+            "gate_threshold_sweep": gate_sweep,
+            "recommended_gate_threshold": recommended_gate_threshold,
+            "direction_threshold_sweep": direction_sweep,
+            "recommended_direction_threshold": recommended_direction_threshold,
         }
         headline: dict[str, Any] = {
             key: full_metrics[key]
