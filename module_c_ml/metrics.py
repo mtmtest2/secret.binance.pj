@@ -252,6 +252,43 @@ def entry_threshold_sweep(
     return rows
 
 
+def gate_threshold_sweep(
+    target: pd.Series,
+    probabilities: np.ndarray,
+    thresholds: Sequence[float] = CONFIDENCE_THRESHOLDS,
+    min_signal_sample_size: int = 20,
+) -> list[dict[str, Any]]:
+    """Precision/recall/F1/signal-count at each candidate gate threshold.
+
+    Same metric computation as :func:`entry_threshold_sweep` (see there for
+    why the trading-level fields are :data:`NOT_AVAILABLE`), applied to the
+    Direction model's trade-vs-no-trade gate stage instead of the Entry
+    model: ``target`` is ground truth (1 = trade, 0 = no-trade, i.e. whether
+    the row's true label is anything other than NO_TRADE_OR_FAIL) and
+    ``probabilities`` is the gate's own raw ``trade_probability`` per row -
+    never the multiplied joint probability.
+    """
+    return entry_threshold_sweep(target, probabilities, thresholds, min_signal_sample_size)
+
+
+def direction_threshold_sweep(
+    target: pd.Series,
+    probabilities: np.ndarray,
+    thresholds: Sequence[float] = CONFIDENCE_THRESHOLDS,
+    min_signal_sample_size: int = 20,
+) -> list[dict[str, Any]]:
+    """Precision/recall/F1/signal-count at each candidate direction-given-trade
+    threshold.
+
+    Same metric computation as :func:`entry_threshold_sweep`, applied to the
+    long-vs-short stage conditional on the gate having already said "trade":
+    ``target`` is ground truth restricted to true-trade rows (1 = LONG,
+    0 = SHORT) and ``probabilities`` is ``direction_given_trade_probability``
+    per row, already restricted to those same true-trade rows.
+    """
+    return entry_threshold_sweep(target, probabilities, thresholds, min_signal_sample_size)
+
+
 # ---------------------------------------------------------------------------
 # Regression (Exit targets, Risk)
 # ---------------------------------------------------------------------------
