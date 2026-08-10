@@ -64,6 +64,14 @@ class DirectionPrediction(BaseModel):
     )
     source: ModelSource = Field(default=ModelSource.TRAINED)
 
+    #: Raw two-stage cascade outputs (NOT the multiplied joint probability
+    #: in `probabilities`). Lets the Decision Engine gate "is this bar worth
+    #: trading" and "which way, how sure" independently, instead of
+    #: requiring their product to clear one bar - which silently discards a
+    #: confident direction call whenever the gate alone reads under 0.5.
+    trade_probability: float = Field(default=0.5, ge=0.0, le=1.0)
+    direction_given_trade_probability: float = Field(default=0.5, ge=0.0, le=1.0)
+
     @field_validator("probabilities")
     @classmethod
     def _validate_distribution(cls, value: dict[str, float]) -> dict[str, float]:

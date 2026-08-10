@@ -676,6 +676,8 @@ class DirectionModel(BaseModelHead):
                 LabelClass.NO_TRADE_OR_FAIL.value: no_trade_probability,
             },
             source=ModelSource.TRAINED,
+            trade_probability=trade_probability,
+            direction_given_trade_probability=long_given_trade,
         )
 
     # ------------------------------------------------------------------
@@ -978,6 +980,8 @@ class DirectionModel(BaseModelHead):
                 LabelClass.NO_TRADE_OR_FAIL.value: max(1e-6, 1.0 - long_mass - short_mass),
             },
             source=ModelSource.HEURISTIC,
+            trade_probability=trade_mass,
+            direction_given_trade_probability=directional,
         )
 
 
