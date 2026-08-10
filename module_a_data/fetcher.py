@@ -50,6 +50,16 @@ PERMANENT_ERRORS: Final[tuple[type[BaseException], ...]] = (
 )
 
 
+def _safe_int(value: Any) -> int | None:
+    """Coerce ``value`` to ``int``, returning ``None`` (never a guessed 0) on failure."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class BinanceDataFetcher:
     """Async gateway to every Binance USDT-M market-data endpoint we consume.
 
@@ -623,6 +633,215 @@ class BinanceDataFetcher:
             else:
                 sell_volume += quote
         return (buy_volume, sell_volume)
+
+    # ------------------------------------------------------------------
+    # Historical futures-metrics backfill
+    # ------------------------------------------------------------------
+    # ``fetch_futures_metrics`` above only ever captures "now" - it is called
+    # once per live 5-minute cycle, so a freshly-bootstrapped deployment has
+    # essentially no real history for funding/OI/positioning under a long
+    # training window and every micro-structure feature derived from them
+    # sits at its neutral default for nearly every historical row. Order-book
+    # depth has no historical endpoint at all on Binance (a snapshot is only
+    # ever "now"), but funding rate, open interest and the positioning ratios
+    # *do* have dedicated history endpoints and can be backfilled - this
+    # section does that, loudly logging when a source cannot deliver data
+    # instead of silently leaving the caller with defaults.
+
+    async def fetch_funding_rate_history(
+        self, symbol: str, start_ms: int, end_ms: int
+    ) -> list[tuple[int, float]]:
+        """Backfill funding-rate history over ``[start_ms, end_ms]``.
+
+        Binance retains funding-rate history for the entire life of a
+        contract via ``/fapi/v1/fundingRate`` (unlike open interest and the
+        positioning ratios below, which are capped to a recent rolling
+        window) - this is the one micro-structure/derivatives source that can
+        genuinely be recovered across a multi-month training window.
+        """
+        await self.load_markets()
+        market_id: str = self._market_id(symbol)
+        collected: list[tuple[int, float]] = []
+        cursor: int = start_ms
+        limit: int = 1_000
+        guard: int = 0
+        max_pages: int = 500
+        while cursor <= end_ms and guard < max_pages:
+            guard += 1
+            params: dict[str, Any] = {
+                "symbol": market_id,
+                "startTime": cursor,
+                "endTime": end_ms,
+                "limit": limit,
+            }
+            try:
+                payload: Any = await self._call(
+                    f"fetch_funding_rate_history[{symbol}]",
+                    lambda: self._exchange.fapiPublicGetFundingRate(params),
+                )
+            except DataFetchError as error:
+                _LOGGER.error(
+                    "Funding-rate history backfill aborted for %s at cursor %d: %s",
+                    symbol,
+                    cursor,
+                    error,
+                )
+                break
+            if not isinstance(payload, list) or not payload:
+                break
+            for row in payload:
+                timestamp: int | None = _safe_int(row.get("fundingTime"))
+                if timestamp is None:
+                    continue
+                rate: float = safe_float(row.get("fundingRate"), 0.0)
+                if abs(rate) > 0.05:
+                    # Same implausibility guard as the live path - drop, don't poison.
+                    continue
+                collected.append((timestamp, rate))
+            last_timestamp: int | None = _safe_int(payload[-1].get("fundingTime"))
+            if last_timestamp is None or last_timestamp < cursor:
+                break
+            next_cursor: int = last_timestamp + 1
+            if next_cursor <= cursor:
+                break
+            cursor = next_cursor
+            if len(payload) < limit:
+                break
+        if not collected:
+            _LOGGER.warning(
+                "No funding-rate history recovered for %s in [%d, %d] - funding_rate "
+                "will stay at its neutral default for this window",
+                symbol,
+                start_ms,
+                end_ms,
+            )
+        return collected
+
+    async def fetch_open_interest_history(
+        self, symbol: str, start_ms: int, end_ms: int
+    ) -> list[tuple[int, float]]:
+        """Backfill open interest via ``futures/data/openInterestHist``.
+
+        Binance only retains ~30 days of history for this endpoint - a
+        request reaching further back simply returns fewer rows than the
+        window implies, which is logged, not swallowed.
+        """
+        return await self._fetch_futures_data_series(
+            symbol,
+            endpoint_name="fapiDataGetOpenInterestHist",
+            field="sumOpenInterest",
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
+
+    async def fetch_long_short_ratio_history(
+        self, symbol: str, start_ms: int, end_ms: int
+    ) -> list[tuple[int, float]]:
+        """Backfill the global long/short account ratio (~30-day retention)."""
+        return await self._fetch_futures_data_series(
+            symbol,
+            endpoint_name="fapiDataGetGlobalLongShortAccountRatio",
+            field="longShortRatio",
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
+
+    async def fetch_taker_ratio_history(
+        self, symbol: str, start_ms: int, end_ms: int
+    ) -> list[tuple[int, float]]:
+        """Backfill the taker buy/sell volume ratio (~30-day retention)."""
+        return await self._fetch_futures_data_series(
+            symbol,
+            endpoint_name="fapiDataGetTakerlongshortRatio",
+            field="buySellRatio",
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
+
+    async def _fetch_futures_data_series(
+        self,
+        symbol: str,
+        endpoint_name: str,
+        field: str,
+        start_ms: int,
+        end_ms: int,
+    ) -> list[tuple[int, float]]:
+        """Paginate one ``futures/data/*`` aggregated series over a time range.
+
+        These endpoints (open interest, long/short ratios, taker ratio) are
+        documented by Binance as retaining only the most recent ~30 days -
+        requesting further back is not a bug, it genuinely has nothing to
+        return, so an empty page ends pagination cleanly rather than raising.
+        A missing/unsupported endpoint (older ccxt build) *is* logged loudly,
+        since that would otherwise look identical to "no data in range".
+        """
+        await self.load_markets()
+        method: Any = getattr(self._exchange, endpoint_name, None)
+        if method is None:
+            _LOGGER.error(
+                "%s is not exposed by the installed ccxt build - cannot backfill "
+                "%s history for %s; it will stay at its neutral default",
+                endpoint_name,
+                field,
+                symbol,
+            )
+            return []
+
+        market_id: str = self._market_id(symbol)
+        collected: list[tuple[int, float]] = []
+        cursor: int = start_ms
+        limit: int = 500
+        guard: int = 0
+        max_pages: int = 500
+        while cursor <= end_ms and guard < max_pages:
+            guard += 1
+            params: dict[str, Any] = {
+                "symbol": market_id,
+                "period": self._timeframe,
+                "startTime": cursor,
+                "endTime": end_ms,
+                "limit": limit,
+            }
+            try:
+                payload: Any = await self._call(
+                    f"{endpoint_name}[{market_id}]", lambda: method(params)
+                )
+            except DataFetchError as error:
+                _LOGGER.warning(
+                    "%s backfill interrupted for %s at cursor %d: %s",
+                    endpoint_name,
+                    symbol,
+                    cursor,
+                    error,
+                )
+                break
+            if not isinstance(payload, list) or not payload:
+                break
+            for row in payload:
+                timestamp: int | None = _safe_int(row.get("timestamp"))
+                if timestamp is None:
+                    continue
+                value: float = safe_float(row.get(field), 0.0)
+                collected.append((timestamp, value))
+            last_timestamp: int | None = _safe_int(payload[-1].get("timestamp"))
+            if last_timestamp is None or last_timestamp < cursor:
+                break
+            next_cursor: int = last_timestamp + 1
+            if next_cursor <= cursor:
+                break
+            cursor = next_cursor
+            if len(payload) < limit:
+                break
+        if not collected:
+            _LOGGER.warning(
+                "%s returned no rows for %s in [%d, %d] - likely outside Binance's "
+                "retention window for this endpoint (~30 days)",
+                endpoint_name,
+                symbol,
+                start_ms,
+                end_ms,
+            )
+        return collected
 
     # ------------------------------------------------------------------
     # Misc

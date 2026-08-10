@@ -320,6 +320,66 @@ class DatabaseHandler:
                 "futures metrics upsert failed", symbol=metrics.symbol, reason=str(error)
             ) from error
 
+    async def upsert_futures_metrics_batch(self, metrics: Sequence[FuturesMetrics]) -> int:
+        """Bulk-upsert historical futures metrics (funding/OI/positioning backfill).
+
+        Mirrors :meth:`upsert_candles`'s batching: a multi-month backfill across
+        29 symbols can easily produce tens of thousands of rows, well past
+        SQLite's bound-parameter ceiling for a single statement.
+        """
+        if not metrics:
+            return 0
+
+        payload: list[dict[str, Any]] = [
+            {
+                "symbol": item.symbol,
+                "timestamp": item.timestamp,
+                "funding_rate": item.funding_rate,
+                "next_funding_time": item.next_funding_time,
+                "open_interest": item.open_interest,
+                "open_interest_value": item.open_interest_value,
+                "long_short_ratio": item.long_short_ratio,
+                "top_trader_long_short_ratio": item.top_trader_long_short_ratio,
+                "taker_buy_sell_ratio": item.taker_buy_sell_ratio,
+                "liquidation_buy_volume": item.liquidation_buy_volume,
+                "liquidation_sell_volume": item.liquidation_sell_volume,
+                "mark_price": item.mark_price,
+                "index_price": item.index_price,
+            }
+            for item in metrics
+        ]
+        batch_rows: int = _detect_upsert_batch_rows(len(payload[0]))
+
+        try:
+            async with self._write_lock, self._factory()() as session:
+                async with session.begin():
+                    for batch in chunked(payload, batch_rows):
+                        statement = sqlite_insert(FuturesMetricsRow).values(batch)
+                        statement = statement.on_conflict_do_update(
+                            index_elements=[FuturesMetricsRow.symbol, FuturesMetricsRow.timestamp],
+                            set_={
+                                key: statement.excluded[key]
+                                for key in batch[0]
+                                if key not in ("symbol", "timestamp")
+                            },
+                        )
+                        await session.execute(statement)
+        except SQLAlchemyError as error:
+            raise DatabaseError(
+                "futures metrics batch upsert failed", rows=len(payload), reason=str(error)
+            ) from error
+        return len(payload)
+
+    async def latest_futures_metrics_timestamp(self, symbol: str) -> int | None:
+        """Return the newest stored futures-metrics timestamp for ``symbol``."""
+        query: Select[Any] = select(func.max(FuturesMetricsRow.timestamp)).where(
+            FuturesMetricsRow.symbol == symbol
+        )
+        async with self._factory()() as session:
+            result: Result[Any] = await session.execute(query)
+            value: Any = result.scalar_one_or_none()
+        return int(value) if value is not None else None
+
     # ------------------------------------------------------------------
     # Market-data reads
     # ------------------------------------------------------------------

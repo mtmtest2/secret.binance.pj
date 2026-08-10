@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 from typing import Callable, Final
 
+import pandas as pd
+
 from config.settings import Settings
 from core.exceptions import DataFetchError, DataIntegrityError, DatabaseError
 from core.logger import get_logger
@@ -161,6 +163,183 @@ class DataPipeline:
             len(written_by_symbol),
         )
         return written_by_symbol
+
+    async def backfill_futures_metrics(
+        self,
+        symbols: list[str] | None = None,
+        progress: ProgressCallback | None = None,
+    ) -> dict[str, int]:
+        """Backfill funding-rate/open-interest/positioning history for training.
+
+        ``run_cycle`` only ever captures a live "now" snapshot, once per
+        5-minute cycle - a freshly-bootstrapped deployment therefore has
+        almost no real ``futures_metrics`` rows under a multi-month OHLCV
+        backfill window, so every feature derived from them (``funding_rate``,
+        ``open_interest_change``, ``long_short_ratio``, ``taker_buy_sell_ratio``)
+        sits at its neutral default for nearly every training row. This
+        recovers as much real history as Binance actually retains: funding
+        rate has full history since contract inception; open interest and the
+        positioning ratios are capped to roughly the last 30 days on
+        Binance's side (an exchange limitation, not something this code can
+        work around) - see :meth:`module_a_data.fetcher.BinanceDataFetcher.
+        fetch_open_interest_history` and friends for the per-source detail.
+
+        Order-book depth (``ob_imbalance``, ``ob_spread_bps``) and liquidation
+        flow (``liquidation_imbalance``) have no historical endpoint on
+        Binance at all - a snapshot is only ever "now". Those can only
+        accumulate real data from here forward via :meth:`run_cycle`, which
+        already persists a genuine snapshot every cycle; there is nothing to
+        backfill for them.
+        """
+        universe: list[str] = symbols if symbols is not None else list(self._settings.data.symbols)
+        timeframe_ms: int = self._settings.data.timeframe_ms
+        target_bars: int = self._settings.data.history_bootstrap_candles
+        end_ms: int = last_closed_candle_open_ms(timeframe_ms)
+        completed: int = 0
+        total: int = len(universe)
+
+        async def _backfill_one(symbol: str) -> tuple[str, int]:
+            nonlocal completed
+            async with self._symbol_semaphore:
+                try:
+                    newest: int | None = await self._db.latest_futures_metrics_timestamp(symbol)
+                    default_start: int = end_ms - target_bars * timeframe_ms
+                    start_ms: int = (
+                        max(default_start, newest + 1) if newest is not None else default_start
+                    )
+                    if start_ms > end_ms:
+                        return symbol, 0
+
+                    funding, open_interest, long_short, taker = await asyncio.gather(
+                        self._fetcher.fetch_funding_rate_history(symbol, start_ms, end_ms),
+                        self._fetcher.fetch_open_interest_history(symbol, start_ms, end_ms),
+                        self._fetcher.fetch_long_short_ratio_history(symbol, start_ms, end_ms),
+                        self._fetcher.fetch_taker_ratio_history(symbol, start_ms, end_ms),
+                    )
+
+                    records: list[FuturesMetrics] = self._merge_futures_history(
+                        symbol, funding, open_interest, long_short, taker
+                    )
+                    if not records:
+                        _LOGGER.warning(
+                            "No historical futures metrics recovered for %s in [%d, %d]",
+                            symbol,
+                            start_ms,
+                            end_ms,
+                        )
+                        return symbol, 0
+
+                    written: int = await self._db.upsert_futures_metrics_batch(records)
+                    return symbol, written
+                except (DataFetchError, DatabaseError) as error:
+                    # One symbol's backfill failing must not abort the other 28 -
+                    # same isolation policy as `bootstrap_history`.
+                    _LOGGER.error("Futures-metrics backfill failed for %s: %s", symbol, error)
+                    return symbol, 0
+                finally:
+                    completed += 1
+                    if progress is not None:
+                        try:
+                            progress(symbol, completed, total)
+                        except Exception as callback_error:  # pragma: no cover
+                            _LOGGER.debug("Progress callback failed: %s", callback_error)
+
+        results: list[tuple[str, int]] = await asyncio.gather(
+            *(_backfill_one(symbol) for symbol in universe)
+        )
+        written_by_symbol: dict[str, int] = dict(results)
+        _LOGGER.info(
+            "Futures-metrics backfill complete: %d row(s) across %d symbol(s). "
+            "Order-book and liquidation history cannot be backfilled (no exchange "
+            "endpoint for either) and will only accumulate real data from the live "
+            "5-minute cycle going forward.",
+            sum(written_by_symbol.values()),
+            len(written_by_symbol),
+        )
+        return written_by_symbol
+
+    @staticmethod
+    def _merge_futures_history(
+        symbol: str,
+        funding: list[tuple[int, float]],
+        open_interest: list[tuple[int, float]],
+        long_short: list[tuple[int, float]],
+        taker: list[tuple[int, float]],
+    ) -> list[FuturesMetrics]:
+        """Combine independently-paced historical series onto one timeline.
+
+        Each source updates on its own cadence (funding every 8h; open
+        interest/positioning at Binance's native ~5m granularity where still
+        retained). Every column is forward-filled independently across the
+        union of all observed timestamps before being read off, replicating
+        the "most recent value as of this bar" semantics the backward as-of
+        join in :mod:`module_b_features.features` applies on the live path -
+        so a sparse historical write is exactly as valid an input to that join
+        as a dense live one.
+        """
+        sources: dict[str, list[tuple[int, float]]] = {
+            "funding_rate": funding,
+            "open_interest": open_interest,
+            "long_short_ratio": long_short,
+            "taker_buy_sell_ratio": taker,
+        }
+        all_timestamps: set[int] = set()
+        for points in sources.values():
+            all_timestamps.update(timestamp for timestamp, _ in points)
+        if not all_timestamps:
+            return []
+
+        frame: pd.DataFrame = pd.DataFrame(index=pd.Index(sorted(all_timestamps), name="timestamp"))
+        for column, points in sources.items():
+            series: pd.Series = pd.Series(dict(points), dtype=float).sort_index()
+            frame[column] = series.reindex(frame.index).ffill()
+
+        defaults: dict[str, float] = {
+            "funding_rate": 0.0,
+            "open_interest": 0.0,
+            "long_short_ratio": 1.0,
+            "taker_buy_sell_ratio": 1.0,
+        }
+        records: list[FuturesMetrics] = []
+        for timestamp, row in frame.iterrows():
+            try:
+                records.append(
+                    FuturesMetrics(
+                        symbol=symbol,
+                        timestamp=int(timestamp),
+                        funding_rate=(
+                            float(row["funding_rate"])
+                            if pd.notna(row["funding_rate"])
+                            else defaults["funding_rate"]
+                        ),
+                        open_interest=max(
+                            0.0,
+                            float(row["open_interest"])
+                            if pd.notna(row["open_interest"])
+                            else defaults["open_interest"],
+                        ),
+                        long_short_ratio=max(
+                            0.0,
+                            float(row["long_short_ratio"])
+                            if pd.notna(row["long_short_ratio"])
+                            else defaults["long_short_ratio"],
+                        ),
+                        taker_buy_sell_ratio=max(
+                            0.0,
+                            float(row["taker_buy_sell_ratio"])
+                            if pd.notna(row["taker_buy_sell_ratio"])
+                            else defaults["taker_buy_sell_ratio"],
+                        ),
+                    )
+                )
+            except ValueError as error:
+                _LOGGER.warning(
+                    "Skipping implausible backfilled futures row for %s at %d: %s",
+                    symbol,
+                    timestamp,
+                    error,
+                )
+        return records
 
     async def run_cycle(self, symbols: list[str] | None = None) -> dict[str, MarketDataBundle]:
         """Run one 5-minute ingestion cycle across the universe.
