@@ -276,11 +276,27 @@ class MLSettings(BaseModel):
 class DecisionSettings(BaseModel):
     """Decision Engine thresholds (Module D)."""
 
+    #: RiskModel's own hard-veto/sizing floor (module_c_ml.ml_models.RiskModel.
+    #: predict). No longer read by the Decision Engine's own rule cascade -
+    #: R1 used to gate on this too, but that meant a single threshold sat on
+    #: the *joint* long/short probability, which silently discarded a
+    #: confident direction call whenever the gate alone read under 0.5 (see
+    #: min_gate_confidence / min_direction_given_trade_confidence below).
+    #: RiskModel is still handed that same joint-probability confidence
+    #: (direction.confidence), so it keeps its own, differently-scoped
+    #: threshold rather than being repointed at either of the new fields.
     min_direction_confidence: float = Field(default=0.70, gt=0.0, lt=1.0)
-    #: Directional edge required over the opposing side.
-    min_direction_margin: float = Field(default=0.15, ge=0.0, lt=1.0)
     max_no_trade_probability: float = Field(default=0.35, gt=0.0, le=1.0)
     min_entry_probability: float = Field(default=0.55, gt=0.0, lt=1.0)
+
+    #: Stage-1: is this bar worth trading at all (gate's own probability,
+    #: not the multiplied joint one). Replaces gating on the product, which
+    #: silently discarded confident direction calls whenever the gate alone
+    #: was <0.5.
+    min_gate_confidence: float = Field(default=0.55, gt=0.0, lt=1.0)
+    #: Stage-2, conditional on the gate already saying "trade": how sure is
+    #: LONG vs SHORT.
+    min_direction_given_trade_confidence: float = Field(default=0.60, gt=0.0, lt=1.0)
 
     min_leverage: int = Field(default=1, ge=0, le=10)
     max_leverage: int = Field(default=10, ge=1, le=10)

@@ -10,9 +10,12 @@ Rule cascade
 ------------
 ========  ==========================================================
 ``R0``    System gate: kill switch, trading flag, portfolio caps.
-``R1``    Direction confidence >= threshold, and not a NO_TRADE call.
-``R2``    Directional margin over the opposing side is decisive.
-``R3``    NO_TRADE probability mass is not itself dominant.
+``R1A``   Gate confidence (is this bar a trade at all?) >= threshold.
+``R1B``   Conditional on R1A: direction-given-trade confidence (LONG vs
+          SHORT) >= threshold.
+``R3``    Joint NO_TRADE probability mass is not itself dominant - a
+          secondary consistency check now, not the primary gate (see
+          R1A/R1B below).
 ``R4``    Entry model says "now" rather than "wait".
 ``R5``    Exit geometry is sane and clears the reward/risk floor.
 ``R6``    Risk model returned non-zero leverage.
@@ -20,6 +23,19 @@ Rule cascade
 ``R8``    Regime is not on the blocked list.
 ``R9``    Model provenance is acceptable for the current trading mode.
 ========  ==========================================================
+
+R1A/R1B replace the old single R1 (which gated on ``action is not NO_TRADE``
+and on the *joint* long/short probability) plus R2 (directional margin on
+that same joint distribution). The old scheme forced one product,
+``trade_probability * direction_given_trade_probability``, to clear one bar -
+which silently discarded a confident direction call (e.g. 95% sure of LONG
+given a trade) whenever the gate alone read under 0.5. R1A/R1B gate the two
+questions independently: R1A asks "is this worth trading at all", R1B asks
+"given that, which way and how sure" - so a confident direction call is never
+thrown out by an unrelated gate read. R2 is retired outright: it measured
+``abs(long_probability - short_probability)`` on the joint distribution,
+which is now redundant with R1B's confidence check on the independent
+conditional distribution.
 
 Only when all ten pass is a :class:`TradeSignal` constructed - and even then the
 Pydantic validator re-checks the barrier geometry before it can leave this
@@ -57,9 +73,9 @@ class Rule:
     TRADING_DISABLED: Final[str] = "R0_TRADING_DISABLED"
     PORTFOLIO_FULL: Final[str] = "R0_PORTFOLIO_FULL"
     SYMBOL_ALREADY_OPEN: Final[str] = "R0_SYMBOL_ALREADY_OPEN"
-    DIRECTION_NO_TRADE: Final[str] = "R1_DIRECTION_IS_NO_TRADE"
-    DIRECTION_CONFIDENCE: Final[str] = "R1_DIRECTION_CONFIDENCE_TOO_LOW"
-    DIRECTION_MARGIN: Final[str] = "R2_DIRECTIONAL_MARGIN_TOO_THIN"
+    GATE_CONFIDENCE: Final[str] = "R1A_GATE_CONFIDENCE_TOO_LOW"
+    DIRECTION_CONFIDENCE: Final[str] = "R1B_DIRECTION_CONFIDENCE_TOO_LOW"
+    # DIRECTION_NO_TRADE and DIRECTION_MARGIN retired - see commit message
     NO_TRADE_MASS: Final[str] = "R3_NO_TRADE_MASS_TOO_HIGH"
     ENTRY_REJECTED: Final[str] = "R4_ENTRY_MODEL_SAYS_WAIT"
     REWARD_RISK: Final[str] = "R5_REWARD_RISK_BELOW_FLOOR"
@@ -128,69 +144,41 @@ class DecisionEngine:
         if blocked is not None:
             return blocked
 
-        # --- R1: direction confidence --------------------------------------
-        action: TradeAction = direction.action
+        # --- R1a: is this bar worth trading at all? -------------------------
         self._record(
-            checks,
-            Rule.DIRECTION_NO_TRADE,
-            action is not TradeAction.NO_TRADE,
-            f"action={action.value}",
+            checks, Rule.GATE_CONFIDENCE,
+            direction.trade_probability >= self._config.min_gate_confidence,
+            f"trade_probability={direction.trade_probability:.4f} threshold={self._config.min_gate_confidence:.4f}",
         )
-        if action is TradeAction.NO_TRADE:
+        if direction.trade_probability < self._config.min_gate_confidence:
             return self._reject(
-                inference,
-                Rule.DIRECTION_NO_TRADE,
-                (
-                    f"Direction model favours NO_TRADE "
-                    f"(p={direction.no_trade_probability:.3f} vs long "
-                    f"{direction.long_probability:.3f} / short {direction.short_probability:.3f})"
-                ),
+                inference, Rule.GATE_CONFIDENCE,
+                f"Rejected: gate confidence {direction.trade_probability:.1%} < {self._config.min_gate_confidence:.0%}",
                 checks,
             )
 
-        threshold: float = self._config.min_direction_confidence
-        directional_confidence: float = (
-            direction.long_probability
-            if action is TradeAction.LONG
-            else direction.short_probability
-        )
+        # --- R1b: given a trade, which way, and how sure? --------------------
+        long_given_trade: float = direction.direction_given_trade_probability
+        action: TradeAction = TradeAction.LONG if long_given_trade >= 0.5 else TradeAction.SHORT
+        directional_confidence: float = max(long_given_trade, 1.0 - long_given_trade)
         self._record(
-            checks,
-            Rule.DIRECTION_CONFIDENCE,
-            directional_confidence >= threshold,
-            f"confidence={directional_confidence:.4f} threshold={threshold:.4f}",
+            checks, Rule.DIRECTION_CONFIDENCE,
+            directional_confidence >= self._config.min_direction_given_trade_confidence,
+            f"confidence={directional_confidence:.4f} threshold={self._config.min_direction_given_trade_confidence:.4f}",
         )
-        if directional_confidence < threshold:
+        if directional_confidence < self._config.min_direction_given_trade_confidence:
             return self._reject(
-                inference,
-                Rule.DIRECTION_CONFIDENCE,
-                (
-                    f"Rejected: direction confidence {directional_confidence:.1%} < "
-                    f"{threshold:.0%}"
-                ),
+                inference, Rule.DIRECTION_CONFIDENCE,
+                f"Rejected: direction confidence {directional_confidence:.1%} < {self._config.min_direction_given_trade_confidence:.0%}",
                 checks,
             )
 
-        # --- R2: margin over the opposing side ------------------------------
-        margin: float = direction.directional_margin
-        self._record(
-            checks,
-            Rule.DIRECTION_MARGIN,
-            margin >= self._config.min_direction_margin,
-            f"margin={margin:.4f} minimum={self._config.min_direction_margin:.4f}",
-        )
-        if margin < self._config.min_direction_margin:
-            return self._reject(
-                inference,
-                Rule.DIRECTION_MARGIN,
-                (
-                    f"Rejected: directional edge {margin:.1%} below the required "
-                    f"{self._config.min_direction_margin:.1%} - the model is nearly indifferent"
-                ),
-                checks,
-            )
-
-        # --- R3: NO_TRADE mass ----------------------------------------------
+        # --- R3: NO_TRADE mass - secondary consistency check ------------------
+        # Direction is now decided from the conditional (given-trade)
+        # probability above, not this joint one. This guards against a
+        # degenerate case where the gate and direction stages disagree badly
+        # enough to produce an implausibly high combined no_trade_probability
+        # despite both R1a and R1b having already passed.
         no_trade_mass: float = direction.no_trade_probability
         self._record(
             checks,

@@ -1487,7 +1487,14 @@ class RiskModel(BaseModelHead):
 
         Args:
             features: One feature row.
-            direction_confidence: Winning probability mass from Model 1.
+            direction_confidence: Winning probability mass from Model 1 - the
+                *joint* long/short/no_trade distribution's max
+                (``DirectionPrediction.confidence``), not the Decision
+                Engine's independent gate/direction-given-trade confidence.
+                This head's own hard veto and sizing curve are gated against
+                ``DecisionSettings.min_direction_confidence`` specifically
+                because of that difference in scale - see the field's
+                docstring in ``config/settings.py``.
 
         Returns:
             A :class:`RiskAllocation`; ``leverage == 0`` means "do not trade".
