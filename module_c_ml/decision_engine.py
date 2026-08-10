@@ -354,10 +354,27 @@ class DecisionEngine:
         Symbols are ranked by directional confidence so that when the portfolio
         can only absorb two more positions, they go to the two strongest signals
         rather than to whichever symbol happened to be first alphabetically.
+
+        Ranked by the independent direction-given-trade conditional
+        confidence (``max(p, 1 - p)`` of
+        ``direction.direction_given_trade_probability``) - the same
+        quantity R1B gates on and RiskModel now sizes against - not the
+        stale *joint* ``direction.confidence``. Ranking by the joint metric
+        was the same class of bug fixed in ``RiskModel.predict``'s input
+        (see that commit): a symbol with a highly confident direction call
+        could rank behind one with a merely-average joint confidence simply
+        because the gate stage read differently, even though R1B's own
+        threshold is what actually decides whether either symbol is
+        tradeable at all.
         """
         state: DecisionContext = context or DecisionContext()
+
+        def _direction_given_trade_confidence(item: ModelInferenceResult) -> float:
+            p: float = item.direction.direction_given_trade_probability
+            return max(p, 1.0 - p)
+
         ranked: list[ModelInferenceResult] = sorted(
-            inferences, key=lambda item: item.direction.confidence, reverse=True
+            inferences, key=_direction_given_trade_confidence, reverse=True
         )
 
         results: list[DecisionResult] = []

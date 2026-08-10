@@ -314,16 +314,15 @@ class MLSettings(BaseModel):
 class DecisionSettings(BaseModel):
     """Decision Engine thresholds (Module D)."""
 
-    #: RiskModel's own hard-veto/sizing floor (module_c_ml.ml_models.RiskModel.
-    #: predict). No longer read by the Decision Engine's own rule cascade -
-    #: R1 used to gate on this too, but that meant a single threshold sat on
-    #: the *joint* long/short probability, which silently discarded a
-    #: confident direction call whenever the gate alone read under 0.5 (see
-    #: min_gate_confidence / min_direction_given_trade_confidence below).
-    #: RiskModel is still handed that same joint-probability confidence
-    #: (direction.confidence), so it keeps its own, differently-scoped
-    #: threshold rather than being repointed at either of the new fields.
-    min_direction_confidence: float = Field(default=0.70, gt=0.0, lt=1.0)
+    #: Removed: this field used to be RiskModel's own hard-veto/sizing floor,
+    #: read against the stale *joint* long/short/no_trade confidence
+    #: (`DirectionPrediction.confidence`). RiskModel.predict now receives the
+    #: same independent direction-given-trade conditional confidence the
+    #: Decision Engine's own R1B rule gates on (see MLSubsystem.infer_sync),
+    #: so it was repointed at `min_direction_given_trade_confidence` below
+    #: instead - a second, differently-scoped threshold for the same
+    #: quantity would just be a second place to forget to update. Nothing in
+    #: the repo reads `min_direction_confidence` any more (grepped clean).
     max_no_trade_probability: float = Field(default=0.35, gt=0.0, le=1.0)
     min_entry_probability: float = Field(default=0.55, gt=0.0, lt=1.0)
 
@@ -333,7 +332,10 @@ class DecisionSettings(BaseModel):
     #: was <0.5.
     min_gate_confidence: float = Field(default=0.55, gt=0.0, lt=1.0)
     #: Stage-2, conditional on the gate already saying "trade": how sure is
-    #: LONG vs SHORT.
+    #: LONG vs SHORT. Also the threshold RiskModel.predict gates its own hard
+    #: veto and sizing curve against (see min_direction_confidence's removal
+    #: note above) - both consumers now read the identical, independent
+    #: conditional-confidence signal off the same threshold.
     min_direction_given_trade_confidence: float = Field(default=0.60, gt=0.0, lt=1.0)
 
     min_leverage: int = Field(default=1, ge=0, le=10)

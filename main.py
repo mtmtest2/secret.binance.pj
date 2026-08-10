@@ -94,7 +94,6 @@ _MAX_STORED_CYCLE_TIMINGS: Final[int] = 500
 #: edge is visible at all with a larger sample, without ever touching the
 #: thresholds that gate real orders.
 _RELAXED_DECISION_SETTINGS: Final[DecisionSettings] = DecisionSettings(
-    min_direction_confidence=0.55,
     min_gate_confidence=0.50,
     min_direction_given_trade_confidence=0.52,
     max_no_trade_probability=0.50,

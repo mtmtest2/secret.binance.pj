@@ -52,8 +52,10 @@ from module_b_features.features import FEATURE_COLUMNS
 from module_b_features.processor import ProcessedDataset
 from module_c_ml.ml_models import DirectionModel
 
-#: The OLD architecture's single product-probability threshold (matches the
-#: live system's pre-fix DecisionSettings.min_direction_confidence default).
+#: The OLD architecture's single product-probability threshold (matched the
+#: pre-fix DecisionSettings.min_direction_confidence default - that field has
+#: since been removed entirely; see the "fix RiskModel's stale joint-
+#: probability confidence input" commit).
 OLD_JOINT_THRESHOLD = 0.70
 
 

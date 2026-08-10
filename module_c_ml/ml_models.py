@@ -1792,14 +1792,21 @@ class RiskModel(BaseModelHead):
 
         Args:
             features: One feature row.
-            direction_confidence: Winning probability mass from Model 1 - the
-                *joint* long/short/no_trade distribution's max
-                (``DirectionPrediction.confidence``), not the Decision
-                Engine's independent gate/direction-given-trade confidence.
-                This head's own hard veto and sizing curve are gated against
-                ``DecisionSettings.min_direction_confidence`` specifically
-                because of that difference in scale - see the field's
-                docstring in ``config/settings.py``.
+            direction_confidence: The independent direction-given-trade
+                conditional confidence (``max(p, 1 - p)`` of
+                ``DirectionPrediction.direction_given_trade_probability``) -
+                the same 0.5-1.0 conditional-confidence scale the Decision
+                Engine's own R1B rule (``Rule.DIRECTION_CONFIDENCE``) gates
+                on. This head's hard veto and sizing curve are gated against
+                ``DecisionSettings.min_direction_given_trade_confidence`` for
+                consistency with that scale. Prior to the fix that added this
+                docstring note, callers passed the stale *joint*
+                long/short/no_trade distribution's max
+                (``DirectionPrediction.confidence``) here, which meant a
+                confident direction call could still be silently downsized or
+                vetoed by this head even after clearing the Decision Engine's
+                own independent gate/direction rules - see
+                ``MLSubsystem.infer_sync`` for the call site.
 
         Returns:
             A :class:`RiskAllocation`; ``leverage == 0`` means "do not trade".
@@ -1836,7 +1843,7 @@ class RiskModel(BaseModelHead):
                 ),
                 source=source,
             )
-        if direction_confidence < decision.min_direction_confidence:
+        if direction_confidence < decision.min_direction_given_trade_confidence:
             return RiskAllocation(
                 leverage=0,
                 capital_allocation_pct=0.0,
@@ -1844,7 +1851,7 @@ class RiskModel(BaseModelHead):
                 risk_tier=risk_tier,
                 abort_reason=(
                     f"direction confidence {direction_confidence:.3f} < "
-                    f"{decision.min_direction_confidence:.3f}"
+                    f"{decision.min_direction_given_trade_confidence:.3f}"
                 ),
                 source=source,
             )
@@ -1852,9 +1859,9 @@ class RiskModel(BaseModelHead):
         # --- Sizing ------------------------------------------------------
         # Confidence is rescaled onto [0, 1] across the *tradeable* band, so a
         # 70 %-confidence signal sizes near the floor and a 100 % one near the cap.
-        confidence_span: float = max(1e-6, 1.0 - decision.min_direction_confidence)
+        confidence_span: float = max(1e-6, 1.0 - decision.min_direction_given_trade_confidence)
         confidence_factor: float = clamp(
-            (direction_confidence - decision.min_direction_confidence) / confidence_span, 0.0, 1.0
+            (direction_confidence - decision.min_direction_given_trade_confidence) / confidence_span, 0.0, 1.0
         )
         volatility_factor: float = 1.0 - clamp(volatility_rank, 0.0, 1.0) ** 2
         tier_factor: float = {"LOW": 1.0, "MEDIUM": 0.75, "HIGH": 0.5}.get(risk_tier, 0.6)
@@ -1996,9 +2003,21 @@ class MLSubsystem:
         direction: DirectionPrediction = self.direction.predict(features)
         entry: EntryPrediction = self.entry.predict(features, action=direction.action)
         exit_params: ExitParameters = self.exit.predict(features)
+        # RiskModel's hard veto/sizing curve reads the same independent
+        # direction-given-trade conditional confidence the Decision Engine's
+        # R1B rule gates on - not the stale *joint* long/short/no_trade
+        # distribution's max (`direction.confidence`). Passing the joint
+        # metric here meant a confident direction call that had already
+        # cleared the Decision Engine's own gate/direction rules could still
+        # be silently vetoed or downsized by this head reading a different,
+        # harder-to-clear scale.
+        direction_given_trade_confidence: float = max(
+            direction.direction_given_trade_probability,
+            1.0 - direction.direction_given_trade_probability,
+        )
         risk: RiskAllocation = self.risk.predict(
             features,
-            direction_confidence=direction.confidence,
+            direction_confidence=direction_given_trade_confidence,
         )
 
         return ModelInferenceResult(
