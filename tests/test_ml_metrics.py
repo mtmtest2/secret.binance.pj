@@ -53,8 +53,11 @@ def test_direction_metrics_confidence_threshold_excludes_low_confidence_rows() -
     result = m.direction_metrics(target, probabilities, LABELS)
     row_80 = next(r for r in result["confidence_threshold_analysis"] if r["confidence_threshold"] == 0.80)
     assert row_80["n_predictions"] == 1  # only the 0.9-confidence row qualifies
+    # CONFIDENCE_THRESHOLDS was extended downward in task 7a (grid used to
+    # bottom out at 0.50) - assert against the live constant's own floor
+    # rather than a frozen 0.50 literal.
     row_none = {**result["confidence_threshold_analysis"][0]}
-    assert row_none["confidence_threshold"] == 0.50
+    assert row_none["confidence_threshold"] == m.CONFIDENCE_THRESHOLDS[0]
 
 
 def test_entry_metrics_at_threshold() -> None:

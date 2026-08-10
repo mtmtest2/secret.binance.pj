@@ -24,8 +24,20 @@ import pandas as pd
 NOT_AVAILABLE: Final[str] = "NOT_AVAILABLE"
 
 #: Confidence/threshold grids requested by the diagnostic reporting spec.
-CONFIDENCE_THRESHOLDS: Final[tuple[float, ...]] = (0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85)
-ENTRY_THRESHOLDS: Final[tuple[float, ...]] = (0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90)
+#: Extended downward from a 0.50 floor (task 7a): a production diagnostic
+#: report's auto-tuner recommended the F-beta-optimal gate AND direction
+#: thresholds exactly at the grid's lowest value (0.50) for both sweeps,
+#: which means the true optimum could sit below 0.50 and was structurally
+#: unknowable on the old grid - the sweep can never recommend a value it
+#: was never offered. 0.30/0.35/0.40/0.45 let the next real-data retrain
+#: actually find out, rather than silently capping the search at a value
+#: that already looked like a boundary optimum, not an interior one.
+CONFIDENCE_THRESHOLDS: Final[tuple[float, ...]] = (
+    0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85,
+)
+ENTRY_THRESHOLDS: Final[tuple[float, ...]] = (
+    0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90,
+)
 
 
 def _distribution_stats(values: np.ndarray) -> dict[str, float]:

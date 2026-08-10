@@ -86,8 +86,11 @@ def test_entry_model_metadata_includes_threshold_sweep_and_decision_threshold(tm
     valid_thresholds = {row["threshold"] for row in sweep} | {settings.decision.min_entry_probability}
     assert head.metadata["decision_threshold"] in valid_thresholds
     assert len(sweep) == len(head.metadata["threshold_sweep"])  # sanity: non-empty, self-consistent
-    assert {row["threshold"] for row in sweep} == set(
-        (0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90)
-    )
+    # ENTRY_THRESHOLDS was extended downward in task 7a (grid used to bottom
+    # out at 0.50) - assert against the live constant rather than a frozen
+    # literal, so this test does not silently drift out of sync again.
+    from module_c_ml.metrics import ENTRY_THRESHOLDS
+
+    assert {row["threshold"] for row in sweep} == set(ENTRY_THRESHOLDS)
     for row in sweep:
         assert row["average_r"] == "NOT_AVAILABLE"
