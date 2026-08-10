@@ -51,7 +51,7 @@ import uvicorn
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from config.settings import Settings, get_settings
+from config.settings import DecisionSettings, Settings, get_settings
 from core.exceptions import KillSwitchEngaged, QuantSystemError
 from core.logger import configure_logging, get_logger
 from core.utils import utc_now, utc_now_ms
@@ -82,6 +82,23 @@ _CYCLE_MINUTES: Final[str] = "0,5,10,15,20,25,30,35,40,45,50,55"
 
 #: Rolling history cap for persisted per-cycle timing telemetry.
 _MAX_STORED_CYCLE_TIMINGS: Final[int] = 500
+
+#: Decision-cascade thresholds for the *diagnostic-only* relaxed backtest run
+#: by ``TradingSystem._run_validation_backtest`` - never used for real trading.
+#: The live ``DecisionSettings`` defaults (min_direction_confidence=0.70,
+#: min_entry_probability=0.55, ...) are intentionally strict and, combined
+#: with a single ~8-week out-of-sample window, routinely leave the strict
+#: backtest with a single-digit trade count - too small for win rate/profit
+#: factor/Sharpe to mean anything. This loosened copy replays the *same*
+#: window to check whether the strategy's edge is visible at all with a
+#: larger sample, without ever touching the thresholds that gate real orders.
+_RELAXED_DECISION_SETTINGS: Final[DecisionSettings] = DecisionSettings(
+    min_direction_confidence=0.55,
+    min_direction_margin=0.05,
+    max_no_trade_probability=0.50,
+    min_entry_probability=0.50,
+    min_reward_risk_ratio=1.0,
+)
 
 
 def _headline_metrics(report: dict[str, Any]) -> dict[str, Any]:
@@ -302,7 +319,7 @@ class TradingSystem:
                 )
 
     async def _setup_collect(self, symbols: list[str]) -> None:
-        """Stage 1 - backfill historical candles for the selected universe."""
+        """Stage 1 - backfill historical candles and derivatives/positioning history."""
         self.phase = SystemPhase.COLLECTING_DATA
         self.progress.begin(
             SystemPhase.COLLECTING_DATA,
@@ -338,7 +355,25 @@ class TradingSystem:
             len(usable),
         )
 
-    async def _run_validation_backtest(self, dataset: ProcessedDataset) -> BacktestReport | None:
+        # Backfill funding-rate/open-interest/positioning history so the
+        # micro-structure/derivatives features are not stuck at their neutral
+        # default for the whole training window - see
+        # `DataPipeline.backfill_futures_metrics` for why this is a separate
+        # pass from the candle backfill above (order book has no historical
+        # endpoint at all; the rest are capped by Binance's own retention).
+        self.progress.advance(0, len(usable), "backfilling derivatives/positioning history")
+        futures_written: dict[str, int] = await self.pipeline.backfill_futures_metrics(
+            usable, progress=report
+        )
+        _LOGGER.info(
+            "Futures-metrics backfill complete: %d row(s) across %d symbol(s)",
+            sum(futures_written.values()),
+            len(futures_written),
+        )
+
+    async def _run_validation_backtest(
+        self, dataset: ProcessedDataset
+    ) -> tuple[BacktestReport | None, BacktestReport | None]:
         """Replay the out-of-sample validation window through the full pipeline.
 
         The ML diagnostic report's trading-level fields (win rate, profit
@@ -357,33 +392,61 @@ class TradingSystem:
         treat the resulting numbers as directionally informative rather than
         a certified live-performance estimate.
 
+        Returns ``(strict, relaxed)``: ``strict`` replays with the live
+        ``DecisionSettings`` and is the number that matters operationally. A
+        highly selective cascade (min direction confidence, entry
+        probability, reward/risk floor, ...) combined with a single ~8-week
+        OOS window routinely leaves it with a single-digit trade count, which
+        is too small for its own win-rate/profit-factor/Sharpe to mean
+        anything (see ``module_f_panel.diagnostics._backtest_reliability``).
+        ``relaxed`` re-runs the *same* window with those thresholds loosened
+        (never the live config) purely to see whether the strategy's edge is
+        directionally visible at all with a larger trade count - it is a
+        diagnostic reference only, never a performance estimate to trade on.
+
         Never raises: a backtest failure must not block training or the
         diagnostic report it enriches.
         """
         if not dataset.symbols:
-            return None
+            return None, None
         try:
             _, validation_index = dataset.train_validation_split(
                 self.settings.ml.validation_fraction, self.settings.ml.purge_bars
             )
             if len(validation_index) == 0:
-                return None
+                return None, None
 
             symbols: list[str] = list(dataset.symbols)
             validation_bars_per_symbol: int = -(-len(validation_index) // len(symbols))  # ceil
             warmup_padding: int = self.features.engineer.minimum_rows()
+            max_candles: int = validation_bars_per_symbol + warmup_padding
 
             backtester = Backtester(
                 self.settings, self.database, self.features, self.ml, self.decisions
             )
-            return await backtester.run(
-                symbols=symbols,
-                max_candles=validation_bars_per_symbol + warmup_padding,
-                warmup_bars=warmup_padding,
+            strict: BacktestReport = await backtester.run(
+                symbols=symbols, max_candles=max_candles, warmup_bars=warmup_padding
             )
+
+            relaxed: BacktestReport | None = None
+            try:
+                relaxed_settings: Settings = self.settings.model_copy(
+                    update={"decision": _RELAXED_DECISION_SETTINGS}
+                )
+                relaxed_engine = DecisionEngine(relaxed_settings)
+                relaxed_backtester = Backtester(
+                    relaxed_settings, self.database, self.features, self.ml, relaxed_engine
+                )
+                relaxed = await relaxed_backtester.run(
+                    symbols=symbols, max_candles=max_candles, warmup_bars=warmup_padding
+                )
+            except Exception as error:  # noqa: BLE001 - diagnostic-only pass, never fatal
+                _LOGGER.error("Relaxed diagnostic backtest failed: %s", error, exc_info=True)
+
+            return strict, relaxed
         except Exception as error:  # noqa: BLE001 - a backtest failure must not block training
             _LOGGER.error("Validation backtest failed: %s", error, exc_info=True)
-            return None
+            return None, None
 
     async def _setup_train(self, symbols: list[str], force_retrain: bool) -> None:
         """Stage 2 - build the dataset and fit the four heads."""
@@ -439,7 +502,9 @@ class TradingSystem:
 
         run_id: str = str(uuid.uuid4())
         self.progress.set_step("running validation backtest", "replaying out-of-sample bars")
-        backtest_report: BacktestReport | None = await self._run_validation_backtest(dataset)
+        backtest_report: BacktestReport | None
+        relaxed_backtest_report: BacktestReport | None
+        backtest_report, relaxed_backtest_report = await self._run_validation_backtest(dataset)
         self.progress.advance(3, 4, "validation backtest complete")
         try:
             self.progress.set_step(
@@ -452,6 +517,7 @@ class TradingSystem:
                 dataset=dataset,
                 run_id=run_id,
                 backtest=backtest_report,
+                relaxed_backtest=relaxed_backtest_report,
             )
             self.latest_ml_report_id = run_id
             self.progress.advance(4, 4, "diagnostic report ready")
@@ -1169,7 +1235,9 @@ class TradingSystem:
             _LOGGER.info("%-10s -> %s", head, metrics)
 
         run_id: str = str(uuid.uuid4())
-        backtest_report: BacktestReport | None = await self._run_validation_backtest(dataset)
+        backtest_report: BacktestReport | None
+        relaxed_backtest_report: BacktestReport | None
+        backtest_report, relaxed_backtest_report = await self._run_validation_backtest(dataset)
         try:
             diagnostic_report: dict[str, Any] = await diagnostics.build_report(
                 settings=self.settings,
@@ -1178,6 +1246,7 @@ class TradingSystem:
                 dataset=dataset,
                 run_id=run_id,
                 backtest=backtest_report,
+                relaxed_backtest=relaxed_backtest_report,
             )
             self.latest_ml_report_id = run_id
             reports_dir = self.settings.ml.model_dir.parent / diagnostics.REPORTS_DIR_NAME
