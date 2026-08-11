@@ -260,6 +260,29 @@ class LabelSettings(BaseModel):
     discard_very_high_risk: bool = Field(default=True)
 
 
+class BoosterHyperparameters(BaseModel):
+    """One gradient-boosted-tree hyperparameter profile.
+
+    Factored out of :class:`MLSettings` so a model head whose target is
+    noisier or weaker-signal than the rest (see ``MLSettings.
+    direction_stage2_hyperparameters`` and ``MLSettings.risk_hyperparameters``)
+    can be tuned independently instead of sharing one generic profile with
+    every other head.
+    """
+
+    n_estimators: int = Field(default=400, ge=10)
+    learning_rate: float = Field(default=0.05, gt=0.0, le=1.0)
+    max_depth: int = Field(default=6, ge=1, le=32)
+    num_leaves: int = Field(default=63, ge=2)
+    subsample: float = Field(default=0.85, gt=0.0, le=1.0)
+    colsample_bytree: float = Field(default=0.85, gt=0.0, le=1.0)
+    min_child_samples: int = Field(default=40, ge=1)
+    reg_lambda: float = Field(default=1.0, ge=0.0)
+    #: L1 regularisation. ``0.0`` matches LightGBM/XGBoost's own default, so
+    #: leaving this unset changes nothing for any existing profile.
+    reg_alpha: float = Field(default=0.0, ge=0.0)
+
+
 class MLSettings(BaseModel):
     """Machine-learning subsystem configuration (Module C)."""
 
@@ -275,6 +298,62 @@ class MLSettings(BaseModel):
     colsample_bytree: float = Field(default=0.85, gt=0.0, le=1.0)
     min_child_samples: int = Field(default=40, ge=1)
     reg_lambda: float = Field(default=1.0, ge=0.0)
+    #: L1 regularisation for every head that does not have its own dedicated
+    #: profile below. ``0.0`` preserves the exact behaviour every head had
+    #: before this field existed.
+    reg_alpha: float = Field(default=0.0, ge=0.0)
+
+    #: Dedicated hyperparameter profile for the Direction model's stage-2
+    #: (long-vs-short *given* a trade) classifier - see ``DirectionModel.
+    #: train``'s docstring for why the gate and direction questions lean on
+    #: different signal. Production diagnostics have repeatedly shown this
+    #: stage's precision sitting barely above the 50/50 base rate (e.g.
+    #: 0.53 at its own F1-optimal threshold) while leaning heavily on
+    #: weak/noisy features (time-of-day) in its importance ranking - both
+    #: symptoms of a model fit to noise rather than genuine signal. This
+    #: profile trades tree capacity for variance reduction relative to the
+    #: shared default above: more, shallower trees at a lower learning rate,
+    #: much larger leaves (``min_child_samples``) so splits need real
+    #: statistical support, heavier L1+L2 regularisation to discourage
+    #: latching onto marginally-useful features, and more aggressive column
+    #: subsampling so no single weak feature dominates every tree.
+    direction_stage2_hyperparameters: BoosterHyperparameters = Field(
+        default_factory=lambda: BoosterHyperparameters(
+            n_estimators=700,
+            learning_rate=0.03,
+            max_depth=5,
+            num_leaves=31,
+            min_child_samples=100,
+            subsample=0.8,
+            colsample_bytree=0.7,
+            reg_lambda=2.0,
+            reg_alpha=0.5,
+        )
+    )
+
+    #: Dedicated hyperparameter profile for the Risk (opportunity-score)
+    #: regressor - the ML diagnostic report's own weakest-scored component
+    #: (R^2 ~0.14 against identical hyperparameters to every other head,
+    #: despite RiskModel.train's own docstring already having removed the
+    #: single largest known confound - training on an out-of-distribution
+    #: NO_TRADE population). Given more capacity to close the remaining gap:
+    #: more trees at a lower learning rate, deeper/wider trees, and smaller
+    #: leaves so it can fit the finer-grained heat/path structure the target
+    #: actually has, offset by a modest regularisation bump so the extra
+    #: capacity does not just overfit the training window instead.
+    risk_hyperparameters: BoosterHyperparameters = Field(
+        default_factory=lambda: BoosterHyperparameters(
+            n_estimators=600,
+            learning_rate=0.04,
+            max_depth=7,
+            num_leaves=95,
+            min_child_samples=25,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            reg_lambda=1.5,
+            reg_alpha=0.1,
+        )
+    )
 
     #: Strict, chronological 3-way split (never a random shuffle). ``test`` is
     #: anchored to the most recent data and is the model's final backtest

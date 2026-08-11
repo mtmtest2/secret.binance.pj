@@ -410,9 +410,11 @@ def calibrate_classifier(
         "improved": bool(improved),
         "recommended_for_production": bool(improved),
         "note": (
-            "Measured only - not yet wired into live inference. Swapping the "
-            "decision engine onto calibrated probabilities is a live-trading "
-            "behaviour change and is left as an explicit follow-up."
+            "Measured here; the caller (DirectionModel/EntryModel) swaps this "
+            "stage onto the isotonic-calibrated estimator for live inference "
+            "whenever `improved` is True, and leaves it on the raw estimator "
+            "otherwise - see the model artifact's own `production_calibration` "
+            "field for what was actually applied to this run."
         ),
     }
 

@@ -38,7 +38,7 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from config.settings import MLSettings, Settings
+from config.settings import BoosterHyperparameters, MLSettings, Settings
 from core.exceptions import ModelNotLoadedError, ModelTrainingError
 from core.logger import get_logger
 from core.utils import clamp, git_commit_hash
@@ -78,6 +78,7 @@ _HYPERPARAMETER_FIELDS: Final[tuple[str, ...]] = (
     "subsample",
     "colsample_bytree",
     "reg_lambda",
+    "reg_alpha",
     "random_state",
     "train_months",
     "validation_months",
@@ -131,8 +132,20 @@ def load_artifact(path: Path) -> dict[str, Any] | None:
 
 
 def _hyperparameter_snapshot(config: MLSettings) -> dict[str, Any]:
-    """The exact booster hyperparameters used for this run, for reproducibility."""
-    return {field: getattr(config, field) for field in _HYPERPARAMETER_FIELDS if hasattr(config, field)}
+    """The exact booster hyperparameters used for this run, for reproducibility.
+
+    Includes the shared profile every head falls back to (``_HYPERPARAMETER_
+    FIELDS``) plus the dedicated overrides used by DirectionModel's stage-2
+    (long/short) classifier and RiskModel - see ``MLSettings.
+    direction_stage2_hyperparameters`` / ``risk_hyperparameters`` for why
+    those two heads do not share the generic profile.
+    """
+    snapshot: dict[str, Any] = {
+        field: getattr(config, field) for field in _HYPERPARAMETER_FIELDS if hasattr(config, field)
+    }
+    snapshot["direction_stage2_hyperparameters"] = config.direction_stage2_hyperparameters.model_dump()
+    snapshot["risk_hyperparameters"] = config.risk_hyperparameters.model_dump()
+    return snapshot
 
 
 def focal_loss_binary(
@@ -362,20 +375,47 @@ class BaseModelHead(ABC):
         """Thread budget for the booster (kept small: we run many in parallel)."""
         return max(1, self._config.inference_workers)
 
-    def _make_classifier(self, num_class: int) -> Any:
-        """Build an untrained gradient-boosted classifier."""
+    def _base_hyperparameters(self) -> BoosterHyperparameters:
+        """The shared hyperparameter profile every head falls back to."""
         config: MLSettings = self._config
+        return BoosterHyperparameters(
+            n_estimators=config.n_estimators,
+            learning_rate=config.learning_rate,
+            max_depth=config.max_depth,
+            num_leaves=config.num_leaves,
+            subsample=config.subsample,
+            colsample_bytree=config.colsample_bytree,
+            min_child_samples=config.min_child_samples,
+            reg_lambda=config.reg_lambda,
+            reg_alpha=config.reg_alpha,
+        )
+
+    def _make_classifier(
+        self, num_class: int, *, hyperparameters: BoosterHyperparameters | None = None
+    ) -> Any:
+        """Build an untrained gradient-boosted classifier.
+
+        Args:
+            hyperparameters: Overrides the shared profile - used by
+                DirectionModel's stage-2 (long/short) classifier, which is
+                tuned separately (see ``MLSettings.
+                direction_stage2_hyperparameters``). Every other caller omits
+                this and gets the shared ``MLSettings`` fields, unchanged.
+        """
+        config: MLSettings = self._config
+        params: BoosterHyperparameters = hyperparameters or self._base_hyperparameters()
         if config.booster == "xgboost":
             from xgboost import XGBClassifier
 
             return XGBClassifier(
-                n_estimators=config.n_estimators,
-                learning_rate=config.learning_rate,
-                max_depth=config.max_depth,
-                subsample=config.subsample,
-                colsample_bytree=config.colsample_bytree,
-                reg_lambda=config.reg_lambda,
-                min_child_weight=config.min_child_samples,
+                n_estimators=params.n_estimators,
+                learning_rate=params.learning_rate,
+                max_depth=params.max_depth,
+                subsample=params.subsample,
+                colsample_bytree=params.colsample_bytree,
+                reg_lambda=params.reg_lambda,
+                reg_alpha=params.reg_alpha,
+                min_child_weight=params.min_child_samples,
                 objective="multi:softprob" if num_class > 2 else "binary:logistic",
                 num_class=num_class if num_class > 2 else None,
                 random_state=config.random_state,
@@ -387,15 +427,16 @@ class BaseModelHead(ABC):
         from lightgbm import LGBMClassifier
 
         return LGBMClassifier(
-            n_estimators=config.n_estimators,
-            learning_rate=config.learning_rate,
-            max_depth=config.max_depth,
-            num_leaves=config.num_leaves,
-            subsample=config.subsample,
+            n_estimators=params.n_estimators,
+            learning_rate=params.learning_rate,
+            max_depth=params.max_depth,
+            num_leaves=params.num_leaves,
+            subsample=params.subsample,
             subsample_freq=1,
-            colsample_bytree=config.colsample_bytree,
-            reg_lambda=config.reg_lambda,
-            min_child_samples=config.min_child_samples,
+            colsample_bytree=params.colsample_bytree,
+            reg_lambda=params.reg_lambda,
+            reg_alpha=params.reg_alpha,
+            min_child_samples=params.min_child_samples,
             objective="multiclass" if num_class > 2 else "binary",
             num_class=num_class if num_class > 2 else 1,
             class_weight="balanced",
@@ -404,7 +445,9 @@ class BaseModelHead(ABC):
             verbose=-1,
         )
 
-    def _make_regressor(self, *, robust: bool = False) -> Any:
+    def _make_regressor(
+        self, *, robust: bool = False, hyperparameters: BoosterHyperparameters | None = None
+    ) -> Any:
         """Build an untrained gradient-boosted regressor.
 
         Args:
@@ -415,19 +458,25 @@ class BaseModelHead(ABC):
                 target is heavy-tailed (as the exit-geometry percentages are)
                 and matches the ``l1`` eval metric already used to early-stop
                 these heads.
+            hyperparameters: Overrides the shared profile - used by
+                RiskModel, which is tuned separately (see ``MLSettings.
+                risk_hyperparameters``). Every other caller omits this and
+                gets the shared ``MLSettings`` fields, unchanged.
         """
         config: MLSettings = self._config
+        params: BoosterHyperparameters = hyperparameters or self._base_hyperparameters()
         if config.booster == "xgboost":
             from xgboost import XGBRegressor
 
             return XGBRegressor(
-                n_estimators=config.n_estimators,
-                learning_rate=config.learning_rate,
-                max_depth=config.max_depth,
-                subsample=config.subsample,
-                colsample_bytree=config.colsample_bytree,
-                reg_lambda=config.reg_lambda,
-                min_child_weight=config.min_child_samples,
+                n_estimators=params.n_estimators,
+                learning_rate=params.learning_rate,
+                max_depth=params.max_depth,
+                subsample=params.subsample,
+                colsample_bytree=params.colsample_bytree,
+                reg_lambda=params.reg_lambda,
+                reg_alpha=params.reg_alpha,
+                min_child_weight=params.min_child_samples,
                 objective="reg:absoluteerror" if robust else "reg:squarederror",
                 random_state=config.random_state,
                 n_jobs=self._n_jobs(),
@@ -438,15 +487,16 @@ class BaseModelHead(ABC):
         from lightgbm import LGBMRegressor
 
         return LGBMRegressor(
-            n_estimators=config.n_estimators,
-            learning_rate=config.learning_rate,
-            max_depth=config.max_depth,
-            num_leaves=config.num_leaves,
-            subsample=config.subsample,
+            n_estimators=params.n_estimators,
+            learning_rate=params.learning_rate,
+            max_depth=params.max_depth,
+            num_leaves=params.num_leaves,
+            subsample=params.subsample,
             subsample_freq=1,
-            colsample_bytree=config.colsample_bytree,
-            reg_lambda=config.reg_lambda,
-            min_child_samples=config.min_child_samples,
+            colsample_bytree=params.colsample_bytree,
+            reg_lambda=params.reg_lambda,
+            reg_alpha=params.reg_alpha,
+            min_child_samples=params.min_child_samples,
             objective="regression_l1" if robust else "regression",
             random_state=config.random_state,
             n_jobs=self._n_jobs(),
@@ -1019,7 +1069,9 @@ class DirectionModel(BaseModelHead):
             direction_sample_weight: np.ndarray | None = (
                 sample_weight[trade_mask] if sample_weight is not None else None
             )
-            direction_estimator = self._make_classifier(num_class=2)
+            direction_estimator = self._make_classifier(
+                num_class=2, hyperparameters=self._config.direction_stage2_hyperparameters
+            )
             if early_stopping:
                 direction_estimator = self._fit_estimator(
                     direction_estimator,
@@ -1906,7 +1958,9 @@ class RiskModel(BaseModelHead):
         # are, so it gets the same L1 (robust) objective rather than L2 -
         # a handful of extreme-heat rows should not dominate the loss and
         # drag every other prediction toward them.
-        estimator: Any = self._make_regressor(robust=True)
+        estimator: Any = self._make_regressor(
+            robust=True, hyperparameters=self._config.risk_hyperparameters
+        )
         estimator = self._fit_estimator(
             estimator,
             features.iloc[train_index],
