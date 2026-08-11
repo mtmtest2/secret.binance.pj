@@ -380,6 +380,23 @@ class DatabaseHandler:
             value: Any = result.scalar_one_or_none()
         return int(value) if value is not None else None
 
+    async def earliest_futures_metrics_timestamp(self, symbol: str) -> int | None:
+        """Return the oldest stored futures-metrics timestamp for ``symbol``.
+
+        The backfill resumes from this end, not from
+        :meth:`latest_futures_metrics_timestamp`: the live 5-minute cycle writes
+        a "now" snapshot every pass, so the newest row is always the present
+        moment and a newest-first resume rule would leave the historical window
+        permanently unfilled.
+        """
+        query: Select[Any] = select(func.min(FuturesMetricsRow.timestamp)).where(
+            FuturesMetricsRow.symbol == symbol
+        )
+        async with self._factory()() as session:
+            result: Result[Any] = await session.execute(query)
+            value: Any = result.scalar_one_or_none()
+        return int(value) if value is not None else None
+
     # ------------------------------------------------------------------
     # Market-data reads
     # ------------------------------------------------------------------

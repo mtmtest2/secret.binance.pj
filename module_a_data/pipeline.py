@@ -203,12 +203,30 @@ class DataPipeline:
             nonlocal completed
             async with self._symbol_semaphore:
                 try:
-                    newest: int | None = await self._db.latest_futures_metrics_timestamp(symbol)
                     default_start: int = end_ms - target_bars * timeframe_ms
-                    start_ms: int = (
-                        max(default_start, newest + 1) if newest is not None else default_start
-                    )
+                    # Resume from the *oldest* stored row, not the newest.  The
+                    # live cycle writes a "now" snapshot every 5 minutes, so the
+                    # newest timestamp is always the present moment - a
+                    # newest-first resume rule made ``start_ms`` exceed ``end_ms``
+                    # on every run and the backfill wrote 0 rows forever, leaving
+                    # funding_rate, open_interest_change, long_short_ratio and
+                    # taker_buy_sell_ratio pinned to their neutral defaults across
+                    # the whole training set.
+                    oldest: int | None = await self._db.earliest_futures_metrics_timestamp(symbol)
+                    start_ms: int = default_start
+                    if oldest is not None and oldest <= default_start:
+                        # History already reaches back past the requested window;
+                        # only the leading edge can still be missing.
+                        newest: int | None = await self._db.latest_futures_metrics_timestamp(symbol)
+                        if newest is not None:
+                            start_ms = max(default_start, newest + 1)
                     if start_ms > end_ms:
+                        _LOGGER.debug(
+                            "Futures-metrics history for %s already covers [%d, %d]",
+                            symbol,
+                            default_start,
+                            end_ms,
+                        )
                         return symbol, 0
 
                     funding, open_interest, long_short, taker = await asyncio.gather(

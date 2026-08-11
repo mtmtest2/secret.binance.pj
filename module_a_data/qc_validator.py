@@ -31,6 +31,17 @@ timestamp range, merges the repaired rows over the corrupt ones and re-validates
 repeating with exponential backoff until the block is pristine or the attempt
 budget is exhausted (in which case :class:`DataIntegrityError` is raised and the
 symbol is skipped for this cycle - never silently accepted).
+
+**Exchange confirmation.**  The statistical checks (families 3 and 4 above) are
+heuristics for spotting *corrupt* data, and they cannot tell a bad print from a
+violent-but-real market.  So the healer resolves the ambiguity by asking: bars
+the exchange re-serves with byte-identical OHLCV during a heal round are recorded
+as confirmed, and on the next validation pass their return-outlier and
+zero-volume verdicts drop from CRITICAL to WARNING.  A 40 % five-minute candle
+that survives a fresh fetch is a real dislocation, not a glitch, and failing the
+block over it costs every candle before it to quarantine.  Structural checks
+(families 1 and 2) are never downgraded - broken geometry is broken whoever
+served it.
 """
 
 from __future__ import annotations
@@ -84,12 +95,29 @@ class QCValidator:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def validate_candles(self, symbol: str, candles: Sequence[OHLCVCandle]) -> QCReport:
+    def validate_candles(
+        self,
+        symbol: str,
+        candles: Sequence[OHLCVCandle],
+        *,
+        confirmed_timestamps: Iterable[int] = (),
+    ) -> QCReport:
         """Run the full check battery over a candle block.
 
         Args:
             symbol: Symbol the block belongs to (used for reporting only).
             candles: Candles in any order; the validator sorts defensively.
+            confirmed_timestamps: Bars the exchange has already re-served
+                byte-identically during healing.  QC exists to catch *feed
+                corruption*, and a value the exchange reproduces on a fresh
+                request is not corruption - it is what really happened in the
+                market.  Statistical verdicts (return outliers, an excessive
+                zero-volume share) are therefore downgraded from CRITICAL to
+                WARNING for these bars, so a genuine market-wide dislocation or
+                a genuinely thin market stops being treated as damage that must
+                be re-fetched forever or quarantined away.  Structural verdicts
+                (missing candles, bad price geometry, staleness) are unaffected:
+                those are broken regardless of who served them.
 
         Returns:
             A :class:`QCReport`.  ``report.passed`` is ``False`` when at least one
@@ -97,6 +125,7 @@ class QCValidator:
             which grid points need re-fetching.
         """
         issues: list[QCIssue] = []
+        confirmed: frozenset[int] = frozenset(confirmed_timestamps)
 
         if not candles:
             issues.append(
@@ -125,14 +154,14 @@ class QCValidator:
                         f"{timestamps[0]} and {timestamps[-1]}"
                     ),
                     symbol=symbol,
-                    timestamps=tuple(missing[:50]),
+                    timestamps=tuple(missing),
                     healable=True,
                 )
             )
 
         issues.extend(self._check_price_logic(symbol, ordered))
-        issues.extend(self._check_volume_logic(symbol, ordered))
-        issues.extend(self._check_return_outliers(symbol, ordered))
+        issues.extend(self._check_volume_logic(symbol, ordered, confirmed))
+        issues.extend(self._check_return_outliers(symbol, ordered, confirmed))
         issues.extend(self._check_freshness(symbol, timestamps))
 
         if len(ordered) < self._qc.min_rows_for_statistics:
@@ -213,6 +242,9 @@ class QCValidator:
         working: list[OHLCVCandle] = sorted(candles, key=lambda item: item.timestamp)
         report: QCReport = self.validate_candles(symbol, working)
         heal_attempts: list[HealAttempt] = []
+        #: Bars the exchange has re-served byte-identically.  See the
+        #: ``confirmed_timestamps`` argument of :meth:`validate_candles`.
+        confirmed: set[int] = set()
 
         def _record_quarantine(before: QCReport, kept: list[OHLCVCandle]) -> None:
             heal_attempts.append(
@@ -264,13 +296,30 @@ class QCValidator:
                     heal_attempts=[record.model_dump(mode="json") for record in heal_attempts],
                 )
 
+            windows: list[tuple[int, int]] = self._heal_windows(working, report)
+            if not windows:
+                # A CRITICAL verdict that names no timestamps cannot be targeted,
+                # and re-fetching the whole block on spec is how a single symbol
+                # used to burn the entire cycle budget.  Treat it as unhealable.
+                quarantined = self._try_quarantine(symbol, working, report, quarantine_unhealable)
+                if quarantined is not None:
+                    healed_candles, final_report = quarantined
+                    _record_quarantine(report, healed_candles)
+                    return healed_candles, final_report, heal_attempts
+                raise DataIntegrityError(
+                    "QC failure names no timestamps to re-fetch",
+                    symbol=symbol,
+                    attempts=attempt,
+                    codes=report.critical_codes,
+                    heal_attempts=[record.model_dump(mode="json") for record in heal_attempts],
+                )
+
             delay: float = backoff_delay(
                 attempt,
                 base_seconds=self._qc.heal_backoff_seconds,
                 max_seconds=self._settings.exchange.backoff_max_seconds,
                 jitter=self._settings.exchange.backoff_jitter,
             )
-            windows: list[tuple[int, int]] = self._heal_windows(working, report)
             reason: tuple[str, ...] = report.critical_codes
             _LOGGER.warning(
                 "QC failed for %s (%s) - heal attempt %d/%d: %d window(s) in %.2fs",
@@ -292,9 +341,18 @@ class QCValidator:
             )
             bars_received: int = sum(len(patch) for patch in patches)
 
-            working = self._merge_patches(working, self._suspicious_timestamps(report), patches)
-            report = self.validate_candles(symbol, working)
+            targeted: set[int] = self._suspicious_timestamps(report)
+            previous: dict[int, OHLCVCandle] = {
+                candle.timestamp: candle for candle in working
+            }
+            confirmed |= self._confirmed_timestamps(previous, targeted, patches)
+            working = self._merge_patches(working, targeted, patches)
+            report = self.validate_candles(symbol, working, confirmed_timestamps=confirmed)
             attempt += 1
+
+            changed: bool = any(
+                previous.get(candle.timestamp) != candle for candle in working
+            ) or len(working) != len(previous)
 
             heal_attempts.append(
                 HealAttempt(
@@ -302,16 +360,32 @@ class QCValidator:
                     attempt_number=attempt,
                     reason=reason,
                     window_count=len(windows),
-                    start_timestamp=windows[0][0] if windows else None,
-                    end_timestamp=windows[-1][1] if windows else None,
+                    start_timestamp=windows[0][0],
+                    end_timestamp=windows[-1][1],
                     bars_requested=bars_requested,
                     bars_received=bars_received,
                     bars_written=bars_received,
-                    bars_invalid_after_heal=len(self._suspicious_timestamps(report)),
+                    bars_invalid_after_heal=self._critical_bar_count(report),
                     duration_seconds=time.monotonic() - attempt_started,
                     result="resolved" if report.passed else "still_invalid",
                 )
             )
+
+            if not report.passed and not changed and bars_received:
+                # The exchange answered, and served exactly the same bytes back.
+                # Every further round would be a verbatim replay of this one -
+                # three more sleeps and three more identical round-trips per
+                # symbol, which is what used to stretch a 5-minute cycle past 20
+                # minutes.  An *empty* reply is different: that is a transient
+                # miss the backoff exists to ride out, so it still gets retried.
+                _LOGGER.warning(
+                    "%s: re-fetch returned identical data (%s) - abandoning the heal "
+                    "loop after %d attempt(s) instead of replaying it",
+                    symbol,
+                    ", ".join(report.critical_codes),
+                    attempt,
+                )
+                break
 
         if not report.passed:
             quarantined = self._try_quarantine(symbol, working, report, quarantine_unhealable)
@@ -761,7 +835,12 @@ class QCValidator:
             )
         return issues
 
-    def _check_volume_logic(self, symbol: str, candles: Sequence[OHLCVCandle]) -> list[QCIssue]:
+    def _check_volume_logic(
+        self,
+        symbol: str,
+        candles: Sequence[OHLCVCandle],
+        confirmed: frozenset[int] = frozenset(),
+    ) -> list[QCIssue]:
         """Screen for negative volume, glitch spikes and dead feeds."""
         issues: list[QCIssue] = []
         volumes: np.ndarray = np.asarray([candle.volume for candle in candles], dtype=np.float64)
@@ -777,7 +856,7 @@ class QCValidator:
                     severity=QCSeverity.CRITICAL,
                     message=f"{len(bad)} candle(s) report negative volume",
                     symbol=symbol,
-                    timestamps=tuple(bad[:50]),
+                    timestamps=tuple(bad),
                     healable=True,
                 )
             )
@@ -786,18 +865,48 @@ class QCValidator:
         if volumes.size >= self._qc.min_rows_for_statistics and (
             zero_ratio > self._qc.max_zero_volume_ratio
         ):
-            issues.append(
-                QCIssue(
-                    code=QCIssueCode.EXCESSIVE_ZERO_VOLUME,
-                    severity=QCSeverity.CRITICAL,
-                    message=(
-                        f"{zero_ratio:.1%} of candles have zero volume "
-                        f"(limit {self._qc.max_zero_volume_ratio:.0%})"
-                    ),
-                    symbol=symbol,
-                    healable=True,
+            # Naming the offending bars is what makes this healable at all: a
+            # bare block-level ratio gives the healer nothing to target, and it
+            # would otherwise fall back to re-fetching the *entire* history.
+            zero_timestamps: list[int] = [
+                candles[index].timestamp for index in np.flatnonzero(volumes <= 0.0).tolist()
+            ]
+            unconfirmed: list[int] = [ts for ts in zero_timestamps if ts not in confirmed]
+            unconfirmed_ratio: float = len(unconfirmed) / float(volumes.size)
+            if unconfirmed_ratio > self._qc.max_zero_volume_ratio:
+                issues.append(
+                    QCIssue(
+                        code=QCIssueCode.EXCESSIVE_ZERO_VOLUME,
+                        severity=QCSeverity.CRITICAL,
+                        message=(
+                            f"{zero_ratio:.1%} of candles have zero volume "
+                            f"(limit {self._qc.max_zero_volume_ratio:.0%})"
+                        ),
+                        symbol=symbol,
+                        timestamps=tuple(unconfirmed),
+                        healable=True,
+                    )
                 )
-            )
+            else:
+                # The exchange re-served these bars unchanged: the market really
+                # is this thin.  Surface it, but do not fail the block - the
+                # alternative is discarding a genuinely illiquid symbol's entire
+                # history over data that is not actually corrupt.
+                issues.append(
+                    QCIssue(
+                        code=QCIssueCode.EXCESSIVE_ZERO_VOLUME,
+                        severity=QCSeverity.WARNING,
+                        message=(
+                            f"{zero_ratio:.1%} of candles have zero volume "
+                            f"(limit {self._qc.max_zero_volume_ratio:.0%}); "
+                            "exchange-confirmed, treating the market as thin rather "
+                            "than the feed as broken"
+                        ),
+                        symbol=symbol,
+                        timestamps=tuple(zero_timestamps),
+                        healable=False,
+                    )
+                )
 
         positive: np.ndarray = volumes[volumes > 0.0]
         if positive.size >= self._qc.min_rows_for_statistics:
@@ -819,19 +928,29 @@ class QCValidator:
                                 f"({self._qc.volume_spike_median_multiple:.0f}x median volume)"
                             ),
                             symbol=symbol,
-                            timestamps=tuple(spikes[:50]),
+                            timestamps=tuple(spikes),
                             healable=False,
                         )
                     )
         return issues
 
-    def _check_return_outliers(self, symbol: str, candles: Sequence[OHLCVCandle]) -> list[QCIssue]:
+    def _check_return_outliers(
+        self,
+        symbol: str,
+        candles: Sequence[OHLCVCandle],
+        confirmed: frozenset[int] = frozenset(),
+    ) -> list[QCIssue]:
         """Robust outlier screen on close-to-close log returns.
 
         Uses the median absolute deviation instead of the standard deviation:
         a single corrupt print inflates sigma enough to mask itself, whereas the
         MAD has a 50 % breakdown point and stays anchored to the bulk of the
         distribution.
+
+        Bars in ``confirmed`` - ones the exchange re-served unchanged during
+        healing - are reported as WARNING rather than CRITICAL: a 40 % five-minute
+        candle that survives a fresh fetch is a real dislocation, and failing the
+        block over it costs every candle before it to quarantine.
         """
         issues: list[QCIssue] = []
         if len(candles) < self._qc.min_rows_for_statistics:
@@ -851,19 +970,38 @@ class QCValidator:
             offenders: list[int] = [
                 candles[index + 1].timestamp for index in np.flatnonzero(hard_mask).tolist()
             ]
-            issues.append(
-                QCIssue(
-                    code=QCIssueCode.RETURN_OUTLIER,
-                    severity=QCSeverity.CRITICAL,
-                    message=(
-                        f"{len(offenders)} candle(s) move more than "
-                        f"{self._qc.max_abs_candle_return:.0%} in a single 5m bar"
-                    ),
-                    symbol=symbol,
-                    timestamps=tuple(offenders[:50]),
-                    healable=True,
+            suspect: list[int] = [ts for ts in offenders if ts not in confirmed]
+            real_moves: list[int] = [ts for ts in offenders if ts in confirmed]
+            if suspect:
+                issues.append(
+                    QCIssue(
+                        code=QCIssueCode.RETURN_OUTLIER,
+                        severity=QCSeverity.CRITICAL,
+                        message=(
+                            f"{len(suspect)} candle(s) move more than "
+                            f"{self._qc.max_abs_candle_return:.0%} in a single 5m bar"
+                        ),
+                        symbol=symbol,
+                        timestamps=tuple(suspect),
+                        healable=True,
+                    )
                 )
-            )
+            if real_moves:
+                issues.append(
+                    QCIssue(
+                        code=QCIssueCode.RETURN_OUTLIER,
+                        severity=QCSeverity.WARNING,
+                        message=(
+                            f"{len(real_moves)} candle(s) move more than "
+                            f"{self._qc.max_abs_candle_return:.0%} in a single 5m bar "
+                            "but were re-served unchanged by the exchange; accepted as "
+                            "a genuine dislocation rather than a bad print"
+                        ),
+                        symbol=symbol,
+                        timestamps=tuple(real_moves),
+                        healable=False,
+                    )
+                )
 
         median: float = float(np.median(log_returns))
         mad: float = float(np.median(np.abs(log_returns - median)))
@@ -888,7 +1026,7 @@ class QCValidator:
                         f"(sigma={sigma:.5f})"
                     ),
                     symbol=symbol,
-                    timestamps=tuple(offenders[:50]),
+                    timestamps=tuple(offenders),
                     healable=False,
                 )
             )
@@ -940,6 +1078,44 @@ class QCValidator:
                 suspicious.update(issue.timestamps)
         return suspicious
 
+    def _critical_bar_count(self, report: QCReport) -> int:
+        """How many bars are still tied to a CRITICAL verdict.
+
+        Reported as ``bars_invalid_after_heal``.  Counting the suspicious set
+        alone used to under-report badly: a block-level verdict that named no
+        timestamps showed ``0`` bars invalid next to a ``still_invalid`` result.
+        """
+        return len(self._suspicious_timestamps(report))
+
+    @staticmethod
+    def _confirmed_timestamps(
+        previous: dict[int, OHLCVCandle],
+        targeted: set[int],
+        patches: Sequence[Sequence[OHLCVCandle]],
+    ) -> set[int]:
+        """Targeted bars the exchange re-served with identical OHLCV values.
+
+        These are the bars a further re-fetch can never change, and the ones
+        :meth:`validate_candles` stops treating as corruption.
+        """
+        confirmed: set[int] = set()
+        for patch in patches:
+            for candle in patch:
+                if candle.timestamp not in targeted:
+                    continue
+                before: OHLCVCandle | None = previous.get(candle.timestamp)
+                if before is None:
+                    continue
+                if (
+                    before.open == candle.open
+                    and before.high == candle.high
+                    and before.low == candle.low
+                    and before.close == candle.close
+                    and before.volume == candle.volume
+                ):
+                    confirmed.add(candle.timestamp)
+        return confirmed
+
     def _heal_windows(
         self,
         candles: Sequence[OHLCVCandle],
@@ -979,7 +1155,11 @@ class QCValidator:
 
         if not suspicious:
             if candles:
-                return [(candles[0].timestamp, candles[-1].timestamp + self._timeframe_ms)]
+                # A CRITICAL verdict that names no bars gives the healer nothing
+                # to aim at.  Re-fetching the whole block "just in case" is how a
+                # single symbol once requested 212 401 bars and spent 415 s against
+                # a 90 s budget; an empty plan tells the caller it is unhealable.
+                return []
             end_ms: int = last_closed_candle_open_ms(self._timeframe_ms)
             span: int = self._settings.data.ohlcv_limit * self._timeframe_ms
             return [(end_ms - span, end_ms)]
@@ -1003,8 +1183,25 @@ class QCValidator:
             windows[-1] = (last_start, max(last_end, newest_expected))
 
         if len(windows) > self._qc.max_heal_window_groups:
-            return self._batch_windows(windows)
-        return windows
+            windows = self._batch_windows(windows)
+        return self._split_oversized(windows)
+
+    def _split_oversized(self, windows: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
+        """Chop any window wider than ``max_heal_window_bars`` into bounded slices.
+
+        ``_batch_windows`` bounds the *coalesced* case, but a single contiguous
+        run of damage - a multi-week zero-volume stretch, say - is one window
+        from the start and used to escape the cap entirely.
+        """
+        max_span_ms: int = self._qc.max_heal_window_bars * self._timeframe_ms
+        sliced: list[tuple[int, int]] = []
+        for start_ms, end_ms in windows:
+            cursor: int = start_ms
+            while end_ms - cursor > max_span_ms:
+                sliced.append((cursor, cursor + max_span_ms))
+                cursor += max_span_ms
+            sliced.append((cursor, end_ms))
+        return sliced
 
     def _batch_windows(self, windows: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
         """Coalesce many small windows into few, but bounded-size, batches.
