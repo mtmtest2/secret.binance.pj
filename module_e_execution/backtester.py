@@ -45,6 +45,7 @@ from module_c_ml.decision_engine import DecisionContext, DecisionEngine
 from module_c_ml.ml_models import MLSubsystem
 from module_c_ml.schemas import DecisionResult, TradeAction, TradeSignal
 from module_e_execution.models import CloseReason, Position, PositionStatus
+from module_e_execution.tp_ladder import LadderEvent
 
 _LOGGER = get_logger(__name__)
 
@@ -265,10 +266,8 @@ class Backtester:
                     continue
                 position: Position = positions[symbol]
                 self._accrue_funding(position, row, funding_lookup.get(symbol, {}), timestamp)
-                resolution: tuple[CloseReason, float] | None = self._resolve_bar(position, row)
-                if resolution is not None:
-                    reason, price = resolution
-                    balance += self._book_close(position, price, reason, timestamp)
+                balance += self._advance_bar(position, row, timestamp)
+                if position.status is not PositionStatus.OPEN:
                     closed.append(position.to_row() | {"closed_ts": timestamp})
                     positions.pop(symbol, None)
 
@@ -418,6 +417,7 @@ class Backtester:
             quantity=quantity,
             maintenance_margin_rate=self._config.maintenance_margin_rate,
             mode=self.mode,
+            take_profit_config=self._settings.take_profit,
         )
         # The barriers were computed off the decision-bar close; re-anchor them to
         # the actual fill so the geometry the models asked for is preserved.
@@ -436,58 +436,98 @@ class Backtester:
         position.last_funding_ms = int(row["timestamp"])
         return position
 
-    def _resolve_bar(self, position: Position, row: pd.Series) -> tuple[CloseReason, float] | None:
-        """Decide whether this bar closes the position, pessimistically.
+    def _advance_bar(self, position: Position, row: pd.Series, timestamp: int) -> float:
+        """Run one bar through the position and return the cash delta it produced.
 
-        The adverse side is evaluated first.  For a long, the *higher* of the
-        stop and the liquidation price is reached first on the way down, so that
-        level - and its reason - wins.  Only if neither adverse level was touched
-        is the take-profit considered, and only then is the trailing stop allowed
-        to ratchet on the bar's favourable extreme.
+        Precedence within a bar is fixed and always unfavourable to the position:
+
+        1. **Liquidation** - checked before anything else, because a liquidated
+           position cannot go on to take a profit.
+        2. **The ladder**, which applies its own adverse-first rule (see
+           :mod:`module_e_execution.tp_ladder`): the in-force stop is tested
+           against the bar's adverse extreme *before* any take-profit level is
+           allowed to fill, and re-tested afterwards against the same bar.
+        3. **The trailing stop**, which may only ratchet on a bar that resolved
+           nothing, and is then immediately re-tested against that bar's adverse
+           extreme.
+
+        With OHLCV alone the true intrabar sequence is unknowable, so the
+        favourable ordering is never assumed anywhere in this chain.
         """
         high: float = float(row["high"])
         low: float = float(row["low"])
         position.update_excursions(high, low)
 
-        stop: float = position.effective_stop()
         liquidation: float = position.liquidation_price
+        stop: float = position.effective_stop()
+        if liquidation > 0.0:
+            liquidation_hit: bool = low <= liquidation if position.is_long else high >= liquidation
+            liquidation_first: bool = (
+                liquidation >= stop if position.is_long else liquidation <= stop
+            )
+            if liquidation_hit and liquidation_first:
+                return self._book_close(position, liquidation, CloseReason.LIQUIDATION, timestamp)
 
+        if position.ladder is not None:
+            events: list[LadderEvent] = position.ladder.on_bar(high, low)
+            if events:
+                return self._book_ladder_events(position, events, timestamp)
+            return 0.0
+
+        # --- Ladder disabled: the original single-target behaviour ----------
         if position.is_long:
-            adverse_level: float = max(stop, liquidation)
-            adverse_hit: bool = low <= adverse_level
+            adverse_hit: bool = low <= stop
             target_hit: bool = high >= position.take_profit
         else:
-            adverse_level = min(stop, liquidation) if liquidation > 0.0 else stop
-            adverse_hit = high >= adverse_level
+            adverse_hit = high >= stop
             target_hit = low <= position.take_profit
 
         if adverse_hit:
-            liquidation_first: bool = (
-                liquidation > 0.0
-                and (liquidation >= stop if position.is_long else liquidation <= stop)
-            )
-            if liquidation_first:
-                return CloseReason.LIQUIDATION, liquidation
-            reason: CloseReason = (
-                CloseReason.TRAILING_STOP if position.trailing_active else CloseReason.STOP_LOSS
-            )
-            return reason, stop
-
+            return self._book_close(position, stop, position.stop_close_reason(), timestamp)
         if target_hit:
-            return CloseReason.TAKE_PROFIT, position.take_profit
+            return self._book_close(
+                position, position.take_profit, CloseReason.TAKE_PROFIT, timestamp
+            )
 
-        # Neither pre-existing barrier was touched, so the trail may ratchet on
-        # this bar's favourable extreme.  Having done so, the bar's *adverse*
-        # extreme must be re-tested against the tightened stop: a bar that ran up
-        # and then gave it all back would otherwise escape until the next bar, an
-        # optimism that compounds across a backtest.
         advanced: float | None = position.advance_trailing(high if position.is_long else low)
         if advanced is None:
-            return None
+            return 0.0
         breached: bool = low <= advanced if position.is_long else high >= advanced
         if breached:
-            return CloseReason.TRAILING_STOP, advanced
-        return None
+            return self._book_close(position, advanced, CloseReason.TRAILING_STOP, timestamp)
+        return 0.0
+
+    def _book_ladder_events(
+        self,
+        position: Position,
+        events: list[LadderEvent],
+        timestamp: int,
+    ) -> float:
+        """Book every leg the ladder produced on this bar, with costs."""
+        delta: float = 0.0
+        last_reason: CloseReason = CloseReason.TAKE_PROFIT
+        for event in events:
+            fill_price: float = self._exit_price(position, event.price)
+            leg_delta, last_reason = position.apply_ladder_event(
+                event,
+                exit_price=fill_price,
+                fee_rate=self._config.taker_fee,
+                timestamp_ms=timestamp,
+            )
+            delta += leg_delta
+
+        if position.is_flat:
+            delta -= position.funding_paid
+            position.exit_price = self._exit_price(position, events[-1].price)
+            position.close_reason = last_reason.value
+            position.closed_at = datetime.fromtimestamp(timestamp / 1_000.0, tz=timezone.utc)
+            position.status = PositionStatus.CLOSED
+        return delta
+
+    def _exit_price(self, position: Position, raw_price: float) -> float:
+        """Apply exit slippage in the unfavourable direction."""
+        penalty: float = self._config.slippage_bps / 10_000.0
+        return raw_price * (1.0 - penalty) if position.is_long else raw_price * (1.0 + penalty)
 
     def _accrue_funding(
         self,
@@ -550,15 +590,20 @@ class Backtester:
         else:
             exit_price = raw_price * (1.0 + penalty)
 
-        gross: float = (exit_price - position.entry_price) * position.quantity * position.direction
-        exit_fee: float = exit_price * position.quantity * self._config.taker_fee
+        remaining: float = position.quantity
+        gross: float = (exit_price - position.entry_price) * remaining * position.direction
+        exit_fee: float = exit_price * remaining * self._config.taker_fee
         position.fees_paid += exit_fee
 
         delta: float = gross - exit_fee - position.funding_paid
         if reason is CloseReason.LIQUIDATION:
-            delta = max(delta, -position.margin)
+            # Isolated margin caps the loss at the committed margin, and profit
+            # already banked by earlier ladder legs is not clawed back.
+            delta = max(delta, -position.margin - position.realized_pnl)
 
-        position.realized_pnl = delta
+        # ``realized_pnl`` may already carry closed ladder legs, so this adds
+        # to it rather than replacing it.
+        position.realized_pnl += delta
         position.exit_price = exit_price
         position.close_reason = reason.value
         position.closed_at = datetime.fromtimestamp(timestamp / 1_000.0, tz=timezone.utc)
@@ -614,6 +659,8 @@ class Backtester:
             annualised = 0.0
 
         return {
+            **self._ladder_metrics(trades),
+            **self._side_metrics(trades),
             "total_trades": float(pnls.size),
             "winning_trades": float(wins.size),
             "losing_trades": float(losses.size),
@@ -641,6 +688,80 @@ class Backtester:
                 sum(1 for trade in trades if trade.get("close_reason") == CloseReason.LIQUIDATION.value)
             ),
         }
+
+    @staticmethod
+    def _ladder_metrics(trades: list[dict[str, Any]]) -> dict[str, float]:
+        """How the three-stage ladder actually behaved.
+
+        These are the numbers that say whether the ladder is doing its job:
+        what share of trades got far enough to move the stop to breakeven, what
+        share banked a TP1-locked profit after reversing, and what the average
+        realised R and trade return look like once partial closes are counted.
+        """
+        total: int = len(trades)
+        if total == 0:
+            return {}
+
+        reached: dict[str, int] = {"tp1": 0, "tp2": 0, "tp3": 0}
+        stopped: dict[str, int] = {"INITIAL": 0, "BREAKEVEN": 0, "TP1_LOCKED": 0}
+        realized_r: list[float] = []
+        returns: list[float] = []
+
+        for trade in trades:
+            payload: dict[str, Any] = trade.get("payload") or {}
+            ladder: dict[str, Any] | None = payload.get("ladder")
+            if ladder:
+                reached["tp1"] += int(bool(ladder.get("reached_tp1")))
+                reached["tp2"] += int(bool(ladder.get("reached_tp2")))
+                reached["tp3"] += int(bool(ladder.get("reached_tp3")))
+            protection: str = str(payload.get("stop_protection") or "")
+            if protection in stopped:
+                stopped[protection] += 1
+            realized_r.append(float(payload.get("realized_r", 0.0) or 0.0))
+            margin: float = float(trade.get("margin", 0.0) or 0.0)
+            if margin > 0.0:
+                returns.append(float(trade.get("realized_pnl", 0.0)) / margin)
+
+        return {
+            "pct_reached_tp1": reached["tp1"] / total,
+            "pct_reached_tp2": reached["tp2"] / total,
+            "pct_reached_tp3": reached["tp3"] / total,
+            "pct_stopped_initial": stopped["INITIAL"] / total,
+            "pct_stopped_breakeven": stopped["BREAKEVEN"] / total,
+            "pct_stopped_tp1_locked": stopped["TP1_LOCKED"] / total,
+            "average_r": float(np.mean(realized_r)) if realized_r else 0.0,
+            "average_trade_return": float(np.mean(returns)) if returns else 0.0,
+        }
+
+    @staticmethod
+    def _side_metrics(trades: list[dict[str, Any]]) -> dict[str, float]:
+        """LONG and SHORT performance reported separately.
+
+        A strategy whose aggregate looks acceptable while one side bleeds is a
+        strategy with one working half; the split is the only way to see it.
+        """
+        metrics: dict[str, float] = {}
+        for side in ("LONG", "SHORT"):
+            subset: list[dict[str, Any]] = [
+                trade for trade in trades if str(trade.get("side")) == side
+            ]
+            pnls: np.ndarray = np.asarray(
+                [float(trade.get("realized_pnl", 0.0)) for trade in subset], dtype=np.float64
+            )
+            prefix: str = side.lower()
+            wins: np.ndarray = pnls[pnls > 0.0]
+            losses: np.ndarray = pnls[pnls < 0.0]
+            gross_loss: float = float(-losses.sum()) if losses.size else 0.0
+            metrics[f"{prefix}_trades"] = float(pnls.size)
+            metrics[f"{prefix}_win_rate"] = float(wins.size / pnls.size) if pnls.size else 0.0
+            metrics[f"{prefix}_net_profit"] = float(pnls.sum()) if pnls.size else 0.0
+            metrics[f"{prefix}_expectancy"] = float(pnls.mean()) if pnls.size else 0.0
+            metrics[f"{prefix}_profit_factor"] = (
+                float(wins.sum()) / gross_loss
+                if gross_loss > 0.0
+                else (math.inf if wins.size else 0.0)
+            )
+        return metrics
 
     @staticmethod
     def _max_drawdown(equity: np.ndarray) -> float:

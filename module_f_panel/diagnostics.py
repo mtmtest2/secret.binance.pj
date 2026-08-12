@@ -315,6 +315,67 @@ def _microstructure_coverage(dataset: ProcessedDataset) -> dict[str, Any]:
     return {"status": "AVAILABLE", "features": coverage}
 
 
+def _take_profit_ladder(
+    settings: Settings,
+    backtest: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """How the three-stage take-profit ladder actually behaved in the backtest.
+
+    Pulled out of the backtest metrics blob into its own section because these
+    are the numbers that say whether the ladder is earning its complexity: what
+    share of trades got far enough to move the stop to breakeven, what share
+    banked a TP1-locked profit after reversing, and what the average realised R
+    looks like once partial closes are counted.
+
+    A configured-but-never-triggered ladder and a disabled one look very
+    different here, which is the point - the configuration is reported
+    alongside the outcome so the two can be compared.
+    """
+    config = settings.take_profit
+    section: dict[str, Any] = {
+        "enabled": config.enabled,
+        "level_fractions": list(config.level_fractions),
+        "close_fractions": list(config.close_fractions),
+        "breakeven_after_tp1": config.breakeven_after_tp1,
+        "lock_tp1_after_tp2": config.lock_tp1_after_tp2,
+    }
+    if not backtest or backtest.get("status") == NOT_AVAILABLE:
+        section["status"] = NOT_AVAILABLE
+        section["reason"] = "no backtest was run for this training run"
+        return section
+
+    metrics: dict[str, Any] = backtest.get("metrics", {}) or {}
+    tracked: tuple[str, ...] = (
+        "pct_reached_tp1",
+        "pct_reached_tp2",
+        "pct_reached_tp3",
+        "pct_stopped_initial",
+        "pct_stopped_breakeven",
+        "pct_stopped_tp1_locked",
+        "average_r",
+        "average_trade_return",
+    )
+    measured: dict[str, Any] = {key: metrics[key] for key in tracked if key in metrics}
+    if not measured:
+        section["status"] = NOT_AVAILABLE
+        section["reason"] = "backtest produced no ladder statistics (no closed trades)"
+        return section
+
+    section["status"] = "AVAILABLE"
+    section.update(measured)
+    section["long"] = {
+        key: metrics[key]
+        for key in ("long_trades", "long_win_rate", "long_net_profit", "long_profit_factor")
+        if key in metrics
+    }
+    section["short"] = {
+        key: metrics[key]
+        for key in ("short_trades", "short_win_rate", "short_net_profit", "short_profit_factor")
+        if key in metrics
+    }
+    return section
+
+
 def _backtest_reliability(backtest: dict[str, Any] | None) -> dict[str, Any]:
     """Flag whether a backtest's trade count is large enough to trust its
     ratio-based metrics (win rate, profit factor, expectancy, Sharpe, Sortino,
@@ -612,6 +673,9 @@ async def build_report(
             else {"status": NOT_AVAILABLE, "reason": "direction model is not trained"}
         ),
         "backtest": backtest.to_dict() if backtest is not None else {"status": NOT_AVAILABLE},
+        "take_profit_ladder": _take_profit_ladder(
+            settings, backtest.to_dict() if backtest is not None else None
+        ),
         "backtest_reliability": _backtest_reliability(
             backtest.to_dict() if backtest is not None else None
         ),
@@ -883,6 +947,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         "## Backtest",
         f"```json\n{json.dumps(_trim(report.get('backtest', {})), indent=2, default=str)}\n```",
+        "",
+        "## Take-Profit Ladder (TP1/TP2/TP3 + dynamic stop)",
+        f"```json\n{json.dumps(report.get('take_profit_ladder', {}), indent=2, default=str)}\n```",
         "",
         "## Backtest Reliability",
         f"```json\n{json.dumps(report.get('backtest_reliability', {}), indent=2, default=str)}\n```",

@@ -514,6 +514,68 @@ class RiskSettings(BaseModel):
         return self
 
 
+class TakeProfitSettings(BaseModel):
+    """Three-stage take-profit ladder with a stage-driven stop loss.
+
+    The ladder scales out of a position at three targets and ratchets the stop
+    behind them, so profit is protected progressively while the remainder is
+    still allowed to reach the final target:
+
+    ==========  ==================================  ==========================
+    Stage       Trigger                             Stop moves to
+    ==========  ==================================  ==========================
+    ``TP1``     ``level_fractions[0]`` of the TP     entry (breakeven)
+    ``TP2``     ``level_fractions[1]`` of the TP     the TP1 price
+    ``TP3``     the model's full take-profit         position is closed out
+    ==========  ==================================  ==========================
+
+    Levels are expressed as fractions of the take-profit distance the Exit model
+    produced, so the ladder inherits the model's volatility-scaled geometry
+    instead of imposing a second, unrelated one.  With the default thirds, a long
+    entered at 100 with a 3 % target and a 2 % stop gets TP1=101, TP2=102,
+    TP3=103 and SL=98 - the worked example in the specification.
+    """
+
+    enabled: bool = Field(default=True)
+
+    #: TP1/TP2/TP3 as fractions of the full take-profit distance.  Strictly
+    #: increasing; the last entry is the model's own target and must be 1.0.
+    level_fractions: tuple[float, float, float] = Field(default=(1.0 / 3.0, 2.0 / 3.0, 1.0))
+    #: Share of the *original* position closed at each level.  Must sum to 1.0.
+    close_fractions: tuple[float, float, float] = Field(default=(0.30, 0.30, 0.40))
+
+    #: Move the stop to breakeven once TP1 fills.
+    breakeven_after_tp1: bool = Field(default=True)
+    #: Move the stop to the TP1 price once TP2 fills.
+    lock_tp1_after_tp2: bool = Field(default=True)
+    #: Offset applied to the breakeven stop, as a fraction of the entry price, so
+    #: that "breakeven" still covers the round-trip fee instead of scratching.
+    breakeven_offset_pct: float = Field(default=0.0, ge=0.0, le=0.01)
+
+    #: Minimum share of the original position any single leg may close.  Legs
+    #: below this are merged forward, which stops an exchange rejecting a
+    #: dust-sized reduce-only order.
+    min_leg_fraction: float = Field(default=0.05, gt=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _validate_ladder(self) -> "TakeProfitSettings":
+        if len(self.level_fractions) != 3 or len(self.close_fractions) != 3:
+            raise ValueError("the ladder is defined by exactly three levels")
+        if any(value <= 0.0 for value in self.level_fractions):
+            raise ValueError("take-profit level fractions must be positive")
+        if list(self.level_fractions) != sorted(self.level_fractions):
+            raise ValueError("take-profit level fractions must be strictly increasing")
+        if len(set(self.level_fractions)) != 3:
+            raise ValueError("take-profit level fractions must be distinct")
+        if abs(self.level_fractions[-1] - 1.0) > 1e-9:
+            raise ValueError("the final take-profit level must be the model's own target (1.0)")
+        if any(value <= 0.0 for value in self.close_fractions):
+            raise ValueError("every ladder leg must close a positive share")
+        if abs(sum(self.close_fractions) - 1.0) > 1e-6:
+            raise ValueError("close_fractions must sum to 1.0")
+        return self
+
+
 class ExecutionSettings(BaseModel):
     """Order-routing, fee and simulation parameters (Module E)."""
 
@@ -600,6 +662,7 @@ class Settings(BaseSettings):
     ml: MLSettings = Field(default_factory=MLSettings)
     decision: DecisionSettings = Field(default_factory=DecisionSettings)
     risk: RiskSettings = Field(default_factory=RiskSettings)
+    take_profit: TakeProfitSettings = Field(default_factory=TakeProfitSettings)
     execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
     web: WebSettings = Field(default_factory=WebSettings)
     db: DatabaseSettings = Field(default_factory=DatabaseSettings)
