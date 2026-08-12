@@ -26,9 +26,12 @@ from config.settings import Settings
 from core.exceptions import DataFetchError
 from core.logger import get_logger
 from core.utils import async_retry, safe_float, utc_now_ms
-from module_a_data.models import FuturesMetrics, OHLCVCandle, OrderBookSnapshot
+from module_a_data.models import AggTradeFlow, FuturesMetrics, OHLCVCandle, OrderBookSnapshot
 
 _LOGGER = get_logger(__name__)
+
+#: Binance rejects an ``aggTrades`` window wider than one hour.
+_AGG_TRADE_MAX_SPAN_MS: Final[int] = 60 * 60 * 1_000
 
 #: Errors worth retrying - all of them are transient by nature.
 TRANSIENT_ERRORS: Final[tuple[type[BaseException], ...]] = (
@@ -368,25 +371,18 @@ class BinanceDataFetcher:
         and are *not* worth halting trading over.
         """
         await self.load_markets()
-        market_id: str = self._market_id(symbol)
         now_ms: int = utc_now_ms()
 
         results: list[Any] = await asyncio.gather(
             self._safe_funding_rate(symbol),
             self._safe_open_interest(symbol),
-            self._safe_ratio(market_id, "fapiDataGetGlobalLongShortAccountRatio", "longShortRatio"),
-            self._safe_ratio(market_id, "fapiDataGetTopLongShortAccountRatio", "longShortRatio"),
-            self._safe_ratio(market_id, "fapiDataGetTakerlongshortRatio", "buySellRatio"),
             self._safe_liquidations(symbol),
             return_exceptions=False,
         )
 
         funding: dict[str, float | int | None] = results[0]
         open_interest: dict[str, float] = results[1]
-        global_ls: float = results[2]
-        top_ls: float = results[3]
-        taker_ratio: float = results[4]
-        liquidations: tuple[float, float] = results[5]
+        liquidations: tuple[float, float] = results[2]
 
         return FuturesMetrics(
             symbol=symbol,
@@ -397,9 +393,6 @@ class BinanceDataFetcher:
             ),
             open_interest=open_interest.get("amount", 0.0),
             open_interest_value=open_interest.get("value", 0.0),
-            long_short_ratio=global_ls,
-            top_trader_long_short_ratio=top_ls,
-            taker_buy_sell_ratio=taker_ratio,
             liquidation_buy_volume=liquidations[0],
             liquidation_sell_volume=liquidations[1],
             mark_price=float(funding.get("mark_price") or 0.0),
@@ -451,28 +444,6 @@ class BinanceDataFetcher:
         )
         return {"amount": max(0.0, amount), "value": max(0.0, value)}
 
-    async def _safe_ratio(self, market_id: str, endpoint: str, field: str) -> float:
-        """Fetch a positioning ratio from the ``futures/data`` implicit endpoints.
-
-        Returns ``1.0`` (perfectly balanced) whenever the endpoint is missing,
-        rate-limited or returns an empty series.
-        """
-        method: Any = getattr(self._exchange, endpoint, None)
-        if method is None:
-            return 1.0
-
-        params: dict[str, Any] = {"symbol": market_id, "period": self._timeframe, "limit": 1}
-        try:
-            payload: Any = await self._call(f"{endpoint}[{market_id}]", lambda: method(params))
-        except DataFetchError as error:
-            _LOGGER.debug("%s unavailable for %s: %s", endpoint, market_id, error)
-            return 1.0
-
-        if not isinstance(payload, list) or not payload:
-            return 1.0
-        value: float = safe_float(payload[-1].get(field), 1.0)
-        return max(0.0, value)
-
     async def _safe_liquidations(self, symbol: str) -> tuple[float, float]:
         """Fetch recent liquidation flow as ``(buy_volume, sell_volume)``.
 
@@ -505,6 +476,174 @@ class BinanceDataFetcher:
             else:
                 sell_volume += quote
         return (buy_volume, sell_volume)
+
+    # ------------------------------------------------------------------
+    # Aggregated trades -> 5-minute order-flow buckets
+    # ------------------------------------------------------------------
+    async def fetch_agg_trade_flow(
+        self,
+        symbol: str,
+        start_ms: int,
+        end_ms: int,
+    ) -> list[AggTradeFlow]:
+        """Fold Binance Futures ``aggTrades`` into closed 5-minute flow buckets.
+
+        The endpoint is walked forward with ``startTime``/``endTime`` paging
+        (1000 rows per page).  Every aggregated trade carries ``m``
+        (``isBuyerMaker``), which is the *only* trustworthy source of aggressor
+        side: ``m == false`` means the buyer lifted the offer, so the quantity is
+        aggressive buy volume; ``m == true`` means the seller hit the bid.
+
+        Args:
+            symbol: ccxt unified symbol.
+            start_ms: Inclusive lower bound; snapped down to a bucket boundary.
+            end_ms: Exclusive upper bound on trade time.  Buckets that would
+                extend past it are dropped, so a partially observed bucket can
+                never reach the feature stack.
+
+        Returns:
+            Buckets sorted ascending by open time.  Intervals in which nothing
+            traded are simply absent - the feature layer treats a missing bucket
+            as genuinely zero flow, which is what it is.
+        """
+        await self.load_markets()
+        bucket_ms: int = self._timeframe_ms
+        if end_ms <= start_ms:
+            return []
+
+        first_bucket: int = (start_ms // bucket_ms) * bucket_ms
+        # Only fully closed buckets may be emitted.
+        last_bucket_exclusive: int = (end_ms // bucket_ms) * bucket_ms
+        if last_bucket_exclusive <= first_bucket:
+            return []
+
+        market_id: str = self._market_id(symbol)
+        method: Any = getattr(self._exchange, "fapiPublicGetAggTrades", None)
+        page_limit: int = self._settings.data.agg_trade_page_limit
+
+        buckets: dict[int, dict[str, float]] = {}
+        cursor: int = first_bucket
+        pages: int = 0
+
+        while cursor < last_bucket_exclusive and pages < self._settings.data.agg_trade_max_pages:
+            pages += 1
+            rows: list[dict[str, Any]] = await self._fetch_agg_trade_page(
+                symbol, market_id, method, cursor, last_bucket_exclusive, page_limit
+            )
+            if not rows:
+                break
+
+            newest: int = cursor
+            for row in rows:
+                traded_at: int = int(safe_float(row.get("T") or row.get("timestamp"), 0.0))
+                if traded_at <= 0 or traded_at >= last_bucket_exclusive:
+                    continue
+                newest = max(newest, traded_at)
+
+                quantity: float = safe_float(row.get("q") or row.get("amount"), 0.0)
+                price: float = safe_float(row.get("p") or row.get("price"), 0.0)
+                if quantity <= 0.0:
+                    continue
+
+                bucket_key: int = (traded_at // bucket_ms) * bucket_ms
+                bucket: dict[str, float] = buckets.setdefault(
+                    bucket_key,
+                    {
+                        "buy_volume": 0.0,
+                        "sell_volume": 0.0,
+                        "buy_quote_volume": 0.0,
+                        "sell_quote_volume": 0.0,
+                        "trades": 0.0,
+                    },
+                )
+                buyer_is_maker: bool = self._is_buyer_maker(row)
+                side: str = "sell" if buyer_is_maker else "buy"
+                bucket[f"{side}_volume"] += quantity
+                bucket[f"{side}_quote_volume"] += quantity * price
+                bucket["trades"] += 1.0
+
+            if len(rows) < page_limit:
+                # The exchange returned a partial page: the range is exhausted.
+                break
+            advanced: int = newest + 1
+            if advanced <= cursor:
+                break  # No forward progress; stop rather than spin.
+            cursor = advanced
+
+        return [
+            AggTradeFlow(
+                symbol=symbol,
+                timestamp=key,
+                buy_volume=values["buy_volume"],
+                sell_volume=values["sell_volume"],
+                buy_quote_volume=values["buy_quote_volume"],
+                sell_quote_volume=values["sell_quote_volume"],
+                trades=int(values["trades"]),
+            )
+            for key, values in sorted(buckets.items())
+        ]
+
+    async def _fetch_agg_trade_page(
+        self,
+        symbol: str,
+        market_id: str,
+        method: Any,
+        start_ms: int,
+        end_ms: int,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Fetch one ``aggTrades`` page, preferring the raw Binance endpoint.
+
+        The implicit ``fapiPublicGetAggTrades`` call is used when the installed
+        ccxt build exposes it, because it returns ``m`` (``isBuyerMaker``)
+        verbatim.  Otherwise the call falls back to unified ``fetch_trades``,
+        whose parsed ``side`` ccxt derives from exactly the same flag.
+        """
+        if method is not None:
+            params: dict[str, Any] = {
+                "symbol": market_id,
+                "startTime": int(start_ms),
+                # Binance requires endTime - startTime <= 1 h on this endpoint.
+                "endTime": int(min(end_ms, start_ms + _AGG_TRADE_MAX_SPAN_MS)),
+                "limit": limit,
+            }
+            try:
+                payload: Any = await self._call(
+                    f"agg_trades[{market_id}]", lambda: method(params)
+                )
+            except DataFetchError as error:
+                _LOGGER.warning("aggTrades unavailable for %s: %s", symbol, error)
+                return []
+            return [row for row in payload if isinstance(row, dict)] if isinstance(payload, list) else []
+
+        try:
+            trades: Any = await self._call(
+                f"fetch_trades[{symbol}]",
+                lambda: self._exchange.fetch_trades(symbol, since=int(start_ms), limit=limit),
+            )
+        except DataFetchError as error:
+            _LOGGER.warning("Trade history unavailable for %s: %s", symbol, error)
+            return []
+        return [row for row in trades if isinstance(row, dict)] if isinstance(trades, list) else []
+
+    @staticmethod
+    def _is_buyer_maker(row: dict[str, Any]) -> bool:
+        """Read the aggressor side out of a raw or ccxt-parsed trade row.
+
+        Raw Binance rows carry ``m``; ccxt-parsed rows carry ``side`` (``"sell"``
+        when the buyer was the maker) and often ``info.m``.  Anything else is
+        treated as a maker-buy, i.e. the *conservative* reading that keeps an
+        unclassifiable trade out of the aggressive-buy bucket.
+        """
+        if "m" in row:
+            return bool(row["m"])
+        info: Any = row.get("info")
+        if isinstance(info, dict) and "m" in info:
+            return bool(info["m"])
+        side: str = str(row.get("side") or "").lower()
+        if side in {"buy", "sell"}:
+            return side == "sell"
+        return True
 
     # ------------------------------------------------------------------
     # Misc

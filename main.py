@@ -40,10 +40,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import signal
 import sys
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Final, Sequence
 
 import uvicorn
@@ -269,6 +271,19 @@ class TradingSystem:
 
         written: dict[str, int] = await self.pipeline.bootstrap_history(symbols, progress=report)
         self.progress.data_summary = written
+
+        # Order flow is backfilled after the candles because its window is bounded
+        # by the candle range: the two must cover the same period or the
+        # order-flow features would be NaN over the part they do not overlap.
+        if self.settings.data.collect_agg_trades:
+            self.progress.advance(0, len(symbols), "backfilling aggTrade order flow")
+            buckets: dict[str, int] = await self.pipeline.bootstrap_agg_trade_flow(
+                symbols, progress=report
+            )
+            self.progress.data_summary = {
+                **written,
+                "_agg_trade_buckets": sum(buckets.values()),
+            }
 
         stored: dict[str, int] = {
             symbol: await self.database.candle_count(symbol) for symbol in symbols
@@ -954,6 +969,14 @@ class TradingSystem:
         for symbol, count in sorted(written.items()):
             stored: int = await self.database.candle_count(symbol)
             _LOGGER.info("%-22s +%6d candles (stored: %d)", symbol, count, stored)
+
+        if self.settings.data.collect_agg_trades:
+            buckets: dict[str, int] = await self.pipeline.bootstrap_agg_trade_flow(symbols)
+            _LOGGER.info(
+                "Order-flow buckets written: %d across %d symbol(s)",
+                sum(buckets.values()),
+                len(buckets),
+            )
         await self.fetcher.close()
         await self.database.close()
 
@@ -996,6 +1019,112 @@ class TradingSystem:
         await self.database.close()
         return report
 
+    async def command_compare(
+        self,
+        max_candles: int | None = None,
+        equity: float | None = None,
+        skip_backtest: bool = False,
+    ) -> dict[str, Any]:
+        """Run the full BASELINE vs NEW IDEA comparison and write the report.
+
+        Three passes, in this order, all on the same dataset:
+
+        1. **Direction quality** - the frozen single-stage baseline and the new
+           two-stage cascade are trained on identical rows and scored by the same
+           evaluator at the *same, unchanged* decision threshold.
+        2. **Walk-forward** - both are refitted per fold over the in-sample
+           region so degradation over time is visible, not averaged away.
+        3. **Trading** - the backtester replays the same history through each
+           model with identical execution assumptions, once with the frozen
+           baseline promoted into the direction slot and once with the new head,
+           reporting win rate, profit factor, expectancy, drawdown, the LONG and
+           SHORT split, and the take-profit ladder statistics.
+
+        The test block is read exactly once, at the end of pass 1, and nothing is
+        tuned on what it says.
+        """
+        from module_c_ml.evaluation import ComparisonReport, DirectionComparison
+
+        await self.database.initialize()
+        symbols: list[str] = await self._resolve_cli_universe()
+        dataset: ProcessedDataset = await self.processor.build_training_dataset(
+            symbols=symbols, max_candles_per_symbol=max_candles
+        )
+        if dataset.is_empty:
+            _LOGGER.error("Comparison aborted: the dataset is empty - run `bootstrap` first")
+            await self.database.close()
+            return {}
+
+        _LOGGER.info(
+            "Comparing on %d rows | %s", len(dataset), dataset.class_distribution()
+        )
+        comparison = DirectionComparison(self.settings)
+        report: ComparisonReport = await asyncio.to_thread(comparison.run, dataset)
+        report.notes.append(
+            "Both variants share the decision threshold, the execution assumptions "
+            "and the train/validation/test split; only the Direction head differs."
+        )
+
+        if not skip_backtest:
+            report.trading = await self._compare_trading(symbols, max_candles, equity)
+        else:
+            report.notes.append("Trading comparison skipped (--skip-backtest).")
+
+        destination: Path = self.settings.ml.report_dir / "baseline_vs_new_idea"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.with_suffix(".json").write_text(
+            json.dumps(report.to_dict(), indent=2, default=str), encoding="utf-8"
+        )
+        destination.with_suffix(".md").write_text(report.to_markdown(), encoding="utf-8")
+        print(report.to_markdown())
+        _LOGGER.info("Comparison written to %s.{json,md}", destination)
+
+        await self.features.shutdown()
+        await self.database.close()
+        return report.to_dict()
+
+    async def _compare_trading(
+        self,
+        symbols: list[str],
+        max_candles: int | None,
+        equity: float | None,
+    ) -> dict[str, Any]:
+        """Backtest the same history once per direction head.
+
+        The heads are swapped in and out of the live :class:`MLSubsystem`, so
+        every other component - entry, exit, risk, the decision cascade, the
+        ladder, fees, slippage and funding - is byte-for-byte identical between
+        the two runs.  Any difference in the trading metrics is attributable to
+        the direction model and to nothing else.
+        """
+        from module_c_ml.ml_models import DirectionBaselineModel, DirectionModel
+
+        self.ml.load_all()
+        backtester = Backtester(
+            self.settings, self.database, self.features, self.ml, self.decisions
+        )
+        results: dict[str, Any] = {}
+        original: DirectionModel = self.ml.direction
+
+        variants: tuple[tuple[str, Any], ...] = (
+            ("baseline", DirectionBaselineModel(self.settings)),
+            ("new_idea", original),
+        )
+        try:
+            for label, head in variants:
+                if label == "baseline" and not head.load():
+                    results[label] = {"error": "baseline artifact missing - run `compare` first"}
+                    continue
+                self.ml.direction = head
+                report: BacktestReport = await backtester.run(
+                    symbols=symbols, max_candles=max_candles, initial_equity=equity
+                )
+                results[label] = report.metrics
+                _LOGGER.info("[%s] %s", label, report.summary())
+        finally:
+            self.ml.direction = original
+        return results
+
     async def command_single_cycle(self) -> dict[str, Any]:
         """Run exactly one trading cycle, then exit (useful for cron/debugging)."""
         await self.startup()
@@ -1031,14 +1160,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "command",
         nargs="?",
         default="run",
-        choices=["run", "bootstrap", "train", "backtest", "cycle", "universe"],
+        choices=["run", "bootstrap", "train", "backtest", "compare", "cycle", "universe"],
         help="run: panel + auto setup + scheduler | universe: print the screened pairs | "
         "bootstrap: backfill | train: fit models | backtest: replay history | "
-        "cycle: one cycle then exit",
+        "compare: baseline vs new idea report | cycle: one cycle then exit",
     )
     parser.add_argument("--candles", type=int, default=None, help="History depth per symbol.")
     parser.add_argument("--equity", type=float, default=None, help="Backtest starting equity.")
     parser.add_argument("--mode", choices=["paper", "live"], default=None, help="Execution mode.")
+    parser.add_argument(
+        "--skip-backtest",
+        action="store_true",
+        help="compare: report direction metrics only, without the trading comparison.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1062,6 +1196,12 @@ async def _async_main(arguments: argparse.Namespace) -> int:
         return 0
     if arguments.command == "backtest":
         await system.command_backtest(arguments.candles, arguments.equity)
+        return 0
+
+    if arguments.command == "compare":
+        await system.command_compare(
+            arguments.candles, arguments.equity, skip_backtest=arguments.skip_backtest
+        )
         return 0
     if arguments.command == "cycle":
         await system.command_single_cycle()

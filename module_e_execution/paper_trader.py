@@ -41,6 +41,7 @@ from module_e_execution.models import (
     PositionStatus,
 )
 from module_e_execution.risk_guard import RiskGuard
+from module_e_execution.tp_ladder import LadderEvent
 
 _LOGGER = get_logger(__name__)
 
@@ -204,6 +205,7 @@ class PaperTrader:
                 quantity=quantity,
                 maintenance_margin_rate=self._config.maintenance_margin_rate,
                 mode=self.mode,
+                take_profit_config=self._settings.take_profit,
             )
             position.fees_paid = fill_price * quantity * self._entry_fee_rate()
             position.last_funding_ms = utc_now_ms()
@@ -306,17 +308,77 @@ class PaperTrader:
                     await self._close(position, position.liquidation_price, CloseReason.LIQUIDATION)
                     continue
 
+                if position.ladder is not None:
+                    # Same state machine the backtester drives, fed ticks instead
+                    # of bars.  Nothing about the ladder's behaviour is
+                    # re-implemented here.
+                    await self._apply_ladder(position, price, now_ms)
+                    continue
+
                 position.advance_trailing(price)
                 stop: float = position.effective_stop()
                 if self._hit_stop(position, price, stop):
-                    reason: CloseReason = (
-                        CloseReason.TRAILING_STOP if position.trailing_active else CloseReason.STOP_LOSS
-                    )
+                    reason: CloseReason = position.stop_close_reason()
                     await self._close(position, stop, reason)
                     continue
 
                 if self._hit_take_profit(position, price):
                     await self._close(position, position.take_profit, CloseReason.TAKE_PROFIT)
+
+    async def _apply_ladder(self, position: Position, price: float, now_ms: int) -> None:
+        """Book whatever the ladder decided at this observed price."""
+        events: list[LadderEvent] = position.ladder.on_tick(price) if position.ladder else []
+        if not events:
+            return
+
+        last_reason: CloseReason = CloseReason.TAKE_PROFIT
+        for event in events:
+            fill_price: float = self._apply_slippage(
+                event.price, position.action, is_entry=False
+            )
+            delta, last_reason = position.apply_ladder_event(
+                event,
+                exit_price=fill_price,
+                fee_rate=self._config.taker_fee,
+                timestamp_ms=now_ms,
+            )
+            self._balance += delta
+            _LOGGER.info(
+                "[PAPER] %s %s %.6f @ %.6f (%.0f%% of the position) | pnl=%.4f",
+                last_reason.value,
+                position.symbol,
+                position.quantity_for_fraction(event.fraction),
+                fill_price,
+                event.fraction * 100.0,
+                delta,
+            )
+
+        if position.is_flat:
+            await self._finalise_ladder_close(position, last_reason)
+
+    async def _finalise_ladder_close(self, position: Position, reason: CloseReason) -> None:
+        """Settle funding and retire a position whose ladder ran to completion."""
+        self._balance -= position.funding_paid
+        position.realized_pnl -= position.funding_paid
+        position.exit_price = (
+            float(position.partial_fills[-1]["price"]) if position.partial_fills else position.entry_price
+        )
+        position.closed_at = datetime.now(tz=timezone.utc)
+        position.close_reason = reason.value
+        position.status = PositionStatus.CLOSED
+
+        self._positions.pop(position.symbol, None)
+        await self._persist_close(position)
+        await self._risk.record_trade_result(position.realized_pnl, position.symbol)
+        _LOGGER.info(
+            "[PAPER] CLOSE %s %s | %s | pnl=%.4f USDT (%.2fR) | balance=%.2f",
+            position.action.value,
+            position.symbol,
+            reason.value,
+            position.realized_pnl,
+            position.realized_r,
+            self._balance,
+        )
 
     @staticmethod
     def _hit_liquidation(position: Position, price: float) -> bool:
@@ -422,16 +484,21 @@ class PaperTrader:
         else:
             exit_price = self._apply_slippage(raw_exit_price, position.action, is_entry=False)
 
-        gross: float = (exit_price - position.entry_price) * position.quantity * position.direction
-        exit_fee: float = exit_price * position.quantity * self._config.taker_fee
+        remaining: float = position.quantity
+        gross: float = (exit_price - position.entry_price) * remaining * position.direction
+        exit_fee: float = exit_price * remaining * self._config.taker_fee
         position.fees_paid += exit_fee
+        position.quantity = 0.0
 
         net: float = gross - exit_fee - position.funding_paid
         if reason is CloseReason.LIQUIDATION:
-            # Cannot lose more than the isolated margin that was committed.
-            net = max(net, -position.margin)
+            # Cannot lose more than the isolated margin that was committed - and
+            # profit already banked by earlier ladder legs is not clawed back.
+            net = max(net, -position.margin - position.realized_pnl)
 
-        position.realized_pnl = net
+        # ``realized_pnl`` may already carry closed ladder legs, so this adds to
+        # it rather than replacing it.
+        position.realized_pnl += net
         position.exit_price = exit_price
         position.closed_at = datetime.now(tz=timezone.utc)
         position.close_reason = reason.value
@@ -440,7 +507,7 @@ class PaperTrader:
         )
 
         # The entry fee was already deducted when the position opened.
-        self._balance += gross - exit_fee - position.funding_paid
+        self._balance += net
         if reason is CloseReason.LIQUIDATION:
             self._balance = max(self._balance, 0.0)
 

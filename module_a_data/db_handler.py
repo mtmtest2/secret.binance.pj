@@ -36,6 +36,7 @@ from config.settings import Settings
 from core.exceptions import DatabaseError
 from core.logger import get_logger
 from module_a_data.db_models import (
+    AggTradeFlowRow,
     AuditLogRow,
     Base,
     EquityRow,
@@ -45,7 +46,7 @@ from module_a_data.db_models import (
     SystemStateRow,
     TradeRow,
 )
-from module_a_data.models import FuturesMetrics, OHLCVCandle, OrderBookSnapshot
+from module_a_data.models import AggTradeFlow, FuturesMetrics, OHLCVCandle, OrderBookSnapshot
 
 _LOGGER = get_logger(__name__)
 
@@ -215,9 +216,6 @@ class DatabaseHandler:
             "next_funding_time": metrics.next_funding_time,
             "open_interest": metrics.open_interest,
             "open_interest_value": metrics.open_interest_value,
-            "long_short_ratio": metrics.long_short_ratio,
-            "top_trader_long_short_ratio": metrics.top_trader_long_short_ratio,
-            "taker_buy_sell_ratio": metrics.taker_buy_sell_ratio,
             "liquidation_buy_volume": metrics.liquidation_buy_volume,
             "liquidation_sell_volume": metrics.liquidation_sell_volume,
             "mark_price": metrics.mark_price,
@@ -239,9 +237,112 @@ class DatabaseHandler:
         except SQLAlchemyError as error:
             raise DatabaseError("futures metrics upsert failed", symbol=metrics.symbol) from error
 
+    async def upsert_agg_trade_flow(self, buckets: Sequence[AggTradeFlow]) -> int:
+        """Bulk-upsert closed 5-minute order-flow buckets (idempotent).
+
+        Re-ingesting a window is safe and is in fact the intended repair path:
+        a bucket that was written from a partially fetched page is overwritten by
+        the complete one on the next pass.
+        """
+        if not buckets:
+            return 0
+
+        timeframe: str = self._settings.data.timeframe
+        payload: list[dict[str, Any]] = [
+            {
+                "symbol": bucket.symbol,
+                "timeframe": timeframe,
+                "timestamp": bucket.timestamp,
+                "buy_volume": bucket.buy_volume,
+                "sell_volume": bucket.sell_volume,
+                "buy_quote_volume": bucket.buy_quote_volume,
+                "sell_quote_volume": bucket.sell_quote_volume,
+                "trades": bucket.trades,
+            }
+            for bucket in buckets
+        ]
+
+        statement = sqlite_insert(AggTradeFlowRow).values(payload)
+        statement = statement.on_conflict_do_update(
+            index_elements=[
+                AggTradeFlowRow.symbol,
+                AggTradeFlowRow.timeframe,
+                AggTradeFlowRow.timestamp,
+            ],
+            set_={
+                key: statement.excluded[key]
+                for key in (
+                    "buy_volume",
+                    "sell_volume",
+                    "buy_quote_volume",
+                    "sell_quote_volume",
+                    "trades",
+                )
+            },
+        )
+        try:
+            async with self._factory()() as session:
+                async with session.begin():
+                    await session.execute(statement)
+        except SQLAlchemyError as error:
+            raise DatabaseError("agg trade flow upsert failed", rows=len(payload)) from error
+        return len(payload)
+
     # ------------------------------------------------------------------
     # Market-data reads
     # ------------------------------------------------------------------
+    async def load_agg_trade_flow_frame(
+        self,
+        symbol: str,
+        limit: int | None = None,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+    ) -> pd.DataFrame:
+        """Load 5-minute order-flow buckets as a timestamp-keyed frame."""
+        query: Select[Any] = select(
+            AggTradeFlowRow.timestamp,
+            AggTradeFlowRow.buy_volume,
+            AggTradeFlowRow.sell_volume,
+            AggTradeFlowRow.trades,
+        ).where(
+            AggTradeFlowRow.symbol == symbol,
+            AggTradeFlowRow.timeframe == self._settings.data.timeframe,
+        )
+        if start_ms is not None:
+            query = query.where(AggTradeFlowRow.timestamp >= start_ms)
+        if end_ms is not None:
+            query = query.where(AggTradeFlowRow.timestamp <= end_ms)
+
+        query = (
+            query.order_by(desc(AggTradeFlowRow.timestamp)).limit(limit)
+            if limit
+            else query.order_by(AggTradeFlowRow.timestamp)
+        )
+
+        columns: list[str] = ["timestamp", "buy_volume", "sell_volume", "trades"]
+        try:
+            async with self._factory()() as session:
+                result: Result[Any] = await session.execute(query)
+                rows: list[Any] = result.all()
+        except SQLAlchemyError as error:
+            raise DatabaseError("agg trade flow read failed", symbol=symbol) from error
+
+        if not rows:
+            return pd.DataFrame(columns=columns)
+        frame: pd.DataFrame = pd.DataFrame(rows, columns=columns)
+        return frame.sort_values("timestamp").reset_index(drop=True)
+
+    async def latest_agg_trade_flow_timestamp(self, symbol: str) -> int | None:
+        """Newest stored order-flow bucket for ``symbol``, or ``None``."""
+        query: Select[Any] = select(func.max(AggTradeFlowRow.timestamp)).where(
+            AggTradeFlowRow.symbol == symbol,
+            AggTradeFlowRow.timeframe == self._settings.data.timeframe,
+        )
+        async with self._factory()() as session:
+            result: Result[Any] = await session.execute(query)
+            value: Any = result.scalar_one_or_none()
+        return int(value) if value is not None else None
+
     async def load_ohlcv_dataframe(
         self,
         symbol: str,
@@ -328,6 +429,21 @@ class DatabaseHandler:
             value: Any = result.scalar_one_or_none()
         return int(value) if value is not None else None
 
+    async def candle_range(self, symbol: str) -> tuple[int | None, int | None]:
+        """Return ``(oldest, newest)`` stored candle open times for ``symbol``."""
+        query: Select[Any] = select(
+            func.min(OHLCVRow.timestamp), func.max(OHLCVRow.timestamp)
+        ).where(
+            OHLCVRow.symbol == symbol,
+            OHLCVRow.timeframe == self._settings.data.timeframe,
+        )
+        async with self._factory()() as session:
+            result: Result[Any] = await session.execute(query)
+            row: Any = result.first()
+        if row is None or row[0] is None:
+            return None, None
+        return int(row[0]), int(row[1])
+
     async def candle_count(self, symbol: str) -> int:
         """Return how many candles are stored for ``symbol``."""
         query: Select[Any] = select(func.count()).select_from(OHLCVRow).where(
@@ -374,8 +490,6 @@ class DatabaseHandler:
                 FuturesMetricsRow.timestamp,
                 FuturesMetricsRow.funding_rate,
                 FuturesMetricsRow.open_interest,
-                FuturesMetricsRow.long_short_ratio,
-                FuturesMetricsRow.taker_buy_sell_ratio,
                 FuturesMetricsRow.liquidation_buy_volume,
                 FuturesMetricsRow.liquidation_sell_volume,
             )
@@ -391,8 +505,6 @@ class DatabaseHandler:
             "timestamp",
             "funding_rate",
             "open_interest",
-            "long_short_ratio",
-            "taker_buy_sell_ratio",
             "liquidation_buy_volume",
             "liquidation_sell_volume",
         ]

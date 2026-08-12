@@ -59,29 +59,144 @@ class ProcessedDataset:
         counts: dict[str, int] = self.direction_target.value_counts().to_dict()
         return {str(name): int(count) for name, count in counts.items()}
 
+    # ------------------------------------------------------------------
+    # Splitting
+    # ------------------------------------------------------------------
+    def timestamps(self) -> np.ndarray:
+        """Candle open times (ms) aligned with the feature rows."""
+        if "timestamp" in self.metadata.columns and len(self.metadata) == len(self.features):
+            return self.metadata["timestamp"].to_numpy(dtype=np.int64)
+        # No metadata (empty dataset): fall back to positional pseudo-time so the
+        # split helpers stay total functions.
+        return np.arange(len(self.features), dtype=np.int64)
+
+    def chronological_split(
+        self,
+        validation_fraction: float,
+        test_fraction: float,
+        purge_bars: int,
+        embargo_bars: int,
+        timeframe_ms: int,
+    ) -> "DatasetSplit":
+        """Split train / validation / test in time, with a purged embargo gap.
+
+        Two properties matter here and neither is optional:
+
+        * **The cut points are timestamps, not row positions.**  The dataset is
+          pooled across ~30 symbols, so one bar of history is ~30 rows.  Purging
+          *rows* would have removed two bars where 120 were needed, and the
+          forward-looking labels of the last training bars would still overlap
+          the first validation bars.  Purging a *time window* removes the overlap
+          for every symbol simultaneously.
+        * **The gap is applied on both sides of every boundary**: ``purge_bars``
+          covers the label horizon and ``embargo_bars`` covers the slow rolling
+          features, so no row of one block can share information with the next.
+
+        The test block is the chronological tail and is returned separately so it
+        can be excluded everywhere except final evaluation.
+        """
+        rows: int = len(self.features)
+        empty: np.ndarray = np.array([], dtype=np.int64)
+        if rows == 0:
+            return DatasetSplit(train=empty, validation=empty, test=empty)
+
+        stamps: np.ndarray = self.timestamps()
+        order: np.ndarray = np.argsort(stamps, kind="stable")
+        sorted_stamps: np.ndarray = stamps[order]
+
+        test_share: float = max(0.0, min(0.9, test_fraction))
+        validation_share: float = max(0.0, min(0.9, validation_fraction))
+
+        test_start_ts: int = int(sorted_stamps[min(rows - 1, int(rows * (1.0 - test_share)))])
+        validation_start_ts: int = int(
+            sorted_stamps[min(rows - 1, int(rows * (1.0 - test_share - validation_share)))]
+        )
+        gap_ms: int = max(0, purge_bars + embargo_bars) * max(1, timeframe_ms)
+
+        positions: np.ndarray = np.arange(rows, dtype=np.int64)
+        test_mask: np.ndarray = stamps >= test_start_ts if test_share > 0.0 else np.zeros(rows, bool)
+        validation_mask: np.ndarray = (
+            (stamps >= validation_start_ts)
+            & (stamps < test_start_ts - gap_ms)
+            if validation_share > 0.0
+            else np.zeros(rows, bool)
+        )
+        train_mask: np.ndarray = stamps < validation_start_ts - gap_ms
+
+        return DatasetSplit(
+            train=positions[train_mask],
+            validation=positions[validation_mask],
+            test=positions[test_mask],
+        )
+
     def train_validation_split(
         self,
         validation_fraction: float,
         purge_bars: int,
+        test_fraction: float = 0.0,
+        embargo_bars: int = 0,
+        timeframe_ms: int = 300_000,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Return time-ordered train/validation index positions with a purge gap.
+        """Train/validation index positions, with the test tail already removed.
 
-        Financial labels are forward-looking, so the last ``purge_bars`` rows of
-        the training block overlap the validation block's label horizon.  Those
-        rows are dropped entirely - without the purge, validation scores are
-        optimistically biased by construction.
+        Every head fits through this helper, so passing a non-zero
+        ``test_fraction`` is what structurally guarantees that no model - not
+        even by accident - is fitted or early-stopped on the held-out block.
         """
-        rows: int = len(self.features)
-        if rows == 0:
-            return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+        split: DatasetSplit = self.chronological_split(
+            validation_fraction=validation_fraction,
+            test_fraction=test_fraction,
+            purge_bars=purge_bars,
+            embargo_bars=embargo_bars,
+            timeframe_ms=timeframe_ms,
+        )
+        return split.train, split.validation
 
-        split_point: int = int(rows * (1.0 - validation_fraction))
-        split_point = max(1, min(rows - 1, split_point))
-        train_end: int = max(1, split_point - purge_bars)
+    def subset(self, positions: np.ndarray) -> "ProcessedDataset":
+        """Return a row-subset of this dataset, preserving every target."""
+        index: np.ndarray = np.asarray(positions, dtype=np.int64)
+        return ProcessedDataset(
+            features=self.features.iloc[index].reset_index(drop=True),
+            direction_target=self.direction_target.iloc[index].reset_index(drop=True),
+            entry_target=self.entry_target.iloc[index].reset_index(drop=True),
+            exit_targets=self.exit_targets.iloc[index].reset_index(drop=True),
+            risk_target=self.risk_target.iloc[index].reset_index(drop=True),
+            metadata=self.metadata.iloc[index].reset_index(drop=True),
+            symbols=self.symbols,
+            feature_columns=self.feature_columns,
+        )
 
-        train_index: np.ndarray = np.arange(0, train_end, dtype=np.int64)
-        validation_index: np.ndarray = np.arange(split_point, rows, dtype=np.int64)
-        return train_index, validation_index
+
+@dataclass(slots=True)
+class DatasetSplit:
+    """Row positions of the three chronological blocks.
+
+    ``test`` is a *contract*: nothing outside final evaluation may read it.
+    """
+
+    train: np.ndarray
+    validation: np.ndarray
+    test: np.ndarray
+
+    def describe(self, stamps: np.ndarray) -> dict[str, Any]:
+        """Row counts and time bounds per block, for the training report."""
+
+        def _block(name: str, positions: np.ndarray) -> dict[str, Any]:
+            if positions.size == 0:
+                return {"block": name, "rows": 0, "start": None, "end": None}
+            values: np.ndarray = stamps[positions]
+            return {
+                "block": name,
+                "rows": int(positions.size),
+                "start": int(values.min()),
+                "end": int(values.max()),
+            }
+
+        return {
+            "train": _block("train", self.train),
+            "validation": _block("validation", self.validation),
+            "test": _block("test", self.test),
+        }
 
 
 @dataclass(slots=True)
@@ -170,11 +285,11 @@ class DatasetProcessor:
     async def _build_labeled_symbol(self, symbol: str, depth: int) -> pd.DataFrame | None:
         """Build the feature+label frame for one symbol, or ``None`` on failure."""
         try:
-            ohlcv, futures, book = await self._load_symbol_inputs(symbol, depth)
+            ohlcv, futures, book, flow = await self._load_symbol_inputs(symbol, depth)
             if ohlcv.empty:
                 return None
 
-            featured: pd.DataFrame = await self._features.build(ohlcv, futures, book)
+            featured: pd.DataFrame = await self._features.build(ohlcv, futures, book, flow)
             labeled: pd.DataFrame = await asyncio.to_thread(self._labeler.generate, featured)
             labeled["symbol"] = symbol
             return labeled
@@ -253,12 +368,12 @@ class DatasetProcessor:
         """
         depth: int = lookback_candles or self._inference_depth()
         try:
-            ohlcv, futures, book = await self._load_symbol_inputs(symbol, depth)
+            ohlcv, futures, book, flow = await self._load_symbol_inputs(symbol, depth)
             if ohlcv.empty:
                 _LOGGER.warning("No stored candles for %s - cannot infer", symbol)
                 return None
 
-            featured: pd.DataFrame = await self._features.build(ohlcv, futures, book)
+            featured: pd.DataFrame = await self._features.build(ohlcv, futures, book, flow)
         except (InsufficientDataError, FeatureEngineeringError) as error:
             _LOGGER.warning("Inference features unavailable for %s: %s", symbol, error)
             return None
@@ -345,18 +460,20 @@ class DatasetProcessor:
         self,
         symbol: str,
         depth: int,
-    ) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None]:
-        """Load OHLCV, futures metrics and order-book history for one symbol."""
+    ) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None]:
+        """Load OHLCV, futures metrics, order-book and order-flow history."""
         ohlcv: pd.DataFrame = await self._db.load_ohlcv_dataframe(symbol, limit=depth)
         if ohlcv.empty:
-            return ohlcv, None, None
+            return ohlcv, None, None, None
 
         futures: pd.DataFrame = await self._db.load_futures_metrics_frame(symbol, limit=depth)
         book: pd.DataFrame = await self._load_order_book_frame(symbol, depth)
+        flow: pd.DataFrame = await self._db.load_agg_trade_flow_frame(symbol, limit=depth)
         return (
             ohlcv,
             futures if not futures.empty else None,
             book if not book.empty else None,
+            flow if not flow.empty else None,
         )
 
     async def _load_order_book_frame(self, symbol: str, depth: int) -> pd.DataFrame:

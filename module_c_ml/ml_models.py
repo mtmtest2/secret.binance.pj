@@ -41,8 +41,13 @@ from config.settings import MLSettings, Settings
 from core.exceptions import ModelNotLoadedError, ModelTrainingError
 from core.logger import get_logger
 from core.utils import clamp
-from module_b_features.features import FEATURE_COLUMNS, HMMRegime
-from module_b_features.labeler import LABEL_ORDER, LabelClass
+from module_b_features.features import FEATURE_COLUMNS, HEAD_FEATURE_COLUMNS, HMMRegime
+from module_b_features.labeler import (
+    LABEL_ORDER,
+    LONG_LABELS,
+    SHORT_LABELS,
+    LabelClass,
+)
 from module_b_features.processor import InferencePayload, ProcessedDataset
 from module_c_ml.schemas import (
     DirectionPrediction,
@@ -104,13 +109,55 @@ class BaseModelHead(ABC):
 
     #: Filename stem of the artifact, unique per head.
     name: str = "base"
+    #: Key into :data:`HEAD_FEATURE_COLUMNS`; decides which columns this head
+    #: consumes.  Heads see different feature sets on purpose - a feature is
+    #: routed to the head whose question it answers, and nowhere else.
+    feature_set: str = "direction"
 
     def __init__(self, settings: Settings) -> None:
         self._settings: Settings = settings
         self._config: MLSettings = settings.ml
         self._model: Any = None
-        self._feature_columns: tuple[str, ...] = FEATURE_COLUMNS
+        self._feature_columns: tuple[str, ...] = HEAD_FEATURE_COLUMNS.get(
+            self.feature_set, FEATURE_COLUMNS
+        )
         self._metadata: dict[str, Any] = {}
+
+    # ------------------------------------------------------------------
+    # Feature contract & splitting
+    # ------------------------------------------------------------------
+    def _training_columns(self, dataset: ProcessedDataset) -> list[str]:
+        """Columns this head trains on, intersected with what the dataset has."""
+        wanted: tuple[str, ...] = HEAD_FEATURE_COLUMNS.get(self.feature_set, FEATURE_COLUMNS)
+        available: set[str] = set(dataset.features.columns)
+        columns: list[str] = [column for column in wanted if column in available]
+        missing: list[str] = [column for column in wanted if column not in available]
+        if missing:
+            _LOGGER.warning(
+                "%s: %d feature(s) absent from the dataset and dropped from the contract: %s",
+                self.name,
+                len(missing),
+                missing,
+            )
+        return columns
+
+    def _design_matrix(self, dataset: ProcessedDataset) -> pd.DataFrame:
+        """The head's own view of the pooled feature matrix."""
+        return dataset.features[self._training_columns(dataset)]
+
+    def _split(self, dataset: ProcessedDataset) -> tuple[np.ndarray, np.ndarray]:
+        """Purged, embargoed train/validation positions with the test tail removed.
+
+        Every head fits through here, which is what makes "the test block is never
+        trained on" a structural property rather than a convention.
+        """
+        return dataset.train_validation_split(
+            validation_fraction=self._config.validation_fraction,
+            purge_bars=self._config.purge_bars,
+            test_fraction=self._config.test_fraction,
+            embargo_bars=self._config.embargo_bars,
+            timeframe_ms=self._settings.data.timeframe_ms,
+        )
 
     # ------------------------------------------------------------------
     # State
@@ -352,17 +399,59 @@ class BaseModelHead(ABC):
 
 
 class DirectionModel(BaseModelHead):
-    """Model 1 - multi-class market direction.
+    """Model 1 - market direction, as a two-stage cascade.
 
-    Predicts the probability distribution over the five label classes produced by
-    :class:`~module_b_features.labeler.TradeLabeler`, which the schema then
-    aggregates into LONG / SHORT / NO_TRADE mass.
+    Why not one flat 5-class booster
+    --------------------------------
+    The flat head has to separate "trade vs no-trade" and "long vs short" with
+    the same trees and the same loss.  Since ~45 % of rows are
+    ``NO_TRADE_OR_FAIL`` and the two directional outcomes are near-symmetric,
+    almost all of the achievable log-loss reduction sits in the first question,
+    so that is where the capacity goes - and LONG-vs-SHORT discrimination, the
+    thing the strategy actually monetises, is learned only incidentally.
+
+    The cascade splits the problem instead:
+
+    ``gate``       ``P(tradeable | x)`` over every row.
+    ``direction``  ``P(LONG | x, tradeable)`` fitted **only on tradeable rows**,
+                   so every split it makes is spent on long-vs-short.
+    ``tier``       ``P(low risk | x, tradeable)``, which keeps the five-class
+                   output contract (and therefore the implied risk tier) intact.
+
+    The joint distribution is reassembled as
+
+    .. code-block:: text
+
+        p(NO_TRADE)        = 1 - p_gate
+        p(LONG_*)          = p_gate *      p_dir  * {p_tier, 1 - p_tier}
+        p(SHORT_*)         = p_gate * (1 - p_dir) * {p_tier, 1 - p_tier}
+
+    so :class:`DirectionPrediction`, the Decision Engine cascade and **every
+    threshold** see exactly the shape they saw before.  No threshold anywhere in
+    the system is changed by this head; the improvement has to come from better
+    probabilities at the same cut-off, which is the only kind that is real.
+
+    Setting ``ml.direction_architecture = "single_stage"`` restores the original
+    flat 5-class booster verbatim - that is what
+    :class:`DirectionBaselineModel` uses to stay a frozen comparison point.
     """
 
     name = "direction_model"
+    feature_set = "direction"
+
+    #: Architecture used when the instance does not override it.
+    forced_architecture: str | None = None
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+    @property
+    def architecture(self) -> str:
+        """``two_stage_cascade`` or ``single_stage``."""
+        return self.forced_architecture or self._config.direction_architecture
 
     def train(self, dataset: ProcessedDataset) -> dict[str, Any]:
-        """Fit the multi-class classifier on the pooled, purged dataset."""
+        """Fit the direction head on the pooled, purged, test-free dataset."""
         if dataset.is_empty:
             raise ModelTrainingError("direction model received an empty dataset")
 
@@ -370,15 +459,46 @@ class DirectionModel(BaseModelHead):
         if len(classes) < 2:
             raise ModelTrainingError("direction model needs >= 2 classes", classes=classes)
 
+        train_index, validation_index = self._split(dataset)
+        if train_index.size == 0:
+            raise ModelTrainingError("direction model has no training rows after purging")
+
+        features: pd.DataFrame = self._design_matrix(dataset)
+        self._feature_columns = tuple(features.columns)
+
+        if self.architecture == "single_stage":
+            metrics: dict[str, Any] = self._train_single_stage(
+                dataset, features, train_index, validation_index
+            )
+        else:
+            metrics = self._train_cascade(dataset, features, train_index, validation_index)
+
+        self._metadata = {
+            "trained_at": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
+            "architecture": self.architecture,
+            "rows": int(train_index.size),
+            "validation_rows": int(validation_index.size),
+            "classes": list(LABEL_ORDER),
+            "feature_columns": list(self._feature_columns),
+            "distribution": dataset.class_distribution(),
+            "metrics": metrics,
+        }
+        _LOGGER.info("Direction model (%s) trained: %s", self.architecture, metrics)
+        return metrics
+
+    def _train_single_stage(
+        self,
+        dataset: ProcessedDataset,
+        features: pd.DataFrame,
+        train_index: np.ndarray,
+        validation_index: np.ndarray,
+    ) -> dict[str, Any]:
+        """The original flat 5-class booster - the frozen baseline path."""
         class_index: dict[str, int] = {name: index for index, name in enumerate(LABEL_ORDER)}
         encoded: pd.Series = dataset.direction_target.map(class_index)
         if encoded.isna().any():
             raise ModelTrainingError("direction labels contain unknown classes")
 
-        train_index, validation_index = dataset.train_validation_split(
-            self._config.validation_fraction, self._config.purge_bars
-        )
-        features: pd.DataFrame = dataset.features
         estimator: Any = self._make_classifier(num_class=len(LABEL_ORDER))
         estimator = self._fit_estimator(
             estimator,
@@ -388,43 +508,325 @@ class DirectionModel(BaseModelHead):
             encoded.iloc[validation_index].astype(int),
             eval_metric="multi_logloss",
         )
+        self._model = {"architecture": "single_stage", "flat": estimator}
+        return self._score_validation(features.iloc[validation_index], dataset, validation_index)
 
-        self._model = estimator
-        self._feature_columns = dataset.feature_columns
-        metrics: dict[str, Any] = self._score(
-            estimator, features.iloc[validation_index], encoded.iloc[validation_index].astype(int)
+    def _train_cascade(
+        self,
+        dataset: ProcessedDataset,
+        features: pd.DataFrame,
+        train_index: np.ndarray,
+        validation_index: np.ndarray,
+    ) -> dict[str, Any]:
+        """Fit gate, direction and tier stages, then calibrate the first two."""
+        labels: pd.Series = dataset.direction_target
+        is_trade: pd.Series = labels.isin(LONG_LABELS | SHORT_LABELS).astype(int)
+        is_long: pd.Series = labels.isin(LONG_LABELS).astype(int)
+        is_low_risk: pd.Series = labels.isin(
+            {
+                LabelClass.LONG_SUCCESS_LOW_RISK.value,
+                LabelClass.SHORT_SUCCESS_LOW_RISK.value,
+            }
+        ).astype(int)
+
+        fit_index, calibration_index = self._carve_calibration_slice(dataset, train_index)
+        if fit_index.size == 0:
+            fit_index, calibration_index = train_index, np.array([], dtype=np.int64)
+
+        # --- Stage 1: tradeable gate --------------------------------------
+        gate: Any = self._make_classifier(num_class=2)
+        gate = self._fit_estimator(
+            gate,
+            features.iloc[fit_index],
+            is_trade.iloc[fit_index],
+            features.iloc[validation_index],
+            is_trade.iloc[validation_index],
+            eval_metric="binary_logloss",
         )
-        self._metadata = {
-            "trained_at": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
-            "rows": int(len(train_index)),
-            "validation_rows": int(len(validation_index)),
-            "classes": list(LABEL_ORDER),
-            "distribution": dataset.class_distribution(),
-            "metrics": metrics,
+
+        # --- Stage 2: LONG vs SHORT, tradeable rows only ------------------
+        # This restriction is the point of the cascade: the stage never sees a
+        # NO_TRADE row, so none of its capacity is spent re-deriving the gate.
+        directional_fit: np.ndarray = fit_index[is_trade.iloc[fit_index].to_numpy() == 1]
+        directional_validation: np.ndarray = validation_index[
+            is_trade.iloc[validation_index].to_numpy() == 1
+        ]
+        if directional_fit.size < 100:
+            raise ModelTrainingError(
+                "not enough directional rows to fit the long/short stage",
+                rows=int(directional_fit.size),
+            )
+
+        direction_stage: Any = self._make_stage2_classifier()
+        direction_stage = self._fit_estimator(
+            direction_stage,
+            features.iloc[directional_fit],
+            is_long.iloc[directional_fit],
+            features.iloc[directional_validation],
+            is_long.iloc[directional_validation],
+            eval_metric="binary_logloss",
+        )
+
+        # --- Stage 3: risk tier, so the 5-class contract survives ----------
+        tier_stage: Any = self._make_stage2_classifier()
+        tier_stage = self._fit_estimator(
+            tier_stage,
+            features.iloc[directional_fit],
+            is_low_risk.iloc[directional_fit],
+            features.iloc[directional_validation],
+            is_low_risk.iloc[directional_validation],
+            eval_metric="binary_logloss",
+        )
+
+        self._model = {
+            "architecture": "two_stage_cascade",
+            "gate": gate,
+            "direction": direction_stage,
+            "tier": tier_stage,
+            "gate_calibrator": None,
+            "direction_calibrator": None,
         }
-        _LOGGER.info("Direction model trained: %s", metrics)
+
+        calibration: dict[str, Any] = self._fit_calibrators(
+            features, is_trade, is_long, calibration_index
+        )
+        metrics: dict[str, Any] = self._score_validation(
+            features.iloc[validation_index], dataset, validation_index
+        )
+        metrics["calibration"] = calibration
+        metrics["stage_rows"] = {
+            "gate_fit": int(fit_index.size),
+            "direction_fit": int(directional_fit.size),
+            "calibration": int(calibration_index.size),
+        }
         return metrics
 
-    @staticmethod
-    def _score(estimator: Any, features: pd.DataFrame, target: pd.Series) -> dict[str, float]:
-        """Compute validation accuracy, balanced accuracy and log loss."""
-        if features.empty:
-            return {}
-        from sklearn.metrics import accuracy_score, balanced_accuracy_score, log_loss
+    def _carve_calibration_slice(
+        self,
+        dataset: ProcessedDataset,
+        train_index: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Split the *training* block into fit and calibration parts.
 
-        predictions: np.ndarray = estimator.predict(features)
-        probabilities: np.ndarray = estimator.predict_proba(features)
-        try:
-            loss: float = float(
-                log_loss(target, probabilities, labels=list(range(len(LABEL_ORDER))))
+        The calibration slice is the chronological tail of the training block,
+        separated from the fit part by the same purge+embargo gap used between
+        train and validation.  It deliberately comes out of train and not out of
+        validation: validation is already spent on early stopping, and the test
+        block is untouchable.
+        """
+        if not self._config.direction_calibrate or train_index.size < 500:
+            return train_index, np.array([], dtype=np.int64)
+
+        stamps: np.ndarray = dataset.timestamps()[train_index]
+        order: np.ndarray = np.argsort(stamps, kind="stable")
+        ordered: np.ndarray = train_index[order]
+        sorted_stamps: np.ndarray = stamps[order]
+
+        cut_position: int = int(ordered.size * (1.0 - self._config.direction_calibration_fraction))
+        cut_position = max(1, min(ordered.size - 1, cut_position))
+        cut_ts: int = int(sorted_stamps[cut_position])
+        gap_ms: int = (self._config.purge_bars + self._config.embargo_bars) * (
+            self._settings.data.timeframe_ms
+        )
+
+        fit_mask: np.ndarray = sorted_stamps < cut_ts - gap_ms
+        calibration_mask: np.ndarray = sorted_stamps >= cut_ts
+        return ordered[fit_mask], ordered[calibration_mask]
+
+    def _fit_calibrators(
+        self,
+        features: pd.DataFrame,
+        is_trade: pd.Series,
+        is_long: pd.Series,
+        calibration_index: np.ndarray,
+    ) -> dict[str, Any]:
+        """Fit isotonic calibrators, keeping them only when they help.
+
+        A calibrator that does not improve the Brier score on the slice it was
+        fitted on is not a calibrator, it is noise with extra steps - so it is
+        discarded and the raw estimator stays in production.  The decision and
+        the numbers behind it are recorded in the artifact metadata.
+        """
+        report: dict[str, Any] = {"status": "SKIPPED", "gate": None, "direction": None}
+        if calibration_index.size < 200 or self._model is None:
+            return report
+
+        from sklearn.isotonic import IsotonicRegression
+        from sklearn.metrics import brier_score_loss
+
+        report["status"] = "AVAILABLE"
+        report["rows"] = int(calibration_index.size)
+        matrix: pd.DataFrame = features.iloc[calibration_index]
+
+        def _calibrate(stage: str, estimator: Any, target: np.ndarray) -> dict[str, Any] | None:
+            if target.size == 0 or len(set(target.tolist())) < 2:
+                return None
+            raw: np.ndarray = np.asarray(
+                estimator.predict_proba(matrix), dtype=np.float64
+            )[:, -1]
+            calibrator = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+            calibrator.fit(raw, target)
+            calibrated: np.ndarray = np.asarray(calibrator.predict(raw), dtype=np.float64)
+
+            raw_brier: float = float(brier_score_loss(target, raw))
+            calibrated_brier: float = float(brier_score_loss(target, calibrated))
+            improved: bool = calibrated_brier < raw_brier
+            if improved:
+                self._model[f"{stage}_calibrator"] = calibrator
+            return {
+                "brier_raw": raw_brier,
+                "brier_calibrated": calibrated_brier,
+                "applied": improved,
+            }
+
+        report["gate"] = _calibrate(
+            "gate", self._model["gate"], is_trade.iloc[calibration_index].to_numpy()
+        )
+
+        directional: np.ndarray = calibration_index[
+            is_trade.iloc[calibration_index].to_numpy() == 1
+        ]
+        if directional.size >= 200:
+            directional_matrix: pd.DataFrame = features.iloc[directional]
+            raw_direction: np.ndarray = np.asarray(
+                self._model["direction"].predict_proba(directional_matrix), dtype=np.float64
+            )[:, -1]
+            target: np.ndarray = is_long.iloc[directional].to_numpy()
+            if len(set(target.tolist())) > 1:
+                calibrator = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+                calibrator.fit(raw_direction, target)
+                calibrated = np.asarray(calibrator.predict(raw_direction), dtype=np.float64)
+                raw_brier = float(brier_score_loss(target, raw_direction))
+                calibrated_brier = float(brier_score_loss(target, calibrated))
+                if calibrated_brier < raw_brier:
+                    self._model["direction_calibrator"] = calibrator
+                report["direction"] = {
+                    "brier_raw": raw_brier,
+                    "brier_calibrated": calibrated_brier,
+                    "applied": calibrated_brier < raw_brier,
+                }
+        return report
+
+    def _make_stage2_classifier(self) -> Any:
+        """Binary classifier for the LONG/SHORT and tier stages.
+
+        These stages see a fraction of the rows the gate does and overfit far
+        more readily, so they get their own, harder-regularised hyper-parameters
+        rather than inheriting the gate's.
+        """
+        config: MLSettings = self._config
+        if config.booster == "xgboost":
+            from xgboost import XGBClassifier
+
+            return XGBClassifier(
+                n_estimators=config.direction_stage2_n_estimators,
+                learning_rate=config.direction_stage2_learning_rate,
+                max_depth=config.direction_stage2_max_depth,
+                subsample=config.direction_stage2_subsample,
+                colsample_bytree=config.direction_stage2_colsample_bytree,
+                reg_lambda=config.direction_stage2_reg_lambda,
+                reg_alpha=config.direction_stage2_reg_alpha,
+                min_child_weight=config.direction_stage2_min_child_samples,
+                objective="binary:logistic",
+                random_state=config.random_state,
+                n_jobs=self._n_jobs(),
+                tree_method="hist",
+                verbosity=0,
             )
-        except ValueError:  # pragma: no cover - degenerate validation block
-            loss = float("nan")
-        return {
-            "accuracy": float(accuracy_score(target, predictions)),
-            "balanced_accuracy": float(balanced_accuracy_score(target, predictions)),
-            "log_loss": loss,
-        }
+
+        from lightgbm import LGBMClassifier
+
+        return LGBMClassifier(
+            n_estimators=config.direction_stage2_n_estimators,
+            learning_rate=config.direction_stage2_learning_rate,
+            max_depth=config.direction_stage2_max_depth,
+            num_leaves=config.direction_stage2_num_leaves,
+            subsample=config.direction_stage2_subsample,
+            subsample_freq=1,
+            colsample_bytree=config.direction_stage2_colsample_bytree,
+            reg_lambda=config.direction_stage2_reg_lambda,
+            reg_alpha=config.direction_stage2_reg_alpha,
+            min_child_samples=config.direction_stage2_min_child_samples,
+            objective="binary",
+            num_class=1,
+            # Long and short are close to balanced, but not exactly; weighting
+            # keeps a mild imbalance from becoming a systematic long or short
+            # bias in the decision boundary.
+            class_weight="balanced",
+            random_state=config.random_state,
+            n_jobs=self._n_jobs(),
+            verbose=-1,
+        )
+
+    def _score_validation(
+        self,
+        matrix: pd.DataFrame,
+        dataset: ProcessedDataset,
+        validation_index: np.ndarray,
+    ) -> dict[str, Any]:
+        """Aggregated LONG/SHORT/NO_TRADE metrics on the validation block."""
+        if matrix.empty or validation_index.size == 0:
+            return {}
+
+        from module_c_ml.evaluation import direction_metrics
+
+        probabilities: np.ndarray = self._joint_probabilities(matrix)
+        return direction_metrics(
+            probabilities=probabilities,
+            labels=dataset.direction_target.iloc[validation_index].to_numpy(),
+            settings=self._settings,
+        )
+
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
+    def _joint_probabilities(self, matrix: pd.DataFrame) -> np.ndarray:
+        """Return the ``(n, 5)`` class distribution for a design matrix."""
+        model: dict[str, Any] = self._require_model()
+        rows: int = len(matrix)
+        output: np.ndarray = np.zeros((rows, len(LABEL_ORDER)), dtype=np.float64)
+
+        index_of: dict[str, int] = {name: position for position, name in enumerate(LABEL_ORDER)}
+
+        if model.get("architecture") == "single_stage":
+            estimator: Any = model["flat"]
+            raw: np.ndarray = np.asarray(estimator.predict_proba(matrix), dtype=np.float64)
+            classes: list[int] = [int(value) for value in getattr(estimator, "classes_", [])]
+            if classes and len(classes) == raw.shape[1]:
+                for position, class_index in enumerate(classes):
+                    if 0 <= class_index < len(LABEL_ORDER):
+                        output[:, class_index] = raw[:, position]
+            else:  # pragma: no cover - estimator without `classes_`
+                output[:, : raw.shape[1]] = raw
+            return output
+
+        gate: np.ndarray = self._stage_probability(model["gate"], model["gate_calibrator"], matrix)
+        direction: np.ndarray = self._stage_probability(
+            model["direction"], model["direction_calibrator"], matrix
+        )
+        tier: np.ndarray = self._stage_probability(model["tier"], None, matrix)
+
+        long_mass: np.ndarray = gate * direction
+        short_mass: np.ndarray = gate * (1.0 - direction)
+
+        output[:, index_of[LabelClass.LONG_SUCCESS_LOW_RISK.value]] = long_mass * tier
+        output[:, index_of[LabelClass.LONG_SUCCESS_HIGH_RISK.value]] = long_mass * (1.0 - tier)
+        output[:, index_of[LabelClass.SHORT_SUCCESS_LOW_RISK.value]] = short_mass * tier
+        output[:, index_of[LabelClass.SHORT_SUCCESS_HIGH_RISK.value]] = short_mass * (1.0 - tier)
+        output[:, index_of[LabelClass.NO_TRADE_OR_FAIL.value]] = 1.0 - gate
+        return output
+
+    @staticmethod
+    def _stage_probability(
+        estimator: Any,
+        calibrator: Any,
+        matrix: pd.DataFrame,
+    ) -> np.ndarray:
+        """Positive-class probability of one stage, optionally calibrated."""
+        raw: np.ndarray = np.asarray(estimator.predict_proba(matrix), dtype=np.float64)[:, -1]
+        if calibrator is not None:
+            raw = np.asarray(calibrator.predict(raw), dtype=np.float64)
+        return np.clip(raw, 1e-6, 1.0 - 1e-6)
 
     def predict(self, features: pd.DataFrame) -> DirectionPrediction:
         """Score a single feature row (stateless, thread-safe).
@@ -436,19 +838,15 @@ class DirectionModel(BaseModelHead):
             return self._heuristic(features)
 
         aligned: pd.DataFrame = self._align(features)
-        raw: np.ndarray = np.asarray(self._model.predict_proba(aligned), dtype=np.float64)[0]
-
-        classes: list[int] = [int(value) for value in getattr(self._model, "classes_", [])]
-        probabilities: dict[str, float] = {name: 0.0 for name in LABEL_ORDER}
-        if classes and len(classes) == raw.size:
-            for position, class_index in enumerate(classes):
-                if 0 <= class_index < len(LABEL_ORDER):
-                    probabilities[LABEL_ORDER[class_index]] = float(raw[position])
-        else:  # pragma: no cover - estimator without `classes_`
-            for position, name in enumerate(LABEL_ORDER[: raw.size]):
-                probabilities[name] = float(raw[position])
-
+        raw: np.ndarray = self._joint_probabilities(aligned)[0]
+        probabilities: dict[str, float] = {
+            name: float(raw[position]) for position, name in enumerate(LABEL_ORDER)
+        }
         return DirectionPrediction(probabilities=probabilities, source=ModelSource.TRAINED)
+
+    def predict_proba_frame(self, features: pd.DataFrame) -> np.ndarray:
+        """Batch scoring used by the evaluation harness (``(n, 5)`` array)."""
+        return self._joint_probabilities(self._align(features))
 
     @staticmethod
     def _heuristic(features: pd.DataFrame) -> DirectionPrediction:
@@ -488,6 +886,21 @@ class DirectionModel(BaseModelHead):
         )
 
 
+class DirectionBaselineModel(DirectionModel):
+    """The frozen pre-change Direction head, kept purely for comparison.
+
+    It is pinned to the flat 5-class architecture and to the *base* feature block
+    (no order-flow columns), which is exactly what the system trained before this
+    change.  It writes its own artifact, so retraining the production head can
+    never overwrite the baseline, and the two are always scored by the same
+    evaluator at the same, unchanged decision threshold.
+    """
+
+    name = "direction_model_baseline"
+    feature_set = "baseline_direction"
+    forced_architecture = "single_stage"
+
+
 class EntryModel(BaseModelHead):
     """Model 2 - entry timing filter.
 
@@ -498,6 +911,7 @@ class EntryModel(BaseModelHead):
     """
 
     name = "entry_model"
+    feature_set = "entry"
 
     def train(self, dataset: ProcessedDataset) -> dict[str, Any]:
         """Fit the binary entry-quality classifier."""
@@ -508,10 +922,8 @@ class EntryModel(BaseModelHead):
         if target.nunique() < 2:
             raise ModelTrainingError("entry target is degenerate (single class)")
 
-        train_index, validation_index = dataset.train_validation_split(
-            self._config.validation_fraction, self._config.purge_bars
-        )
-        features: pd.DataFrame = dataset.features
+        train_index, validation_index = self._split(dataset)
+        features: pd.DataFrame = self._design_matrix(dataset)
         estimator: Any = self._make_classifier(num_class=2)
         estimator = self._fit_estimator(
             estimator,
@@ -523,7 +935,7 @@ class EntryModel(BaseModelHead):
         )
 
         self._model = estimator
-        self._feature_columns = dataset.feature_columns
+        self._feature_columns = tuple(features.columns)
 
         metrics: dict[str, float] = {}
         if len(validation_index) > 0:
@@ -624,6 +1036,7 @@ class ExitModel(BaseModelHead):
     """
 
     name = "exit_model"
+    feature_set = "exit"
 
     _TARGETS: Final[tuple[str, ...]] = ("target_tp_pct", "target_sl_pct", "target_trailing_pct")
 
@@ -642,11 +1055,20 @@ class ExitModel(BaseModelHead):
                 "not enough directional rows to fit the exit model", rows=int(usable.sum())
             )
 
-        features: pd.DataFrame = dataset.features[usable].reset_index(drop=True)
+        features: pd.DataFrame = self._design_matrix(dataset)[usable].reset_index(drop=True)
         targets: pd.DataFrame = dataset.exit_targets[usable].reset_index(drop=True)
 
-        split_point: int = max(1, int(len(features) * (1.0 - self._config.validation_fraction)))
-        train_end: int = max(1, split_point - self._config.purge_bars)
+        # The exit head sub-selects rows, so it cannot reuse the shared position
+        # split directly; it reproduces the same three-way geometry by fraction,
+        # with the test tail removed first so it is never fitted on.
+        usable_rows: int = len(features)
+        test_start: int = max(
+            1, int(usable_rows * (1.0 - self._config.test_fraction))
+        )
+        split_point: int = max(
+            1, int(test_start * (1.0 - self._config.validation_fraction))
+        )
+        train_end: int = max(1, split_point - self._config.purge_bars - self._config.embargo_bars)
 
         estimators: dict[str, Any] = {}
         metrics: dict[str, float] = {}
@@ -658,19 +1080,19 @@ class ExitModel(BaseModelHead):
                 estimator,
                 features.iloc[:train_end],
                 targets[column].iloc[:train_end],
-                features.iloc[split_point:],
-                targets[column].iloc[split_point:],
+                features.iloc[split_point:test_start],
+                targets[column].iloc[split_point:test_start],
                 eval_metric="l1",
             )
             estimators[column] = estimator
-            if split_point < len(features):
-                predictions: np.ndarray = estimator.predict(features.iloc[split_point:])
+            if split_point < test_start:
+                predictions: np.ndarray = estimator.predict(features.iloc[split_point:test_start])
                 metrics[f"{column}_mae"] = float(
-                    mean_absolute_error(targets[column].iloc[split_point:], predictions)
+                    mean_absolute_error(targets[column].iloc[split_point:test_start], predictions)
                 )
 
         self._model = estimators
-        self._feature_columns = dataset.feature_columns
+        self._feature_columns = tuple(features.columns)
         self._metadata = {
             "trained_at": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
             "rows": int(train_end),
@@ -771,6 +1193,7 @@ class RiskModel(BaseModelHead):
     """
 
     name = "risk_model"
+    feature_set = "risk"
 
     def train(self, dataset: ProcessedDataset) -> dict[str, Any]:
         """Fit the opportunity-score regressor."""
@@ -778,10 +1201,8 @@ class RiskModel(BaseModelHead):
             raise ModelTrainingError("risk model received an empty dataset")
 
         target: pd.Series = dataset.risk_target.astype(float)
-        train_index, validation_index = dataset.train_validation_split(
-            self._config.validation_fraction, self._config.purge_bars
-        )
-        features: pd.DataFrame = dataset.features
+        train_index, validation_index = self._split(dataset)
+        features: pd.DataFrame = self._design_matrix(dataset)
 
         estimator: Any = self._make_regressor()
         estimator = self._fit_estimator(
@@ -794,7 +1215,7 @@ class RiskModel(BaseModelHead):
         )
 
         self._model = estimator
-        self._feature_columns = dataset.feature_columns
+        self._feature_columns = tuple(features.columns)
 
         metrics: dict[str, float] = {}
         if len(validation_index) > 0:
@@ -936,6 +1357,10 @@ class MLSubsystem:
         self.entry: EntryModel = EntryModel(settings)
         self.exit: ExitModel = ExitModel(settings)
         self.risk: RiskModel = RiskModel(settings)
+        #: Frozen comparison head.  Deliberately *not* part of :attr:`heads`, so
+        #: routine training never overwrites it and it can never serve a live
+        #: prediction - it exists only for the before/after evaluation.
+        self.direction_baseline: DirectionBaselineModel = DirectionBaselineModel(settings)
         self._inference_semaphore: asyncio.Semaphore = asyncio.Semaphore(
             max(1, settings.ml.inference_workers * 2)
         )
