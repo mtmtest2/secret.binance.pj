@@ -39,6 +39,7 @@ from module_e_execution.models import (
     PositionStatus,
 )
 from module_e_execution.risk_guard import RiskGuard
+from module_e_execution.tp_ladder import LadderEvent
 
 _LOGGER = get_logger(__name__)
 
@@ -300,6 +301,7 @@ class LiveExecutor:
             quantity=filled,
             maintenance_margin_rate=self._config.maintenance_margin_rate,
             mode=self.mode,
+            take_profit_config=self._settings.take_profit,
         )
         position.exchange_order_ids["entry"] = str(order.get("id", ""))
         position.fees_paid = self._extract_fee(order, fill_price, filled)
@@ -472,33 +474,68 @@ class LiveExecutor:
         raise ExecutionError("limit order expired unfilled", symbol=symbol, order_id=order_id)
 
     async def _place_protective_orders(self, position: Position) -> None:
-        """Place reduce-only take-profit and stop-loss orders.
+        """Place the reduce-only take-profit ladder and the stop-loss order.
 
         ``workingType=MARK_PRICE`` matches how Binance evaluates liquidation, so
         the stop cannot be triggered by a last-price wick that never touched the
         mark.
+
+        With the ladder enabled this places one reduce-only ``TAKE_PROFIT_MARKET``
+        per level, each sized to that level's share of the position, so the
+        exchange executes the scale-out even if this process dies.  The *stop*
+        stays a single order covering the whole remaining position and is
+        re-placed by :meth:`_sync_ladder_stop` as legs fill.
         """
         symbol: str = position.symbol
-        quantity: float = position.quantity
         side: str = position.reduce_side
-
-        take_profit: float = float(self.exchange.price_to_precision(symbol, position.take_profit))
-        stop_loss: float = float(self.exchange.price_to_precision(symbol, position.stop_loss))
         params: dict[str, Any] = {"reduceOnly": True, "workingType": "MARK_PRICE"}
 
-        tp_order: dict[str, Any] = await self._call(
-            f"create_tp[{symbol}]",
-            lambda: self.exchange.create_order(
-                symbol,
-                "TAKE_PROFIT_MARKET",
-                side,
-                quantity,
-                None,
-                {**params, "stopPrice": take_profit},
-            ),
-        )
-        position.exchange_order_ids["take_profit"] = str(tp_order.get("id", ""))
+        if position.ladder is not None:
+            for level, (price, fraction) in enumerate(
+                zip(position.ladder.tp_prices, position.ladder.close_fractions, strict=True),
+                start=1,
+            ):
+                if fraction <= 0.0:
+                    continue
+                leg_quantity: float = float(
+                    self.exchange.amount_to_precision(
+                        symbol, position.quantity_for_fraction(fraction)
+                    )
+                )
+                if leg_quantity <= 0.0:
+                    continue
+                leg_price: float = float(self.exchange.price_to_precision(symbol, price))
+                leg_order: dict[str, Any] = await self._call(
+                    f"create_tp{level}[{symbol}]",
+                    lambda leg_price=leg_price, leg_quantity=leg_quantity: self.exchange.create_order(
+                        symbol,
+                        "TAKE_PROFIT_MARKET",
+                        side,
+                        leg_quantity,
+                        None,
+                        {**params, "stopPrice": leg_price},
+                    ),
+                )
+                position.exchange_order_ids[f"take_profit_{level}"] = str(leg_order.get("id", ""))
+        else:
+            take_profit: float = float(
+                self.exchange.price_to_precision(symbol, position.take_profit)
+            )
+            tp_order: dict[str, Any] = await self._call(
+                f"create_tp[{symbol}]",
+                lambda: self.exchange.create_order(
+                    symbol,
+                    "TAKE_PROFIT_MARKET",
+                    side,
+                    position.quantity,
+                    None,
+                    {**params, "stopPrice": take_profit},
+                ),
+            )
+            position.exchange_order_ids["take_profit"] = str(tp_order.get("id", ""))
 
+        quantity: float = position.quantity
+        stop_loss: float = float(self.exchange.price_to_precision(symbol, position.effective_stop()))
         sl_order: dict[str, Any] = await self._call(
             f"create_sl[{symbol}]",
             lambda: self.exchange.create_order(
@@ -533,7 +570,10 @@ class LiveExecutor:
                     if price is None or price <= 0.0:
                         continue
                     position.update_excursions(price, price)
-                    await self._maybe_advance_trailing(position, price)
+                    if position.ladder is not None:
+                        await self._maybe_advance_ladder(position, price)
+                    else:
+                        await self._maybe_advance_trailing(position, price)
 
                 now: float = utc_now_ms() / 1_000.0
                 if now - last_reconcile >= reconcile_every:
@@ -543,6 +583,108 @@ class LiveExecutor:
                 raise
             except Exception as error:  # pragma: no cover - the monitor must never die
                 _LOGGER.error("Position monitor iteration failed: %s", error, exc_info=True)
+
+    async def _maybe_advance_ladder(self, position: Position, price: float) -> None:
+        """Track ladder progress on the exchange and move the stop behind it.
+
+        The take-profit legs are resting reduce-only orders, so the *exchange*
+        executes the scale-out - this method does not send them.  What it does is
+        keep the local state machine in step (it advances on the same price
+        crossings the resting orders trigger on) and re-place the single stop
+        order at the new stage's level and the new remaining size.
+
+        Stop breaches are deliberately not handled here: the resting stop order
+        owns that, and :meth:`reconcile` books the closure.  Racing the exchange
+        with a second closing order is how positions get double-closed.
+        """
+        ladder = position.ladder
+        if ladder is None or ladder.is_closed or ladder.stop_breached(price):
+            return
+
+        previous_stage: int = ladder.stage
+        filled: list[LadderEvent] = [
+            event for event in ladder.on_tick(price) if not event.is_stop
+        ]
+        if not filled or ladder.stage == previous_stage:
+            return
+
+        for event in filled:
+            position.quantity = max(
+                0.0, position.quantity - position.quantity_for_fraction(event.fraction)
+            )
+            position.partial_fills.append(
+                {
+                    "reason": event.kind,
+                    "price": float(event.price),
+                    "fraction": float(event.fraction),
+                    "timestamp_ms": utc_now_ms(),
+                }
+            )
+            _LOGGER.info(
+                "%s reached on %s at %.6f - %.0f%% of the position scaled out by the exchange",
+                event.kind,
+                position.symbol,
+                event.price,
+                event.fraction * 100.0,
+            )
+
+        if position.is_flat:
+            # TP3 filled: the exchange has closed us out; reconcile will book it.
+            return
+        await self._sync_ladder_stop(position)
+
+    async def _sync_ladder_stop(self, position: Position) -> None:
+        """Cancel and re-place the stop at the stage's level and remaining size.
+
+        The cancel happens first: briefly having no stop is safer than briefly
+        having two, which would double-close the position.  If the replacement
+        fails the position is flattened at market rather than left naked.
+        """
+        symbol: str = position.symbol
+        old_order_id: str = position.exchange_order_ids.get("stop_loss", "")
+        if old_order_id:
+            try:
+                await self._call(
+                    f"cancel_sl[{symbol}]",
+                    lambda: self.exchange.cancel_order(old_order_id, symbol),
+                    critical=False,
+                )
+            except ExecutionError as error:
+                _LOGGER.warning("Could not cancel the previous stop on %s: %s", symbol, error)
+
+        try:
+            stop_price: float = float(
+                self.exchange.price_to_precision(symbol, position.effective_stop())
+            )
+            quantity: float = float(
+                self.exchange.amount_to_precision(symbol, position.quantity)
+            )
+            order: dict[str, Any] = await self._call(
+                f"replace_sl[{symbol}]",
+                lambda: self.exchange.create_order(
+                    symbol,
+                    "STOP_MARKET",
+                    position.reduce_side,
+                    quantity,
+                    None,
+                    {"reduceOnly": True, "workingType": "MARK_PRICE", "stopPrice": stop_price},
+                ),
+            )
+            position.exchange_order_ids["stop_loss"] = str(order.get("id", ""))
+            _LOGGER.info(
+                "Stop moved on %s -> %.6f (%s protection, %g remaining)",
+                symbol,
+                stop_price,
+                position.ladder.protection.value if position.ladder else "NONE",
+                quantity,
+            )
+        except ExecutionError as error:
+            _LOGGER.critical(
+                "Failed to re-place the stop on %s after cancelling it (%s) - flattening",
+                symbol,
+                error,
+            )
+            await self._market_close(position, CloseReason.MANUAL, note="stop replacement failed")
 
     async def _maybe_advance_trailing(self, position: Position, price: float) -> None:
         """Move the stop up (long) / down (short) as the trade goes in our favour.
@@ -630,14 +772,24 @@ class LiveExecutor:
                 await self._book_external_close(self._positions[symbol])
 
     async def _book_external_close(self, position: Position) -> None:
-        """Record a closure that happened on the exchange (TP/SL/liquidation)."""
-        reason: CloseReason = CloseReason.STOP_LOSS
+        """Record a closure that happened on the exchange (TP/SL/liquidation).
+
+        The ladder's resting legs are inspected newest-first, so a position that
+        ran all the way to TP3 is booked as ``TAKE_PROFIT_3`` rather than as
+        whichever leg happens to be checked first, and a stop-out is attributed
+        to the stage that was actually protecting it.
+        """
+        reason: CloseReason = position.stop_close_reason()
         exit_price: float = position.effective_stop()
 
-        for key, candidate in (
+        candidates: list[tuple[str, CloseReason]] = [
+            ("take_profit_3", CloseReason.TAKE_PROFIT_3),
+            ("take_profit_2", CloseReason.TAKE_PROFIT_2),
+            ("take_profit_1", CloseReason.TAKE_PROFIT_1),
             ("take_profit", CloseReason.TAKE_PROFIT),
-            ("stop_loss", CloseReason.TRAILING_STOP if position.trailing_active else CloseReason.STOP_LOSS),
-        ):
+            ("stop_loss", position.stop_close_reason()),
+        ]
+        for key, candidate in candidates:
             order_id: str = position.exchange_order_ids.get(key, "")
             if not order_id:
                 continue
@@ -730,11 +882,32 @@ class LiveExecutor:
         reason: CloseReason,
         note: str = "",
     ) -> None:
-        """Compute realised PnL, persist the trade and notify the Risk Guard."""
+        """Compute realised PnL, persist the trade and notify the Risk Guard.
+
+        ``position.quantity`` is the size still open, which after a partially
+        filled take-profit ladder is the *remainder*.  The legs the exchange
+        already scaled out are valued at their own fill prices here, so a ladder
+        that banked TP1 and TP2 before being stopped is not mis-booked as if the
+        whole position had exited at the stop.
+        """
+        realized_legs: float = sum(
+            (float(leg["price"]) - position.entry_price)
+            * position.quantity_for_fraction(float(leg["fraction"]))
+            * position.direction
+            for leg in position.partial_fills
+        )
+        leg_fees: float = sum(
+            float(leg["price"])
+            * position.quantity_for_fraction(float(leg["fraction"]))
+            * self._config.taker_fee
+            for leg in position.partial_fills
+        )
         gross: float = (exit_price - position.entry_price) * position.quantity * position.direction
         exit_fee: float = exit_price * position.quantity * self._config.taker_fee
-        position.fees_paid += exit_fee
-        position.realized_pnl = gross - position.fees_paid - position.funding_paid
+        position.fees_paid += exit_fee + leg_fees
+        position.realized_pnl = (
+            gross + realized_legs - position.fees_paid - position.funding_paid
+        )
         position.exit_price = exit_price
         position.closed_at = datetime.now(tz=timezone.utc)
         position.close_reason = reason.value if not note else f"{reason.value}:{note}"

@@ -62,9 +62,20 @@ class HMMRegime(IntEnum):
     UNKNOWN = -1
 
 
-#: Ordered list of columns the ML subsystem consumes.  Order is part of the
-#: model contract: a saved booster expects its features in exactly this layout.
-FEATURE_COLUMNS: Final[tuple[str, ...]] = (
+#: Base feature block shared by every head.
+#:
+#: Order is part of the model contract: a saved booster expects its features in
+#: exactly this layout.
+#:
+#: Three derivatives metrics were **removed** from this contract rather than
+#: neutralised: ``long_short_ratio``, ``open_interest_change`` and
+#: ``taker_buy_sell_ratio``.  Binance publishes the underlying series only for a
+#: rolling ~30-day window, so across the full training period they could not be
+#: reconstructed.  Back-filling them with ``0``/``NaN``/any other placeholder
+#: would have taught the models that "no data" is a market state, so the columns
+#: are gone from the schema instead.  Aggressive buy/sell pressure is now
+#: measured directly from aggTrades - see :data:`ORDER_FLOW_FEATURES`.
+BASE_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     # --- trend / direction --------------------------------------------------
     "kama_distance",
     "kama_slope",
@@ -116,10 +127,7 @@ FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     "funding_rate",
     "funding_rate_delta",
     "funding_rate_rank",
-    "open_interest_change",
     "open_interest_rank",
-    "long_short_ratio",
-    "taker_buy_sell_ratio",
     "liquidation_imbalance",
     # --- session ------------------------------------------------------------
     "hour_sin",
@@ -127,6 +135,65 @@ FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     "dow_sin",
     "dow_cos",
 )
+
+#: Order-flow block, computed from Binance Futures aggTrades folded onto the
+#: existing 5-minute grid.  No 15m/1h dataset is introduced: these are 5-minute
+#: quantities aligned one-to-one with the 5-minute candles.
+ORDER_FLOW_FEATURES: Final[tuple[str, ...]] = (
+    "order_flow_imbalance_5m",
+    "volume_delta_5m",
+    "relative_volume_5m",
+)
+
+#: Full matrix the feature engineer produces.  Individual heads consume subsets
+#: of it (see below); nothing else in the system may assume that "the features"
+#: and "the features this head was trained on" are the same list.
+FEATURE_COLUMNS: Final[tuple[str, ...]] = BASE_FEATURE_COLUMNS + ORDER_FLOW_FEATURES
+
+# ---------------------------------------------------------------------------
+# Per-head feature contracts.
+#
+# The order-flow block is routed deliberately rather than dumped into every
+# head, because a feature only earns its place where it answers that head's
+# question:
+#
+# * ``order_flow_imbalance_5m`` and ``volume_delta_5m`` say who is being
+#   aggressive right now - a directional and a timing question, so Direction and
+#   Entry get them.  They say nothing about how much capital to commit, so the
+#   Risk head does not.
+# * ``relative_volume_5m`` is a participation/liquidity measure: it sharpens
+#   direction and entry timing *and* is a genuine position-sizing input (a
+#   signal fired on a quarter of the usual volume deserves less capital), so it
+#   goes to all three.
+# * The Exit head keeps the base block only; its targets are excursion geometry,
+#   which is driven by volatility rather than by who crossed the spread.
+# ---------------------------------------------------------------------------
+DIRECTION_FEATURE_COLUMNS: Final[tuple[str, ...]] = BASE_FEATURE_COLUMNS + (
+    "order_flow_imbalance_5m",
+    "volume_delta_5m",
+    "relative_volume_5m",
+)
+ENTRY_FEATURE_COLUMNS: Final[tuple[str, ...]] = BASE_FEATURE_COLUMNS + (
+    "order_flow_imbalance_5m",
+    "volume_delta_5m",
+    "relative_volume_5m",
+)
+RISK_FEATURE_COLUMNS: Final[tuple[str, ...]] = BASE_FEATURE_COLUMNS + ("relative_volume_5m",)
+EXIT_FEATURE_COLUMNS: Final[tuple[str, ...]] = BASE_FEATURE_COLUMNS
+
+#: Head name -> the exact column layout that head is trained and scored on.
+#:
+#: ``baseline_direction`` is the pre-change contract: the base block *without*
+#: the order-flow features.  The frozen baseline model uses it so that the
+#: before/after comparison contrasts the whole change - removed features, new
+#: features and new architecture - against what actually ran before.
+HEAD_FEATURE_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
+    "direction": DIRECTION_FEATURE_COLUMNS,
+    "entry": ENTRY_FEATURE_COLUMNS,
+    "exit": EXIT_FEATURE_COLUMNS,
+    "risk": RISK_FEATURE_COLUMNS,
+    "baseline_direction": BASE_FEATURE_COLUMNS,
+}
 
 
 class FeatureEngineer:
@@ -152,6 +219,7 @@ class FeatureEngineer:
                 self._config.rank_window,
                 self._config.fdi_window,
                 self._config.kama_slow,
+                self._config.relative_volume_lookback + 1,
                 48,
             )
             + 10
@@ -162,6 +230,7 @@ class FeatureEngineer:
         ohlcv: pd.DataFrame,
         futures: pd.DataFrame | None = None,
         order_book: pd.DataFrame | None = None,
+        agg_trade_flow: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """Compute every engineered feature for one symbol.
 
@@ -169,10 +238,14 @@ class FeatureEngineer:
             ohlcv: Frame indexed by UTC open time with ``timestamp, open, high,
                 low, close, volume`` columns (as produced by
                 :meth:`DatabaseHandler.load_ohlcv_dataframe`).
-            futures: Optional funding / open-interest / positioning history with
-                a ``timestamp`` column.  Joined backward-asof.
+            futures: Optional funding / open-interest history with a
+                ``timestamp`` column.  Joined backward-asof.
             order_book: Optional order-book snapshot history with a ``timestamp``
                 column.  Joined backward-asof.
+            agg_trade_flow: Optional 5-minute aggressive buy/sell volume buckets
+                with ``timestamp``, ``buy_volume`` and ``sell_volume`` columns.
+                Joined on the exact bucket key, never as-of: the buckets share
+                the candles' own 5-minute grid.
 
         Returns:
             The input frame plus every column in :data:`FEATURE_COLUMNS`.  Rows
@@ -204,6 +277,7 @@ class FeatureEngineer:
             frame = self._add_garch_features(frame)
             frame = self._add_hmm_features(frame)
             frame = self._add_microstructure_features(frame, futures, order_book)
+            frame = self._add_order_flow_features(frame, agg_trade_flow)
             frame = self._add_session_features(frame)
         except (InsufficientDataError, FeatureEngineeringError):
             raise
@@ -821,25 +895,9 @@ class FeatureEngineer:
         open_interest: pd.Series = (
             merged.get("open_interest", pd.Series(0.0, index=merged.index)).astype(float).fillna(0.0)
         )
-        merged["open_interest_change"] = (
-            open_interest.pct_change(12).replace([np.inf, -np.inf], 0.0).fillna(0.0).clip(-5.0, 5.0)
-        )
         merged["open_interest_rank"] = ind.rolling_percentile_rank(
             open_interest, config.rank_window
         ).fillna(0.5)
-
-        long_short: pd.Series = (
-            merged.get("long_short_ratio", pd.Series(1.0, index=merged.index))
-            .astype(float)
-            .fillna(1.0)
-        )
-        merged["long_short_ratio"] = np.log(long_short.clip(lower=0.01))
-        taker: pd.Series = (
-            merged.get("taker_buy_sell_ratio", pd.Series(1.0, index=merged.index))
-            .astype(float)
-            .fillna(1.0)
-        )
-        merged["taker_buy_sell_ratio"] = np.log(taker.clip(lower=0.01))
 
         liq_buy: pd.Series = (
             merged.get("liquidation_buy_volume", pd.Series(0.0, index=merged.index))
@@ -856,6 +914,114 @@ class FeatureEngineer:
 
         merged.index = frame.index
         return merged
+
+    # ------------------------------------------------------------------
+    # Order flow (Binance Futures aggTrades, folded onto the 5m grid)
+    # ------------------------------------------------------------------
+    def _add_order_flow_features(
+        self,
+        frame: pd.DataFrame,
+        agg_trade_flow: pd.DataFrame | None,
+    ) -> pd.DataFrame:
+        """Attach the three 5-minute order-flow features.
+
+        ``order_flow_imbalance_5m``
+            ``(buy - sell) / (buy + sell)`` over the aggressive volumes of the
+            bar's own aggTrades, so it lives in ``[-1, +1]``: positive means
+            buyers were crossing the spread, negative means sellers were.  A bar
+            in which nothing traded has no imbalance to speak of and is reported
+            as ``0.0`` - the neutral value, never ``NaN`` or ``Inf``.
+
+        ``volume_delta_5m``
+            The same flow unnormalised: ``buy - sell`` in base units, straight
+            from the aggTrades quantities.  It is deliberately *not* derived from
+            OHLCV, which cannot distinguish an aggressive buyer from a passive
+            one.
+
+        ``relative_volume_5m``
+            The bar's own volume over the mean of the ``relative_volume_lookback``
+            bars **before** it.  ``shift(1)`` is what excludes the current candle
+            from its own baseline; without it the feature would be partly a
+            function of the very quantity it is meant to contextualise, and a
+            quiet-market bar would look normal simply because it dominates its
+            own average.
+
+        Every quantity is computed from bar ``t`` and its predecessors only, so
+        the block is point-in-time correct by construction.  Warm-up rows keep
+        ``NaN`` and are dropped downstream, exactly like every other rolling
+        feature in this module.
+        """
+        config: FeatureSettings = self._config
+        volume: pd.Series = frame["volume"].astype(float)
+
+        buy_volume, sell_volume = self._align_flow_buckets(frame, agg_trade_flow)
+        total_flow: pd.Series = buy_volume + sell_volume
+
+        imbalance: pd.Series = (buy_volume - sell_volume) / total_flow.where(
+            total_flow > _EPSILON
+        )
+        # An empty bucket is flat, not unknown: no aggressor was present.
+        frame["order_flow_imbalance_5m"] = (
+            imbalance.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-1.0, 1.0)
+        )
+        frame["volume_delta_5m"] = (buy_volume - sell_volume).astype(float)
+
+        baseline: pd.Series = (
+            volume.shift(1)
+            .rolling(window=config.relative_volume_lookback, min_periods=config.relative_volume_lookback)
+            .mean()
+        )
+        # A baseline of (near) zero carries no information about how unusual the
+        # current bar is, so the ratio degrades to the neutral 1.0 rather than
+        # exploding.  Rows still inside the warm-up stay NaN and get dropped.
+        safe_baseline: pd.Series = baseline.where(baseline > _EPSILON)
+        relative: pd.Series = volume / safe_baseline
+        relative = relative.where(baseline.isna() | baseline.gt(_EPSILON), 1.0)
+        frame["relative_volume_5m"] = relative.replace([np.inf, -np.inf], np.nan).clip(
+            upper=config.relative_volume_cap
+        )
+        return frame
+
+    def _align_flow_buckets(
+        self,
+        frame: pd.DataFrame,
+        agg_trade_flow: pd.DataFrame | None,
+    ) -> tuple[pd.Series, pd.Series]:
+        """Map order-flow buckets onto the candle index by exact bucket key.
+
+        A backward as-of join would be wrong here: the buckets are built on the
+        candles' own 5-minute grid, so an as-of match could silently attach the
+        *previous* bar's flow to a candle whose own bucket is missing.  An exact
+        key join makes a missing bucket visible as what it is - a bar with no
+        recorded aggressive flow, i.e. zero.
+        """
+        zeros: pd.Series = pd.Series(0.0, index=frame.index, dtype=float)
+        if agg_trade_flow is None or agg_trade_flow.empty:
+            _LOGGER.debug("No aggTrade flow supplied; order-flow features stay neutral")
+            return zeros, zeros.copy()
+
+        required: set[str] = {"timestamp", "buy_volume", "sell_volume"}
+        if not required.issubset(agg_trade_flow.columns):
+            _LOGGER.warning(
+                "aggTrade flow frame is missing %s; order-flow features stay neutral",
+                sorted(required - set(agg_trade_flow.columns)),
+            )
+            return zeros, zeros.copy()
+
+        flow: pd.DataFrame = agg_trade_flow.copy()
+        flow["timestamp"] = flow["timestamp"].astype("int64")
+        flow = flow.drop_duplicates("timestamp", keep="last").set_index("timestamp")
+
+        keys: pd.Index = pd.Index(frame["timestamp"].astype("int64"))
+        buy: pd.Series = pd.Series(
+            flow["buy_volume"].reindex(keys).to_numpy(dtype=np.float64),
+            index=frame.index,
+        ).fillna(0.0)
+        sell: pd.Series = pd.Series(
+            flow["sell_volume"].reindex(keys).to_numpy(dtype=np.float64),
+            index=frame.index,
+        ).fillna(0.0)
+        return buy.clip(lower=0.0), sell.clip(lower=0.0)
 
     @staticmethod
     def _asof_join(
@@ -922,6 +1088,7 @@ def compute_features_worker(
     ohlcv_records: list[dict[str, Any]],
     futures_records: list[dict[str, Any]],
     book_records: list[dict[str, Any]],
+    flow_records: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Build features from plain records - picklable wrapper for a process pool."""
     ohlcv: pd.DataFrame = pd.DataFrame.from_records(ohlcv_records)
@@ -934,9 +1101,12 @@ def compute_features_worker(
         pd.DataFrame.from_records(futures_records) if futures_records else None
     )
     book: pd.DataFrame | None = pd.DataFrame.from_records(book_records) if book_records else None
+    flow: pd.DataFrame | None = pd.DataFrame.from_records(flow_records) if flow_records else None
 
     engineer = FeatureEngineer(settings)
-    result: pd.DataFrame = engineer.build(ohlcv, futures=futures, order_book=book)
+    result: pd.DataFrame = engineer.build(
+        ohlcv, futures=futures, order_book=book, agg_trade_flow=flow
+    )
     return result.reset_index().to_dict(orient="records")
 
 
@@ -975,12 +1145,13 @@ class FeatureService:
         ohlcv: pd.DataFrame,
         futures: pd.DataFrame | None = None,
         order_book: pd.DataFrame | None = None,
+        agg_trade_flow: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """Compute features without blocking the caller's event loop."""
         async with self._semaphore:
             if not self._use_process_pool:
                 return await asyncio.to_thread(
-                    self._engineer.build, ohlcv, futures, order_book
+                    self._engineer.build, ohlcv, futures, order_book, agg_trade_flow
                 )
 
             loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
@@ -991,6 +1162,7 @@ class FeatureService:
                 ohlcv.reset_index(drop=True).to_dict(orient="records"),
                 [] if futures is None else futures.to_dict(orient="records"),
                 [] if order_book is None else order_book.to_dict(orient="records"),
+                [] if agg_trade_flow is None else agg_trade_flow.to_dict(orient="records"),
             )
             if not records:
                 return pd.DataFrame()
@@ -1001,10 +1173,19 @@ class FeatureService:
 
     async def build_many(
         self,
-        payloads: Sequence[tuple[str, pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None]],
+        payloads: Sequence[
+            tuple[
+                str,
+                pd.DataFrame,
+                pd.DataFrame | None,
+                pd.DataFrame | None,
+                pd.DataFrame | None,
+            ]
+        ],
     ) -> dict[str, pd.DataFrame]:
         """Build features for many symbols concurrently.
 
+        Each payload is ``(symbol, ohlcv, futures, order_book, agg_trade_flow)``.
         Symbols whose computation raises are logged and omitted from the result
         rather than failing the entire cycle.
         """
@@ -1014,15 +1195,19 @@ class FeatureService:
             ohlcv: pd.DataFrame,
             futures: pd.DataFrame | None,
             book: pd.DataFrame | None,
+            flow: pd.DataFrame | None,
         ) -> tuple[str, pd.DataFrame | None]:
             try:
-                return symbol, await self.build(ohlcv, futures, book)
+                return symbol, await self.build(ohlcv, futures, book, flow)
             except (FeatureEngineeringError, InsufficientDataError) as error:
                 _LOGGER.error("Feature build failed for %s: %s", symbol, error)
                 return symbol, None
 
         results: list[tuple[str, pd.DataFrame | None]] = await asyncio.gather(
-            *(_one(symbol, ohlcv, futures, book) for symbol, ohlcv, futures, book in payloads)
+            *(
+                _one(symbol, ohlcv, futures, book, flow)
+                for symbol, ohlcv, futures, book, flow in payloads
+            )
         )
         return {symbol: frame for symbol, frame in results if frame is not None}
 

@@ -21,6 +21,7 @@ from core.utils import last_closed_candle_open_ms, utc_now_ms
 from module_a_data.db_handler import DatabaseHandler
 from module_a_data.fetcher import BinanceDataFetcher
 from module_a_data.models import (
+    AggTradeFlow,
     FuturesMetrics,
     MarketDataBundle,
     OHLCVCandle,
@@ -142,6 +143,70 @@ class DataPipeline:
         )
         return written_by_symbol
 
+    async def bootstrap_agg_trade_flow(
+        self,
+        symbols: list[str] | None = None,
+        progress: ProgressCallback | None = None,
+    ) -> dict[str, int]:
+        """Backfill 5-minute aggressive buy/sell volume buckets from aggTrades.
+
+        This is the historical counterpart of the live refresh in
+        :meth:`_process_symbol`, and it is what gives the order-flow feature
+        block the same depth as the candle history.  As with the candle
+        backfill, only the missing tail is requested, so re-running is cheap.
+
+        The window is bounded by the candles actually stored for the symbol:
+        flow buckets outside the candle range have nothing to attach to.
+        """
+        if not self._settings.data.collect_agg_trades:
+            _LOGGER.info("Aggregated-trade collection is disabled; skipping the flow backfill")
+            return {}
+
+        universe: list[str] = symbols if symbols is not None else list(self._settings.data.symbols)
+        timeframe_ms: int = self._settings.data.timeframe_ms
+        completed: int = 0
+        total: int = len(universe)
+
+        async def _one(symbol: str) -> tuple[str, int]:
+            async with self._symbol_semaphore:
+                try:
+                    oldest, newest = await self._db.candle_range(symbol)
+                    if oldest is None or newest is None:
+                        return symbol, 0
+
+                    stored: int | None = await self._db.latest_agg_trade_flow_timestamp(symbol)
+                    start_ms: int = oldest if stored is None else max(oldest, stored + timeframe_ms)
+                    # `newest` is a candle *open* time, so its bucket closes one
+                    # timeframe later; that instant is the exclusive upper bound.
+                    end_ms: int = newest + timeframe_ms
+                    if start_ms >= end_ms:
+                        return symbol, 0
+
+                    buckets: list[AggTradeFlow] = await self._fetcher.fetch_agg_trade_flow(
+                        symbol, start_ms=start_ms, end_ms=end_ms
+                    )
+                    return symbol, await self._db.upsert_agg_trade_flow(buckets)
+                except (DataFetchError, DataIntegrityError, DatabaseError) as error:
+                    _LOGGER.error("Order-flow backfill failed for %s: %s", symbol, error)
+                    return symbol, 0
+                finally:
+                    nonlocal completed
+                    completed += 1
+                    if progress is not None:
+                        try:
+                            progress(symbol, completed, total)
+                        except Exception as callback_error:  # pragma: no cover
+                            _LOGGER.debug("Progress callback failed: %s", callback_error)
+
+        results: list[tuple[str, int]] = await asyncio.gather(*(_one(symbol) for symbol in universe))
+        written: dict[str, int] = dict(results)
+        _LOGGER.info(
+            "Order-flow backfill complete: %d buckets across %d symbols",
+            sum(written.values()),
+            len(written),
+        )
+        return written
+
     async def run_cycle(self, symbols: list[str] | None = None) -> dict[str, MarketDataBundle]:
         """Run one 5-minute ingestion cycle across the universe.
 
@@ -242,6 +307,7 @@ class DataPipeline:
                     await self._db.upsert_order_book(order_book)
                 if futures is not None:
                     await self._db.upsert_futures_metrics(futures)
+                await self._refresh_agg_trade_flow(symbol)
             except DatabaseError as error:
                 _LOGGER.error("Persistence failed for %s: %s", symbol, error)
                 return None
@@ -254,6 +320,31 @@ class DataPipeline:
                 qc_report=enriched_report,
                 fetched_at_ms=utc_now_ms(),
             )
+
+    async def _refresh_agg_trade_flow(self, symbol: str) -> None:
+        """Re-ingest the last few *closed* 5m order-flow buckets for one symbol.
+
+        Only closed buckets are written: the bucket the exchange is still filling
+        would otherwise reach the feature stack as a partial observation, which
+        is exactly the kind of subtle look-ahead-adjacent error that makes a
+        live-vs-backtest mismatch impossible to diagnose later.
+        """
+        if not self._settings.data.collect_agg_trades:
+            return
+
+        timeframe_ms: int = self._settings.data.timeframe_ms
+        end_ms: int = last_closed_candle_open_ms(timeframe_ms) + timeframe_ms
+        start_ms: int = end_ms - self._settings.data.agg_trade_live_buckets * timeframe_ms
+        try:
+            buckets: list[AggTradeFlow] = await self._fetcher.fetch_agg_trade_flow(
+                symbol, start_ms=start_ms, end_ms=end_ms
+            )
+        except DataFetchError as error:
+            # Order flow is additive: losing a bucket costs one row of training
+            # data, and must never take the whole ingestion cycle down with it.
+            _LOGGER.warning("Order-flow refresh failed for %s: %s", symbol, error)
+            return
+        await self._db.upsert_agg_trade_flow(buckets)
 
     async def _refetch(self, symbol: str, start_ms: int, end_ms: int) -> list[OHLCVCandle]:
         """Targeted re-fetch callback handed to the QC auto-healer."""

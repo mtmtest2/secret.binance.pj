@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from module_c_ml.decision_engine import DecisionEngine
+from module_c_ml.evaluation import ComparisonReport, DirectionComparison, direction_metrics
 from module_c_ml.ml_models import (
+    DirectionBaselineModel,
     DirectionModel,
     EntryModel,
     ExitModel,
@@ -23,9 +25,12 @@ from module_c_ml.schemas import (
 )
 
 __all__: list[str] = [
+    "ComparisonReport",
     "DecisionEngine",
     "DecisionResult",
     "DecisionVerdict",
+    "DirectionBaselineModel",
+    "DirectionComparison",
     "DirectionModel",
     "DirectionPrediction",
     "EntryModel",
@@ -38,4 +43,5 @@ __all__: list[str] = [
     "RiskModel",
     "TradeAction",
     "TradeSignal",
+    "direction_metrics",
 ]

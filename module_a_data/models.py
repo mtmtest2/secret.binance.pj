@@ -180,7 +180,15 @@ class OrderBookSnapshot(BaseModel):
 
 
 class FuturesMetrics(BaseModel):
-    """Perpetual-futures specific state for a symbol at a point in time."""
+    """Perpetual-futures specific state for a symbol at a point in time.
+
+    The positioning ratios Binance publishes under ``futures/data``
+    (``longShortRatio``, ``takerlongshortRatio``) are deliberately **not**
+    modelled here: Binance only retains ~30 days of them, so they cannot be
+    reconstructed across the training period and any historical value would be a
+    fabrication.  Aggressive buy/sell pressure is instead measured directly from
+    aggTrades - see :class:`AggTradeFlow`.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -190,9 +198,6 @@ class FuturesMetrics(BaseModel):
     next_funding_time: int | None = Field(default=None)
     open_interest: float = Field(default=0.0, ge=0.0, description="OI in base contracts.")
     open_interest_value: float = Field(default=0.0, ge=0.0, description="OI notional in USDT.")
-    long_short_ratio: float = Field(default=1.0, ge=0.0)
-    top_trader_long_short_ratio: float = Field(default=1.0, ge=0.0)
-    taker_buy_sell_ratio: float = Field(default=1.0, ge=0.0)
     liquidation_buy_volume: float = Field(default=0.0, ge=0.0)
     liquidation_sell_volume: float = Field(default=0.0, ge=0.0)
     mark_price: float = Field(default=0.0, ge=0.0)
@@ -211,6 +216,46 @@ class FuturesMetrics(BaseModel):
     def net_liquidation_volume(self) -> float:
         """Signed liquidation flow (buy-side liquidations minus sell-side)."""
         return self.liquidation_buy_volume - self.liquidation_sell_volume
+
+
+class AggTradeFlow(BaseModel):
+    """Aggressive buy/sell volume for one fully closed 5-minute bucket.
+
+    Built by folding Binance Futures ``aggTrades`` onto the 5-minute grid.  Each
+    aggregated trade carries ``isBuyerMaker``:
+
+    * ``isBuyerMaker == False`` - the buyer *took* the offer, so the aggressor
+      was a buyer and the quantity counts as **aggressive buy volume**.
+    * ``isBuyerMaker == True`` - the seller took the bid, so the quantity counts
+      as **aggressive sell volume**.
+
+    ``timestamp`` is the bucket's open time and is aligned to the same 5-minute
+    grid as :class:`OHLCVCandle`, which is what lets the two be joined on an
+    exact key rather than an as-of match.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    symbol: str = Field(min_length=3)
+    timestamp: int = Field(ge=_MIN_PLAUSIBLE_TIMESTAMP_MS, description="Bucket open time (ms).")
+    buy_volume: float = Field(default=0.0, ge=0.0, description="Aggressive buy base volume.")
+    sell_volume: float = Field(default=0.0, ge=0.0, description="Aggressive sell base volume.")
+    buy_quote_volume: float = Field(default=0.0, ge=0.0)
+    sell_quote_volume: float = Field(default=0.0, ge=0.0)
+    trades: int = Field(default=0, ge=0, description="Aggregated trades in the bucket.")
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def volume_delta(self) -> float:
+        """Signed aggressive flow: ``buy_volume - sell_volume``."""
+        return self.buy_volume - self.sell_volume
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def order_flow_imbalance(self) -> float:
+        """Normalised flow in ``[-1, 1]``; ``0.0`` for an empty bucket."""
+        total: float = self.buy_volume + self.sell_volume
+        return 0.0 if total <= 0.0 else (self.buy_volume - self.sell_volume) / total
 
 
 class QCIssue(BaseModel):

@@ -107,6 +107,20 @@ class DataSettings(BaseModel):
     #: missing last bar, so a small offset is the operationally correct default.
     cycle_second_offset: int = Field(default=10, ge=0, le=59)
 
+    # --- Aggregated-trade (order-flow) ingestion --------------------------
+    #: Collect Binance Futures aggTrades and fold them into 5-minute buy/sell
+    #: volume buckets.  These buckets are the *only* source of the order-flow
+    #: feature block (``order_flow_imbalance_5m``, ``volume_delta_5m``); without
+    #: them those features stay NaN and their rows are dropped as un-warmed.
+    collect_agg_trades: bool = Field(default=True)
+    #: Rows per ``aggTrades`` page.  Binance caps this endpoint at 1000.
+    agg_trade_page_limit: int = Field(default=1_000, ge=100, le=1_000)
+    #: Safety rail on how many pages one symbol/range walk may request.
+    agg_trade_max_pages: int = Field(default=400, ge=1)
+    #: Closed 5m buckets refreshed on every live cycle (covers a late trade
+    #: landing just after a bucket closed).
+    agg_trade_live_buckets: int = Field(default=2, ge=1, le=24)
+
 
 class UniverseSettings(BaseModel):
     """Screening rules for the tradeable symbol universe.
@@ -192,6 +206,17 @@ class FeatureSettings(BaseModel):
     #: Rolling window used to convert raw values into stationary percentiles.
     rank_window: int = Field(default=288, ge=20)  # 288 bars == 24 h of 5m candles
 
+    #: Trailing baseline for ``relative_volume_5m``, in 5-minute candles.  The
+    #: project had no pre-existing *current-bar-excluding* volume baseline (the
+    #: 96-bar mean behind ``volume_trend`` includes the current bar and therefore
+    #: cannot be reused), so this defaults to the specified 20 candles.  The
+    #: current candle is always excluded from its own baseline - see
+    #: ``FeatureEngineer._add_order_flow_features``.
+    relative_volume_lookback: int = Field(default=20, ge=2)
+    #: Upper rail on ``relative_volume_5m``; a 5m bar 50x its own baseline is a
+    #: data artefact, not a signal, and an unbounded ratio destabilises training.
+    relative_volume_cap: float = Field(default=50.0, gt=1.0)
+
     max_feature_workers: int = Field(default=4, ge=1, le=32)
 
 
@@ -219,6 +244,8 @@ class MLSettings(BaseModel):
     """Machine-learning subsystem configuration (Module C)."""
 
     model_dir: Path = Field(default=PROJECT_ROOT / "artifacts" / "models")
+    #: Where the baseline-vs-new-idea evaluation reports are written.
+    report_dir: Path = Field(default=PROJECT_ROOT / "artifacts" / "reports")
     booster: Literal["lightgbm", "xgboost"] = Field(default="lightgbm")
     random_state: int = Field(default=42)
 
@@ -233,11 +260,57 @@ class MLSettings(BaseModel):
 
     #: Purged, time-ordered validation split (fraction held out at the tail).
     validation_fraction: float = Field(default=0.2, gt=0.0, lt=0.9)
+    #: Chronological tail reserved as a *never-touched* out-of-sample test block.
+    #: Nothing in the system - feature selection, threshold tuning, hyper-parameter
+    #: search, TP allocation, model selection - is allowed to read it; it exists
+    #: solely for the final honest evaluation.
+    test_fraction: float = Field(default=0.2, ge=0.0, lt=0.5)
     #: Bars removed between train and validation blocks to kill label leakage.
     purge_bars: int = Field(default=60, ge=0)
+    #: Extra bars dropped *after* the purge gap, on top of the label horizon, so
+    #: that slow features fitted on the earlier block cannot bleed across.
+    embargo_bars: int = Field(default=60, ge=0)
     early_stopping_rounds: int = Field(default=50, ge=0)
 
     inference_workers: int = Field(default=2, ge=1, le=16)
+
+    # --- Direction head ---------------------------------------------------
+    #: ``two_stage_cascade`` splits the direction problem into a tradeable gate
+    #: and a LONG-vs-SHORT head fitted only on tradeable rows; ``single_stage``
+    #: is the original flat 5-class booster and is what the frozen baseline uses.
+    #: The *decision threshold is identical* under both - see ``DecisionSettings``.
+    direction_architecture: Literal["two_stage_cascade", "single_stage"] = Field(
+        default="two_stage_cascade"
+    )
+    #: Fit isotonic calibrators for the direction stages on a purged slice carved
+    #: out of the *training* block, and keep them only when they improve Brier
+    #: score on that same slice.  Validation and test are never read here.
+    direction_calibrate: bool = Field(default=True)
+    #: Share of the training block reserved for that calibration slice.
+    direction_calibration_fraction: float = Field(default=0.2, gt=0.0, lt=0.5)
+
+    #: Stage-2 (LONG vs SHORT) hyper-parameters.  The stage sees far fewer rows
+    #: than the gate and overfits readily, so it is regularised harder.
+    direction_stage2_n_estimators: int = Field(default=700, ge=10)
+    direction_stage2_learning_rate: float = Field(default=0.03, gt=0.0, le=1.0)
+    direction_stage2_max_depth: int = Field(default=5, ge=1, le=32)
+    direction_stage2_num_leaves: int = Field(default=31, ge=2)
+    direction_stage2_min_child_samples: int = Field(default=100, ge=1)
+    direction_stage2_subsample: float = Field(default=0.8, gt=0.0, le=1.0)
+    direction_stage2_colsample_bytree: float = Field(default=0.7, gt=0.0, le=1.0)
+    direction_stage2_reg_lambda: float = Field(default=2.0, ge=0.0)
+    direction_stage2_reg_alpha: float = Field(default=0.5, ge=0.0)
+
+    # --- Walk-forward evaluation -----------------------------------------
+    #: Folds used by the walk-forward validator.  Folds are carved out of the
+    #: train+validation region only; the test block is never part of a fold.
+    walk_forward_folds: int = Field(default=4, ge=2, le=12)
+
+    @model_validator(mode="after")
+    def _validate_split_budget(self) -> "MLSettings":
+        if self.validation_fraction + self.test_fraction >= 0.9:
+            raise ValueError("validation_fraction + test_fraction must leave room to train")
+        return self
 
 
 class DecisionSettings(BaseModel):
@@ -305,6 +378,68 @@ class RiskSettings(BaseModel):
             raise ValueError("YELLOW loss streak must not exceed the RED one")
         if self.api_errors_yellow > self.api_errors_red:
             raise ValueError("YELLOW API error budget must not exceed the RED one")
+        return self
+
+
+class TakeProfitSettings(BaseModel):
+    """Three-stage take-profit ladder with a stage-driven stop loss.
+
+    The ladder scales out of a position at three targets and ratchets the stop
+    behind them, so profit is protected progressively while the remainder is
+    still allowed to reach the final target:
+
+    ==========  ==================================  ==========================
+    Stage       Trigger                             Stop moves to
+    ==========  ==================================  ==========================
+    ``TP1``     ``level_fractions[0]`` of the TP     entry (breakeven)
+    ``TP2``     ``level_fractions[1]`` of the TP     the TP1 price
+    ``TP3``     the model's full take-profit         position is closed out
+    ==========  ==================================  ==========================
+
+    Levels are expressed as fractions of the take-profit distance the Exit model
+    produced, so the ladder inherits the model's volatility-scaled geometry
+    instead of imposing a second, unrelated one.  With the default thirds, a long
+    entered at 100 with a 3 % target and a 2 % stop gets TP1=101, TP2=102,
+    TP3=103 and SL=98 - the worked example in the specification.
+    """
+
+    enabled: bool = Field(default=True)
+
+    #: TP1/TP2/TP3 as fractions of the full take-profit distance.  Strictly
+    #: increasing; the last entry is the model's own target and must be 1.0.
+    level_fractions: tuple[float, float, float] = Field(default=(1.0 / 3.0, 2.0 / 3.0, 1.0))
+    #: Share of the *original* position closed at each level.  Must sum to 1.0.
+    close_fractions: tuple[float, float, float] = Field(default=(0.30, 0.30, 0.40))
+
+    #: Move the stop to breakeven once TP1 fills.
+    breakeven_after_tp1: bool = Field(default=True)
+    #: Move the stop to the TP1 price once TP2 fills.
+    lock_tp1_after_tp2: bool = Field(default=True)
+    #: Offset applied to the breakeven stop, as a fraction of the entry price, so
+    #: that "breakeven" still covers the round-trip fee instead of scratching.
+    breakeven_offset_pct: float = Field(default=0.0, ge=0.0, le=0.01)
+
+    #: Minimum share of the original position any single leg may close.  Legs
+    #: below this are merged forward, which stops an exchange rejecting a
+    #: dust-sized reduce-only order.
+    min_leg_fraction: float = Field(default=0.05, gt=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _validate_ladder(self) -> "TakeProfitSettings":
+        if len(self.level_fractions) != 3 or len(self.close_fractions) != 3:
+            raise ValueError("the ladder is defined by exactly three levels")
+        if any(value <= 0.0 for value in self.level_fractions):
+            raise ValueError("take-profit level fractions must be positive")
+        if list(self.level_fractions) != sorted(self.level_fractions):
+            raise ValueError("take-profit level fractions must be strictly increasing")
+        if len(set(self.level_fractions)) != 3:
+            raise ValueError("take-profit level fractions must be distinct")
+        if abs(self.level_fractions[-1] - 1.0) > 1e-9:
+            raise ValueError("the final take-profit level must be the model's own target (1.0)")
+        if any(value <= 0.0 for value in self.close_fractions):
+            raise ValueError("every ladder leg must close a positive share")
+        if abs(sum(self.close_fractions) - 1.0) > 1e-6:
+            raise ValueError("close_fractions must sum to 1.0")
         return self
 
 
@@ -394,6 +529,7 @@ class Settings(BaseSettings):
     ml: MLSettings = Field(default_factory=MLSettings)
     decision: DecisionSettings = Field(default_factory=DecisionSettings)
     risk: RiskSettings = Field(default_factory=RiskSettings)
+    take_profit: TakeProfitSettings = Field(default_factory=TakeProfitSettings)
     execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
     web: WebSettings = Field(default_factory=WebSettings)
     db: DatabaseSettings = Field(default_factory=DatabaseSettings)
@@ -410,7 +546,7 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _prepare_directories(self) -> "Settings":
         """Create the runtime directories eagerly so no I/O path can fail later."""
-        for directory in (self.log_dir, self.ml.model_dir, self.db.path.parent):
+        for directory in (self.log_dir, self.ml.model_dir, self.ml.report_dir, self.db.path.parent):
             directory.mkdir(parents=True, exist_ok=True)
         return self
 

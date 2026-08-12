@@ -88,14 +88,19 @@ STARTING ──▶ AWAITING_UNIVERSE ──(you tick pairs)──▶ COLLECTING_
 |---|---|
 | *(none)* / `run` | Panel + automatic setup + 5m scheduler |
 | `universe` | Print the screened pair list in the terminal |
-| `bootstrap` | Backfill historical candles only |
+| `bootstrap` | Backfill historical candles and aggTrade order flow |
 | `train` | Build the training dataset and fit the four heads |
 | `backtest [--candles N] [--equity X]` | Event-driven replay with full metrics |
+| `compare [--skip-backtest]` | Baseline vs new-idea report at the *same* decision threshold |
 | `cycle` | Run exactly one trading cycle, then exit |
 | `--mode paper\|live` | Override the execution mode |
 
 The one-shot commands use the universe saved from the panel; if none exists they
 auto-select the top screened pairs so the CLI is usable standalone.
+
+See [`docs/NEW_IDEA.md`](docs/NEW_IDEA.md) for the order-flow feature block, the
+two-stage Direction head and the three-stage take-profit ladder, including how to
+reproduce the before/after comparison.
 
 ---
 

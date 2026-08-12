@@ -14,6 +14,7 @@ from __future__ import annotations
 from module_a_data.db_handler import DatabaseHandler
 from module_a_data.fetcher import BinanceDataFetcher
 from module_a_data.models import (
+    AggTradeFlow,
     FuturesMetrics,
     MarketDataBundle,
     OHLCVCandle,
@@ -27,6 +28,7 @@ from module_a_data.qc_validator import QCValidator
 from module_a_data.universe import SymbolCandidate, UniverseManager
 
 __all__: list[str] = [
+    "AggTradeFlow",
     "BinanceDataFetcher",
     "DataPipeline",
     "DatabaseHandler",
