@@ -112,8 +112,11 @@ _DASHBOARD_CONTENT: Final[
   <div class="flex items-center justify-between flex-wrap gap-3">
     <div class="font-bold">CONTROLS</div>
     <div class="flex items-center gap-2 flex-wrap">
-      <input id="token" type="password" placeholder="API token (if set)"
-             class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs"/>
+      <form onsubmit="return false" autocomplete="off" class="contents">
+        <input id="token" type="password" name="api-token" placeholder="API token (if set)"
+               autocomplete="off" data-1p-ignore data-lpignore="true"
+               class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs"/>
+      </form>
       <button id="btn-paper" onclick="startTrading('paper')"
               class="bg-emerald-700 hover:bg-emerald-600 rounded px-3 py-1 text-xs font-bold">START PAPER</button>
       <button id="btn-live" onclick="startTrading('live')"
@@ -196,7 +199,7 @@ function killSwitch() {
 
 function startTrading(mode) {
   const warn = mode === 'live'
-    ? 'START LIVE TRADING WITH REAL FUNDS?\n\nAny open paper positions will be closed first.'
+    ? 'START LIVE TRADING WITH REAL FUNDS?\\n\\nAny open paper positions will be closed first.'
     : 'Start paper trading with the virtual balance?';
   if (confirm(warn)) { post('/api/trading/start', {mode: mode}); }
 }
@@ -417,8 +420,11 @@ _UNIVERSE_CONTENT: Final[
       </div>
     </div>
     <div class="flex items-center gap-2 flex-wrap">
-      <input id="token" type="password" placeholder="API token (if set)"
-             class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs"/>
+      <form onsubmit="return false" autocomplete="off" class="contents">
+        <input id="token" type="password" name="api-token" placeholder="API token (if set)"
+               autocomplete="off" data-1p-ignore data-lpignore="true"
+               class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs"/>
+      </form>
       <button onclick="loadUniverse(true)"
               class="bg-slate-700 hover:bg-slate-600 rounded px-3 py-1 text-xs font-bold">REFRESH</button>
       <button onclick="suggest()"
@@ -506,7 +512,7 @@ function renderRows() {
         (r.reasons || []).join('; ').slice(0, 70) + '</span>';
     const chg = (r.price_change_pct_24h >= 0 ? 'pos' : 'neg');
     return '<tr>' +
-      '<td><input type="checkbox" ' + checked + ' onchange="toggle(\'' + r.symbol + '\', this.checked)"/></td>' +
+      '<td><input type="checkbox" ' + checked + ' onchange="toggle(\\'' + r.symbol + '\\', this.checked)"/></td>' +
       '<td><b>' + r.symbol + '</b></td>' +
       '<td>' + fmt(r.price, 6) + '</td>' +
       '<td>' + money(r.quote_volume_24h) + '</td>' +
@@ -546,7 +552,7 @@ async function saveUniverse() {
   if (SELECTED.size === 0) {
     el.textContent = 'Select at least one pair first.'; el.className = 'neg text-xs mt-2'; return;
   }
-  if (!confirm('Save ' + SELECTED.size + ' pair(s)?\n\nData collection and model training will start now. Any armed trading will be stopped first.')) return;
+  if (!confirm('Save ' + SELECTED.size + ' pair(s)?\\n\\nData collection and model training will start now. Any armed trading will be stopped first.')) return;
   el.textContent = 'saving...'; el.className = 'muted text-xs mt-2';
   const res = await fetch('/api/universe/select', {
     method: 'POST',
