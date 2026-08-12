@@ -81,6 +81,33 @@ class OrderBookRow(Base):
     inserted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class AggTradeFlowRow(Base):
+    """Aggressive buy/sell volume for one closed 5-minute bucket.
+
+    Derived from Binance Futures ``aggTrades`` via ``isBuyerMaker``; this is the
+    storage behind ``order_flow_imbalance_5m`` and ``volume_delta_5m``.  Its
+    ``timestamp`` shares the 5-minute grid with :class:`OHLCVRow`, so the join
+    to candles is an exact-key merge rather than an as-of match.
+    """
+
+    __tablename__ = "agg_trade_flow"
+    __table_args__ = (
+        UniqueConstraint("symbol", "timeframe", "timestamp", name="uq_flow_symbol_tf_ts"),
+        Index("ix_flow_symbol_ts", "symbol", "timestamp"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(40), nullable=False)
+    timeframe: Mapped[str] = mapped_column(String(8), nullable=False, default="5m")
+    timestamp: Mapped[int] = mapped_column(Integer, nullable=False)
+    buy_volume: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    sell_volume: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    buy_quote_volume: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    sell_quote_volume: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    trades: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    inserted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class FuturesMetricsRow(Base):
     """Perpetual-specific state: funding, open interest, positioning, liquidations."""
 
@@ -97,9 +124,6 @@ class FuturesMetricsRow(Base):
     next_funding_time: Mapped[int | None] = mapped_column(Integer, nullable=True)
     open_interest: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     open_interest_value: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    long_short_ratio: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
-    top_trader_long_short_ratio: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
-    taker_buy_sell_ratio: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
     liquidation_buy_volume: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     liquidation_sell_volume: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     mark_price: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)

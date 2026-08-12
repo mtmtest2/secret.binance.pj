@@ -190,9 +190,6 @@ class FuturesMetrics(BaseModel):
     next_funding_time: int | None = Field(default=None)
     open_interest: float = Field(default=0.0, ge=0.0, description="OI in base contracts.")
     open_interest_value: float = Field(default=0.0, ge=0.0, description="OI notional in USDT.")
-    long_short_ratio: float = Field(default=1.0, ge=0.0)
-    top_trader_long_short_ratio: float = Field(default=1.0, ge=0.0)
-    taker_buy_sell_ratio: float = Field(default=1.0, ge=0.0)
     liquidation_buy_volume: float = Field(default=0.0, ge=0.0)
     liquidation_sell_volume: float = Field(default=0.0, ge=0.0)
     mark_price: float = Field(default=0.0, ge=0.0)
@@ -211,6 +208,50 @@ class FuturesMetrics(BaseModel):
     def net_liquidation_volume(self) -> float:
         """Signed liquidation flow (buy-side liquidations minus sell-side)."""
         return self.liquidation_buy_volume - self.liquidation_sell_volume
+
+
+class AggTradeFlow(BaseModel):
+    """Aggressive buy/sell volume for one fully closed 5-minute bucket.
+
+    Built by folding Binance Futures ``aggTrades`` onto the 5-minute grid.
+    Aggressor side comes from ``isBuyerMaker``:
+
+    * ``isBuyerMaker == False`` - the buyer lifted the offer, so the quantity
+      is **aggressive buy volume**.
+    * ``isBuyerMaker == True`` - the seller hit the bid, so it is **aggressive
+      sell volume**.
+
+    This is the one derivatives-adjacent source Binance serves from full
+    contract history, which is why it can back the order-flow feature block
+    across a multi-month training window when ``taker_buy_sell_ratio``
+    (~30-day retention) could not.
+
+    ``timestamp`` is the bucket's open time on the same 5-minute grid as
+    :class:`OHLCVCandle`, so the two join on an exact key rather than as-of.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    symbol: str = Field(min_length=3)
+    timestamp: int = Field(ge=_MIN_PLAUSIBLE_TIMESTAMP_MS, description="Bucket open time (ms).")
+    buy_volume: float = Field(default=0.0, ge=0.0, description="Aggressive buy base volume.")
+    sell_volume: float = Field(default=0.0, ge=0.0, description="Aggressive sell base volume.")
+    buy_quote_volume: float = Field(default=0.0, ge=0.0)
+    sell_quote_volume: float = Field(default=0.0, ge=0.0)
+    trades: int = Field(default=0, ge=0, description="Aggregated trades in the bucket.")
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def volume_delta(self) -> float:
+        """Signed aggressive flow: ``buy_volume - sell_volume``."""
+        return self.buy_volume - self.sell_volume
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def order_flow_imbalance(self) -> float:
+        """Normalised flow in ``[-1, 1]``; ``0.0`` for an empty bucket."""
+        total: float = self.buy_volume + self.sell_volume
+        return 0.0 if total <= 0.0 else (self.buy_volume - self.sell_volume) / total
 
 
 class QCIssue(BaseModel):

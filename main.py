@@ -389,6 +389,23 @@ class TradingSystem:
             len(futures_written),
         )
 
+        # Order flow is backfilled after the candles because its window is
+        # clamped to the stored candle range - the two must cover the same
+        # period or the order-flow features would be flat zero over the part
+        # they do not overlap.  Unlike the futures series above, aggTrades has
+        # full contract history, so this pass genuinely covers the training
+        # window rather than Binance's ~30-day retention tail.
+        if self.settings.data.collect_agg_trades:
+            self.progress.advance(0, len(usable), "backfilling aggTrade order flow")
+            flow_written: dict[str, int] = await self.pipeline.backfill_agg_trade_flow(
+                usable, progress=report
+            )
+            _LOGGER.info(
+                "Order-flow backfill complete: %d bucket(s) across %d symbol(s)",
+                sum(flow_written.values()),
+                len(flow_written),
+            )
+
     async def _run_final_backtest(
         self, dataset: ProcessedDataset
     ) -> tuple[BacktestReport | None, BacktestReport | None]:
@@ -515,9 +532,10 @@ class TradingSystem:
         # Idempotent - only fetches the missing tail - but must run again here
         # regardless of what `_setup_collect` already did upstream, so that any
         # future call path that reaches `_setup_train` without first going
-        # through `_setup_collect` still gets funding_rate/open_interest/
-        # long_short_ratio/taker_buy_sell_ratio history before training reads it.
+        # through `_setup_collect` still gets funding-rate/open-interest and
+        # aggTrade order-flow history before training reads it.
         await self.pipeline.backfill_futures_metrics(symbols)
+        await self.pipeline.backfill_agg_trade_flow(symbols)
 
         dataset: ProcessedDataset = await self.processor.build_training_dataset(symbols=symbols)
         if dataset.is_empty:
@@ -1269,10 +1287,11 @@ class TradingSystem:
         await self.database.initialize()
         symbols: list[str] = await self._resolve_cli_universe()
         # `train` is a standalone CLI path - it never runs `_setup_collect`, so
-        # without this the funding_rate/open_interest/long_short_ratio/
-        # taker_buy_sell_ratio history stays at its neutral default no matter
-        # how many times the model is retrained from this entry point.
+        # without these the funding_rate/open_interest history and the
+        # order-flow block stay at their neutral defaults no matter how many
+        # times the model is retrained from this entry point.
         await self.pipeline.backfill_futures_metrics(symbols)
+        await self.pipeline.backfill_agg_trade_flow(symbols)
         dataset: ProcessedDataset = await self.processor.build_training_dataset(
             symbols=symbols, max_candles_per_symbol=max_candles
         )

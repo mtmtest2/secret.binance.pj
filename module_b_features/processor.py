@@ -391,11 +391,11 @@ class DatasetProcessor:
     async def _build_labeled_symbol(self, symbol: str, depth: int) -> pd.DataFrame | None:
         """Build the feature+label frame for one symbol, or ``None`` on failure."""
         try:
-            ohlcv, futures, book = await self._load_symbol_inputs(symbol, depth)
+            ohlcv, futures, book, flow = await self._load_symbol_inputs(symbol, depth)
             if ohlcv.empty:
                 return None
 
-            featured: pd.DataFrame = await self._features.build(ohlcv, futures, book)
+            featured: pd.DataFrame = await self._features.build(ohlcv, futures, book, flow)
             labeled: pd.DataFrame = await asyncio.to_thread(self._labeler.generate, featured)
             labeled["symbol"] = symbol
             return labeled
@@ -481,12 +481,12 @@ class DatasetProcessor:
         """
         depth: int = lookback_candles or self._inference_depth()
         try:
-            ohlcv, futures, book = await self._load_symbol_inputs(symbol, depth)
+            ohlcv, futures, book, flow = await self._load_symbol_inputs(symbol, depth)
             if ohlcv.empty:
                 _LOGGER.warning("No stored candles for %s - cannot infer", symbol)
                 return None
 
-            featured: pd.DataFrame = await self._features.build(ohlcv, futures, book)
+            featured: pd.DataFrame = await self._features.build(ohlcv, futures, book, flow)
         except (InsufficientDataError, FeatureEngineeringError) as error:
             _LOGGER.warning("Inference features unavailable for %s: %s", symbol, error)
             return None
@@ -571,8 +571,10 @@ class DatasetProcessor:
         self,
         symbol: str,
         depth: int,
-    ) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None]:
-        """Load OHLCV, futures metrics and order-book history for one symbol.
+    ) -> tuple[
+        pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None
+    ]:
+        """Load OHLCV, futures metrics, order-book and order-flow history.
 
         The OHLCV window is trimmed to its longest clean trailing run (see
         :meth:`_trim_to_clean_window`) before anything downstream sees it.
@@ -587,16 +589,18 @@ class DatasetProcessor:
         """
         ohlcv: pd.DataFrame = await self._db.load_ohlcv_dataframe(symbol, limit=depth)
         if ohlcv.empty:
-            return ohlcv, None, None
+            return ohlcv, None, None, None
 
         ohlcv = self._trim_to_clean_window(symbol, ohlcv)
 
         futures: pd.DataFrame = await self._db.load_futures_metrics_frame(symbol, limit=depth)
         book: pd.DataFrame = await self._load_order_book_frame(symbol, depth)
+        flow: pd.DataFrame = await self._db.load_agg_trade_flow_frame(symbol, limit=depth)
         return (
             ohlcv,
             futures if not futures.empty else None,
             book if not book.empty else None,
+            flow if not flow.empty else None,
         )
 
     def _trim_to_clean_window(self, symbol: str, ohlcv: pd.DataFrame) -> pd.DataFrame:

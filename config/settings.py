@@ -126,6 +126,26 @@ class DataSettings(BaseModel):
     #: missing last bar, so a small offset is the operationally correct default.
     cycle_second_offset: int = Field(default=10, ge=0, le=59)
 
+    # --- Aggregated-trade (order-flow) ingestion --------------------------
+    #: Fold Binance Futures aggTrades into closed 5-minute buy/sell volume
+    #: buckets.  Unlike every other derivatives source in this system,
+    #: ``aggTrades`` is served from full contract history, which is what makes
+    #: the order-flow feature block backfillable across the whole training
+    #: window where ``taker_buy_sell_ratio`` (~30-day retention) was not.
+    #: With this off, ``order_flow_imbalance_5m`` and ``volume_delta_5m`` sit
+    #: at a flat zero and carry no information.
+    collect_agg_trades: bool = Field(default=True)
+    #: Rows per ``aggTrades`` page; Binance caps this endpoint at 1000.
+    agg_trade_page_limit: int = Field(default=1_000, ge=100, le=1_000)
+    #: Ceiling on pages walked per symbol per backfill call.  aggTrades is by
+    #: far the highest-volume endpoint this system touches (every print, not an
+    #: aggregate), so a deep backfill is paced across runs rather than
+    #: attempted in one pass.
+    agg_trade_max_pages: int = Field(default=20_000, ge=1)
+    #: Closed 5m buckets re-ingested on every live cycle, covering a late trade
+    #: landing just after a bucket closed.
+    agg_trade_live_buckets: int = Field(default=2, ge=1, le=24)
+
 
 class UniverseSettings(BaseModel):
     """Screening rules for the tradeable symbol universe.
@@ -236,6 +256,16 @@ class FeatureSettings(BaseModel):
 
     #: Rolling window used to convert raw values into stationary percentiles.
     rank_window: int = Field(default=288, ge=20)  # 288 bars == 24 h of 5m candles
+
+    #: Trailing baseline for ``relative_volume_5m``, in 5-minute candles.  No
+    #: existing lookback was reusable: ``volume_trend``'s 12/96 means and the
+    #: HMM's 96-bar relative volume all *include* the current bar, which is
+    #: exactly what this feature must exclude.  Hence the specified default.
+    relative_volume_lookback: int = Field(default=20, ge=2)
+    #: Upper rail on ``relative_volume_5m``.  A bar 50x its own trailing mean is
+    #: a data artefact rather than a signal, and an unbounded ratio destabilises
+    #: tree splits near the top of the range.
+    relative_volume_cap: float = Field(default=50.0, gt=1.0)
 
     max_feature_workers: int = Field(default=4, ge=1, le=32)
 

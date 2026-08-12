@@ -42,7 +42,7 @@ from config.settings import BoosterHyperparameters, MLSettings, Settings
 from core.exceptions import ModelNotLoadedError, ModelTrainingError
 from core.logger import get_logger
 from core.utils import clamp, git_commit_hash
-from module_b_features.features import FEATURE_COLUMNS, HMMRegime
+from module_b_features.features import FEATURE_COLUMNS, HEAD_FEATURE_COLUMNS, HMMRegime
 from module_b_features.labeler import LABEL_ORDER, LABEL_TO_INDEX, LabelClass, risk_tier_from_score
 from module_b_features.processor import (
     ChronologicalSplit,
@@ -253,13 +253,46 @@ class BaseModelHead(ABC):
 
     #: Filename stem of the artifact, unique per head.
     name: str = "base"
+    #: Key into :data:`HEAD_FEATURE_COLUMNS`.  Heads consume different feature
+    #: sets on purpose: a feature is routed to the head whose question it
+    #: answers, and nowhere else.  Unset (``None``) means "the whole matrix",
+    #: which is the correct default for a head with no declared contract.
+    feature_set: str | None = None
 
     def __init__(self, settings: Settings) -> None:
         self._settings: Settings = settings
         self._config: MLSettings = settings.ml
         self._model: Any = None
-        self._feature_columns: tuple[str, ...] = FEATURE_COLUMNS
+        self._feature_columns: tuple[str, ...] = self._declared_columns()
         self._metadata: dict[str, Any] = {}
+
+    @classmethod
+    def _declared_columns(cls) -> tuple[str, ...]:
+        """The head's declared feature contract, or the full matrix."""
+        if cls.feature_set is None:
+            return FEATURE_COLUMNS
+        return HEAD_FEATURE_COLUMNS.get(cls.feature_set, FEATURE_COLUMNS)
+
+    def _design_matrix(self, dataset: ProcessedDataset) -> pd.DataFrame:
+        """This head's own view of the pooled feature matrix.
+
+        Intersected with what the dataset actually carries, so a dataset built
+        by an older feature engineer degrades to the columns it has rather than
+        raising - the missing ones are logged, never silently zero-filled into
+        the training set.
+        """
+        wanted: tuple[str, ...] = self._declared_columns()
+        available: set[str] = set(dataset.features.columns)
+        columns: list[str] = [column for column in wanted if column in available]
+        missing: list[str] = [column for column in wanted if column not in available]
+        if missing:
+            _LOGGER.warning(
+                "%s: %d declared feature(s) absent from the dataset: %s",
+                self.name,
+                len(missing),
+                missing,
+            )
+        return dataset.features[columns]
 
     # ------------------------------------------------------------------
     # State
@@ -792,6 +825,7 @@ class DirectionModel(BaseModelHead):
     """
 
     name = "direction_model"
+    feature_set = "direction"
 
     #: Minimum trade-labelled training rows required to fit stage 2
     #: (long-vs-short). Below this a single softmax split is too noisy to
@@ -838,7 +872,7 @@ class DirectionModel(BaseModelHead):
 
         split: ChronologicalSplit = self._chronological_split(dataset)
         train_index, validation_index = split.train_index, split.validation_index
-        features: pd.DataFrame = dataset.features
+        features: pd.DataFrame = self._design_matrix(dataset)
         sample_weight: np.ndarray | None = self._recency_weights(
             self._timestamps_for(dataset, train_index)
         )
@@ -848,7 +882,7 @@ class DirectionModel(BaseModelHead):
         )
 
         self._model = {"gate": gate_estimator, "direction": direction_estimator}
-        self._feature_columns = dataset.feature_columns
+        self._feature_columns = tuple(features.columns)
 
         validation_features: pd.DataFrame = features.iloc[validation_index]
         validation_target: pd.Series = encoded.iloc[validation_index].astype(int)
@@ -868,9 +902,9 @@ class DirectionModel(BaseModelHead):
             )
             full_metrics = ml_metrics.direction_metrics(validation_target, probabilities, LABEL_ORDER)
             importance = {
-                "gate": ml_metrics.feature_importance(gate_estimator, dataset.feature_columns),
+                "gate": ml_metrics.feature_importance(gate_estimator, self._feature_columns),
                 "direction": (
-                    ml_metrics.feature_importance(direction_estimator, dataset.feature_columns)
+                    ml_metrics.feature_importance(direction_estimator, self._feature_columns)
                     if direction_estimator is not None
                     else {"status": "NOT_AVAILABLE", "reason": "not enough trade rows to fit stage 2"}
                 ),
@@ -1361,7 +1395,9 @@ class DirectionModel(BaseModelHead):
         if encoded_full.isna().any():
             return {"status": "NOT_AVAILABLE", "reason": "direction labels contain unknown classes"}
 
-        features: pd.DataFrame = dataset.features.iloc[in_sample_positions].reset_index(drop=True)
+        features: pd.DataFrame = self._design_matrix(dataset).iloc[in_sample_positions].reset_index(
+            drop=True
+        )
         encoded: pd.Series = encoded_full.iloc[in_sample_positions].reset_index(drop=True)
         timestamps: np.ndarray = all_timestamps[in_sample_positions]
         embargo_ms: int = boundaries.embargo_ms
@@ -1481,6 +1517,7 @@ class EntryModel(BaseModelHead):
     """
 
     name = "entry_model"
+    feature_set = "entry"
 
     def train(self, dataset: ProcessedDataset) -> dict[str, Any]:
         """Fit the binary entry-quality classifier."""
@@ -1493,7 +1530,7 @@ class EntryModel(BaseModelHead):
 
         split: ChronologicalSplit = self._chronological_split(dataset)
         train_index, validation_index = split.train_index, split.validation_index
-        features: pd.DataFrame = dataset.features
+        features: pd.DataFrame = self._design_matrix(dataset)
         estimator: Any = self._make_classifier(num_class=2)
         estimator = self._fit_estimator(
             estimator,
@@ -1506,7 +1543,7 @@ class EntryModel(BaseModelHead):
         )
 
         self._model = estimator
-        self._feature_columns = dataset.feature_columns
+        self._feature_columns = tuple(features.columns)
 
         full_metrics: dict[str, Any] = {}
         threshold_sweep: list[dict[str, Any]] = []
@@ -1529,7 +1566,7 @@ class EntryModel(BaseModelHead):
             # true positive only costs a smaller position count).
             cutoff = self._select_recommended_threshold(threshold_sweep, configured_floor)
             full_metrics = ml_metrics.entry_metrics(validation_target, probabilities, cutoff)
-            importance = ml_metrics.feature_importance(estimator, dataset.feature_columns)
+            importance = ml_metrics.feature_importance(estimator, self._feature_columns)
             calib_x, calib_y, eval_x, eval_y = _temporal_half_split(
                 validation_features, validation_target
             )
@@ -1643,9 +1680,12 @@ class EntryModel(BaseModelHead):
         backfilled for training - see the commit that removed them). This
         fallback - only ever exercised when no trained booster is loaded -
         is redesigned around two features that still exist:
-        ``taker_buy_sell_ratio`` (a log taker buy/sell volume ratio - a
-        genuine, if Binance-retention-limited, order-flow-alignment proxy)
-        replaces the order-book imbalance term, and ``atr_rank`` (realized
+        ``order_flow_imbalance_5m`` (aggressive buy/sell imbalance measured
+        directly from that bar's own aggTrades, already normalised to
+        ``[-1, +1]``) replaces the order-book imbalance term - it is a closer
+        substitute than the ``taker_buy_sell_ratio`` proxy it supersedes,
+        being both real order flow and available for the full history rather
+        than Binance's ~30-day window - and ``atr_rank`` (realized
         volatility percentile) replaces the spread-rank term as the closest
         available proxy for "conditions are not adverse" absent any real
         spread metric. Neither substitute is a measured equivalent of the
@@ -1654,7 +1694,7 @@ class EntryModel(BaseModelHead):
         trained model's decision path.
         """
         row: pd.Series = features.iloc[0]
-        order_flow: float = clamp(float(row.get("taker_buy_sell_ratio", 0.0) or 0.0), -1.0, 1.0)
+        order_flow: float = clamp(float(row.get("order_flow_imbalance_5m", 0.0) or 0.0), -1.0, 1.0)
         trending: float = float(row.get("fdi_trending", 0.0) or 0.0)
         volatility_rank: float = float(row.get("atr_rank", 0.5) or 0.5)
 
@@ -1687,6 +1727,7 @@ class ExitModel(BaseModelHead):
     """
 
     name = "exit_model"
+    feature_set = "exit"
 
     _TARGETS: Final[tuple[str, ...]] = ("target_tp_pct", "target_sl_pct", "target_trailing_pct")
 
@@ -1705,7 +1746,7 @@ class ExitModel(BaseModelHead):
                 "not enough directional rows to fit the exit model", rows=int(usable.sum())
             )
 
-        features: pd.DataFrame = dataset.features[usable].reset_index(drop=True)
+        features: pd.DataFrame = self._design_matrix(dataset)[usable].reset_index(drop=True)
         targets: pd.DataFrame = dataset.exit_targets[usable].reset_index(drop=True)
         metadata_usable: pd.DataFrame = dataset.metadata[usable].reset_index(drop=True)
 
@@ -1759,10 +1800,10 @@ class ExitModel(BaseModelHead):
                     target_metrics.get("mae", float("inf")) < baseline_metrics.get("mae", float("inf"))
                 )
                 full_metrics[column] = target_metrics
-                importance[column] = ml_metrics.feature_importance(estimator, dataset.feature_columns)
+                importance[column] = ml_metrics.feature_importance(estimator, self._feature_columns)
 
         self._model = estimators
-        self._feature_columns = dataset.feature_columns
+        self._feature_columns = tuple(features.columns)
         self._metadata = {
             "trained_at": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
             "git_commit": git_commit_hash(),
@@ -1902,6 +1943,7 @@ class RiskModel(BaseModelHead):
     """
 
     name = "risk_model"
+    feature_set = "risk"
 
     def train(self, dataset: ProcessedDataset) -> dict[str, Any]:
         """Fit the opportunity-score regressor.
@@ -1933,7 +1975,7 @@ class RiskModel(BaseModelHead):
                 "not enough directional rows to fit the risk model", rows=int(usable.sum())
             )
 
-        features: pd.DataFrame = dataset.features[usable].reset_index(drop=True)
+        features: pd.DataFrame = self._design_matrix(dataset)[usable].reset_index(drop=True)
         target: pd.Series = dataset.risk_target[usable].astype(float).reset_index(drop=True)
         metadata_usable: pd.DataFrame = dataset.metadata[usable].reset_index(drop=True)
 
@@ -1972,7 +2014,7 @@ class RiskModel(BaseModelHead):
         )
 
         self._model = estimator
-        self._feature_columns = dataset.feature_columns
+        self._feature_columns = tuple(features.columns)
 
         full_metrics: dict[str, Any] = {}
         importance: dict[str, Any] = {"status": "NOT_AVAILABLE", "reason": "no validation rows"}
@@ -1981,7 +2023,7 @@ class RiskModel(BaseModelHead):
             full_metrics = ml_metrics.regression_metrics(
                 target.iloc[validation_index].to_numpy(), predictions
             )
-            importance = ml_metrics.feature_importance(estimator, dataset.feature_columns)
+            importance = ml_metrics.feature_importance(estimator, self._feature_columns)
 
         self._metadata = {
             "trained_at": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),

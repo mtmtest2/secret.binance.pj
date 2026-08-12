@@ -103,10 +103,7 @@ FEATURE_GROUPS: Final[dict[str, str]] = {
     "funding_rate": "Derivatives",
     "funding_rate_delta": "Derivatives",
     "funding_rate_rank": "Derivatives",
-    "open_interest_change": "Derivatives",
     "open_interest_rank": "Derivatives",
-    "long_short_ratio": "Derivatives",
-    "taker_buy_sell_ratio": "Derivatives",
     "hour_sin": "Time/Seasonality",
     "hour_cos": "Time/Seasonality",
     "dow_sin": "Time/Seasonality",
@@ -274,18 +271,19 @@ async def _qc_telemetry(database: DatabaseHandler) -> dict[str, Any]:
 #: parked at this value for nearly every row is a strong signal that source
 #: is not actually being collected for this run, not that the market was
 #: genuinely neutral on every single bar.
-#: ob_imbalance, ob_spread_bps and liquidation_imbalance removed - they no
-#: longer exist as features (see FEATURE_COLUMNS). funding_rate,
-#: open_interest_change, long_short_ratio and taker_buy_sell_ratio remain:
-#: all four have a real, working Binance history endpoint - funding_rate
-#: full-history, the other three Binance-side ~30-day-retention-limited but
-#: genuinely real where present - so it is still meaningful to measure what
-#: fraction of rows carry live data versus this neutral default.
+#: ob_imbalance, ob_spread_bps and liquidation_imbalance were removed for
+#: having no historical endpoint at all; open_interest_change,
+#: long_short_ratio and taker_buy_sell_ratio followed them for having only
+#: ~30 days of Binance-side retention against a multi-month training window
+#: (see FEATURE_COLUMNS). funding_rate remains - it has full history since
+#: contract inception - and the aggTrades-derived order-flow block joins it:
+#: those buckets are exact-key joined per candle, so a bar with no recorded
+#: aggressive flow is genuinely flat rather than merely unobserved, and the
+#: coverage measurement below is what distinguishes the two.
 _NEUTRAL_MICROSTRUCTURE_DEFAULTS: Final[dict[str, float]] = {
     "funding_rate": 0.0,
-    "open_interest_change": 0.0,
-    "long_short_ratio": 0.0,  # log(1.0)
-    "taker_buy_sell_ratio": 0.0,  # log(1.0)
+    "order_flow_imbalance_5m": 0.0,
+    "volume_delta_5m": 0.0,
 }
 
 

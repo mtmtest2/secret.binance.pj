@@ -186,16 +186,16 @@ def test_entry_select_recommended_threshold_falls_back_when_nothing_qualifies() 
 
 
 def test_microstructure_coverage_flags_unpopulated_features() -> None:
-    # long_short_ratio stands in for "genuinely populated" here (ob_imbalance
-    # was removed from FEATURE_COLUMNS entirely - Binance has no historical
-    # order-book depth endpoint, so it could never be backfilled for
-    # training; see the commit that removed it). This test only exercises
-    # the coverage-flagging mechanism, not real-world population rates, so
-    # any surviving feature name works equally well as the "populated" example.
+    # order_flow_imbalance_5m stands in for "genuinely populated" here. The
+    # order-book and ~30-day-retention derivatives features that earlier
+    # versions of this test used were removed from FEATURE_COLUMNS entirely
+    # (see test_feature_removal_and_entry_heuristic.py). This test exercises
+    # the coverage-flagging mechanism, not real-world population rates, so any
+    # tracked feature works equally well as the "populated" example.
     n = 500
     features = pd.DataFrame(0.0, index=range(n), columns=list(FEATURE_COLUMNS))
-    # long_short_ratio genuinely populated; funding_rate left at its neutral default.
-    features["long_short_ratio"] = np.random.default_rng(1).uniform(-0.5, 0.5, size=n)
+    # Order flow genuinely populated; funding_rate left at its neutral default.
+    features["order_flow_imbalance_5m"] = np.random.default_rng(1).uniform(-0.5, 0.5, size=n)
 
     dataset = ProcessedDataset(
         features=features,
@@ -212,7 +212,7 @@ def test_microstructure_coverage_flags_unpopulated_features() -> None:
 
     result = diagnostics._microstructure_coverage(dataset)
     assert result["status"] == "AVAILABLE"
-    assert result["features"]["long_short_ratio"]["likely_populated"] is True
+    assert result["features"]["order_flow_imbalance_5m"]["likely_populated"] is True
     assert result["features"]["funding_rate"]["likely_populated"] is False
 
 

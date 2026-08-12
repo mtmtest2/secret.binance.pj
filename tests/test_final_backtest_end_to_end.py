@@ -80,6 +80,11 @@ class FakeDatabase:
             return self._ohlcv
         return self._ohlcv.iloc[-limit:]
 
+    async def load_agg_trade_flow_frame(
+        self, symbol: str, limit: int | None = None
+    ) -> pd.DataFrame:
+        return pd.DataFrame()
+
     async def load_futures_metrics_frame(self, symbol: str, limit: int = 1_000) -> pd.DataFrame:
         return pd.DataFrame()
 

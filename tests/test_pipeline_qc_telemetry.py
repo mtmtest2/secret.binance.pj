@@ -56,6 +56,11 @@ class FakeFetcher:
     async def fetch_ohlcv(self, symbol: str) -> list[OHLCVCandle]:
         return self.good_series if symbol == GOOD_SYMBOL else self.bad_series
 
+    async def fetch_agg_trade_flow(self, symbol: str, start_ms: int, end_ms: int) -> list[object]:
+        # Order flow is additive to this test's subject (QC telemetry); an
+        # empty result exercises the "nothing to write" path without noise.
+        return []
+
     async def fetch_ohlcv_range(self, symbol: str, start_ms: int, end_ms: int) -> list[OHLCVCandle]:
         # The gap is permanently unfetchable - the exchange genuinely has nothing there.
         return [
@@ -87,6 +92,13 @@ class FakeDatabase:
 
     async def upsert_futures_metrics(self, metrics: FuturesMetrics) -> None:  # pragma: no cover
         raise AssertionError("futures metrics upsert should not be called in this test")
+
+    async def upsert_agg_trade_flow(self, buckets: list[Any]) -> int:
+        # The live cycle always refreshes the trailing closed order-flow
+        # buckets; with the fake fetcher returning none, this is a no-op that
+        # simply must not raise.
+        self.agg_flow_writes = getattr(self, "agg_flow_writes", 0) + len(buckets)
+        return len(buckets)
 
     async def get_state(self, key: str) -> dict[str, Any] | None:
         return self._state.get(key)

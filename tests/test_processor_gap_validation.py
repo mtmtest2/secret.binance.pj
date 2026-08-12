@@ -47,6 +47,11 @@ class FakeDatabase:
     async def load_futures_metrics_frame(self, symbol: str, limit: int = 1_000) -> pd.DataFrame:
         return pd.DataFrame()
 
+    async def load_agg_trade_flow_frame(
+        self, symbol: str, limit: int | None = None
+    ) -> pd.DataFrame:
+        return pd.DataFrame()
+
 
 # ---------------------------------------------------------------------------
 # QCValidator.validate_stored_frame - pure structural checks
@@ -113,7 +118,7 @@ async def test_load_symbol_inputs_trims_to_clean_trailing_run_on_gap() -> None:
     processor = DatasetProcessor(settings, FakeDatabase(gapped))
     processor._load_order_book_frame = _empty_book_frame  # avoid touching a real DB
 
-    ohlcv, futures, book = await processor._load_symbol_inputs("BTC/USDT:USDT", depth=50)
+    ohlcv, futures, book, flow = await processor._load_symbol_inputs("BTC/USDT:USDT", depth=50)
 
     # The pre-gap segment (candles 0..19) is dropped; only the clean trailing
     # run after the gap (candles 30..49) survives - not an outright rejection.
@@ -141,7 +146,7 @@ async def test_load_symbol_inputs_accepts_clean_storage() -> None:
     processor = DatasetProcessor(settings, FakeDatabase(clean_frame(50)))
     processor._load_order_book_frame = _empty_book_frame  # avoid touching a real DB
 
-    ohlcv, futures, book = await processor._load_symbol_inputs("BTC/USDT:USDT", depth=50)
+    ohlcv, futures, book, flow = await processor._load_symbol_inputs("BTC/USDT:USDT", depth=50)
     assert len(ohlcv) == 50
     assert futures is None
     assert book is None
