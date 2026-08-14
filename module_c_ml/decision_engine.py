@@ -160,11 +160,21 @@ class DecisionEngine:
         # --- R1b: given a trade, which way, and how sure? --------------------
         long_given_trade: float = direction.direction_given_trade_probability
         action: TradeAction = TradeAction.LONG if long_given_trade >= 0.5 else TradeAction.SHORT
-        directional_confidence: float = max(long_given_trade, 1.0 - long_given_trade)
+        directional_confidence: float = direction.directional_confidence
+        # Both numbers are recorded, always.  R1B gates on the conditional one
+        # (correctly - the two stages are meant to gate independently), but a
+        # conditional confidence read as if it were a win probability is how an
+        # "88% signal" ends up looking like a broken model when it closes at its
+        # stop: 88% conditional on a 55% gate is a 48% trade.
         self._record(
             checks, Rule.DIRECTION_CONFIDENCE,
             directional_confidence >= self._config.min_direction_given_trade_confidence,
-            f"confidence={directional_confidence:.4f} threshold={self._config.min_direction_given_trade_confidence:.4f}",
+            (
+                f"confidence={directional_confidence:.4f} "
+                f"threshold={self._config.min_direction_given_trade_confidence:.4f} "
+                f"gate={direction.trade_probability:.4f} "
+                f"joint_success_probability={direction.joint_success_probability:.4f}"
+            ),
         )
         if directional_confidence < self._config.min_direction_given_trade_confidence:
             return self._reject(
@@ -217,11 +227,27 @@ class DecisionEngine:
 
         # --- R5: exit geometry ----------------------------------------------
         reward_risk: float = exit_params.reward_risk_ratio
+        # Telemetry, not a gate: how the stop we are about to place compares to
+        # the stop the Direction model's probability was priced against
+        # (`labels.sl_atr_multiple` x ATR).  A ratio below 1.0 means the trade
+        # is a tighter bet than the one the model was asked about, so its
+        # probability overstates the odds.  `ExitModel._assemble` enforces a
+        # floor of 1.0, so this should never print below it - recorded so a
+        # future change to the exit rails cannot silently reintroduce the
+        # mismatch without it showing up in the audit log.
+        atr_pct: float = float(inference.feature_snapshot.get("atr_pct", 0.0) or 0.0)
+        labelled_stop: float = atr_pct * self._settings.labels.sl_atr_multiple
+        stop_ratio: float = (
+            exit_params.stop_loss_pct / labelled_stop if labelled_stop > 0.0 else float("nan")
+        )
         self._record(
             checks,
             Rule.REWARD_RISK,
             reward_risk >= self._config.min_reward_risk_ratio,
-            f"reward_risk={reward_risk:.3f} floor={self._config.min_reward_risk_ratio:.3f}",
+            (
+                f"reward_risk={reward_risk:.3f} floor={self._config.min_reward_risk_ratio:.3f} "
+                f"stop_vs_labelled_atr={stop_ratio:.3f}"
+            ),
         )
         if reward_risk < self._config.min_reward_risk_ratio:
             return self._reject(

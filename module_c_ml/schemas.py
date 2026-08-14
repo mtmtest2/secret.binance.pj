@@ -130,6 +130,45 @@ class DirectionPrediction(BaseModel):
         """Edge of the winning direction over the opposing one."""
         return abs(self.long_probability - self.short_probability)
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def directional_confidence(self) -> float:
+        """``max(p, 1-p)`` of the long-vs-short stage - a **conditional** number.
+
+        This is what ``Rule.DIRECTION_CONFIDENCE`` (R1B) gates on, and it reads
+        on a 0.5-1.0 scale.  It answers "*given* that this bar is worth trading
+        at all, how sure are we of the side?" - it is **not** the probability
+        that the trade wins.  See :attr:`joint_success_probability`.
+        """
+        return max(
+            self.direction_given_trade_probability,
+            1.0 - self.direction_given_trade_probability,
+        )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def joint_success_probability(self) -> float:
+        """Unconditional probability that the chosen side reaches take-profit.
+
+        The number an operator actually wants when they ask "how likely is this
+        trade to work": ``P(worth trading) x P(this side | worth trading)``.
+
+        The two stages gate independently (see the class docstring), which is
+        the right design for *deciding* - but it means the headline confidence
+        surfaced by R1B is conditional.  At the default thresholds a signal can
+        clear R1B at 88% while its unconditional probability is
+        ``0.55 x 0.88 = 48%``: the gate was only just sure the bar was tradeable
+        at all.  Reporting only the conditional number makes a coin-flip look
+        like a near-certainty, so this is carried alongside it everywhere the
+        confidence is displayed or logged.
+
+        Note this remains a probability about the *labelled* barrier pair
+        (``tp_atr_multiple`` / ``sl_atr_multiple`` within ``max_holding_bars``);
+        it only describes the trade actually placed as long as the exit geometry
+        respects that stop distance - which ``ExitModel._assemble`` now enforces.
+        """
+        return self.trade_probability * self.directional_confidence
+
 
 class EntryPrediction(BaseModel):
     """Model 2 output: is *this* candle close the right moment to act?"""

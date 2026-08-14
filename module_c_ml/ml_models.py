@@ -95,9 +95,11 @@ _MIN_TP_PCT: Final[float] = 0.0020
 _MAX_TP_PCT: Final[float] = 0.1500
 _MIN_SL_PCT: Final[float] = 0.0015
 _MAX_SL_PCT: Final[float] = 0.0800
-#: A stop tighter than this fraction of ATR is inside 5m noise and will be
-#: taken out by ordinary chop regardless of whether the direction call was right.
-_MIN_SL_ATR_FRACTION: Final[float] = 0.5
+#: The stop floor is no longer a constant fraction of ATR.  It is
+#: ``LabelSettings.sl_atr_multiple`` - the same distance the labeler used to
+#: decide what counts as a success - because the Direction model's probability
+#: is a statement about *that* barrier and no other.  See
+#: ``ExitModel._assemble``, which reads it from settings.
 #: Reward/risk beyond this is almost always an artefact of a degenerate stop
 #: prediction rather than a real edge, so the target is trimmed back to it.
 _MAX_REWARD_RISK: Final[float] = 6.0
@@ -1861,8 +1863,8 @@ class ExitModel(BaseModelHead):
         trailing: float = take_profit * 0.5
         return self._assemble(take_profit, stop_loss, trailing, row, ModelSource.HEURISTIC)
 
-    @staticmethod
     def _assemble(
+        self,
         take_profit: float,
         stop_loss: float,
         trailing: float,
@@ -1875,14 +1877,40 @@ class ExitModel(BaseModelHead):
         These rails guarantee a positive, ordered geometry regardless of what the
         model produced:
 
-        * the stop is never tighter than half the current ATR, because a stop
-          inside 5-minute noise gets hit for reasons unrelated to the thesis;
         * the target is never below 1.1x nor above 6x the stop, which trims the
-          degenerate "16:1" geometries a collapsed stop regressor can produce.
+          degenerate "16:1" geometries a collapsed stop regressor can produce;
+        * **the stop is never tighter than the barrier the Direction model was
+          trained against** - see below.
+
+        Why the stop floor is ``labels.sl_atr_multiple``, not half of it
+        ---------------------------------------------------------------
+        The Direction model does not predict "price will go up".  It predicts
+        the labeler's question: *will price reach ``tp_atr_multiple`` x ATR
+        before it reaches ``sl_atr_multiple`` x ATR against us, within
+        ``max_holding_bars``?*  Its probability is only a statement about that
+        specific barrier pair.
+
+        This floor used to be ``0.5 * atr_pct`` - half the stop the label
+        assumed - which quietly turned every signal into a bet the model had
+        never been asked about.  The labeler's own risk tiering makes the cost
+        explicit: it classifies a winner with a maximum adverse excursion of
+        0.35-0.60 ATR as MEDIUM risk and 0.60-0.85 ATR as HIGH, and
+        ``DecisionSettings.accepted_risk_tiers`` accepts both by default.  Every
+        one of those trades is a *labelled winner whose recorded path heat
+        exceeds a 0.5 ATR stop* - so a confident, correct directional call would
+        be stopped out by construction, at a rate no amount of model accuracy
+        could fix.  That is the mechanism behind a high-confidence signal
+        closing at its stop loss.
+
+        Widening the floor to the labelled stop distance costs nothing in
+        expectancy (the take-profit rails scale with the stop, preserving
+        reward/risk) and makes the model's probability mean what it says.
         """
         atr_pct: float = float(row.get("atr_pct", 0.0) or 0.0)
+        if not np.isfinite(atr_pct):
+            atr_pct = 0.0
         if atr_pct > 0.0:
-            stop_loss = max(stop_loss, atr_pct * _MIN_SL_ATR_FRACTION)
+            stop_loss = max(stop_loss, atr_pct * self._settings.labels.sl_atr_multiple)
         stop_loss = clamp(stop_loss, _MIN_SL_PCT, _MAX_SL_PCT)
 
         take_profit = clamp(take_profit, _MIN_TP_PCT, _MAX_TP_PCT)

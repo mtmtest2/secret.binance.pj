@@ -141,6 +141,48 @@ def _get_path(report: dict[str, Any], dotted_path: str) -> Any:
     return None
 
 
+def _split_coverage(
+    dataset: ProcessedDataset,
+    train_index: Any,
+    validation_index: Any,
+    test_index: Any,
+) -> dict[str, Any]:
+    """Rows per split against the theoretical capacity of its own time span.
+
+    The single number that would have made the previous run's biggest problem
+    obvious at a glance: train sat at 26.9% of capacity while validation and
+    test were at 96.9% and 99.8%, so the model was fitted on a fundamentally
+    different population from the one it was scored against.  A raw row count
+    cannot show that - only the ratio against the window's own capacity can.
+    """
+    if "timestamp" not in dataset.metadata.columns:
+        return {"status": "NOT_AVAILABLE", "reason": "dataset carries no timestamps"}
+
+    timestamps = dataset.metadata["timestamp"].to_numpy(dtype="int64")
+    symbol_count: int = max(1, len(set(dataset.symbols)) or 1)
+    bar_ms: int = 300_000
+    report: dict[str, Any] = {}
+
+    for name, index in (
+        ("train", train_index),
+        ("validation", validation_index),
+        ("test", test_index),
+    ):
+        if len(index) == 0:
+            report[name] = {"rows": 0, "coverage_pct": 0.0}
+            continue
+        block = timestamps[index]
+        span_ms: int = int(block.max() - block.min())
+        capacity: int = max(1, (span_ms // bar_ms) * symbol_count)
+        report[name] = {
+            "rows": int(len(index)),
+            "span_days": round(span_ms / 86_400_000, 1),
+            "capacity_rows": int(capacity),
+            "coverage_pct": round(min(1.0, len(index) / capacity), 4),
+        }
+    return report
+
+
 def _feature_statistics(dataset: ProcessedDataset) -> dict[str, Any]:
     """Per-feature descriptive statistics computed directly from the training frame."""
     features: pd.DataFrame = dataset.features
@@ -592,6 +634,14 @@ async def build_report(
             "feature_count": len(dataset.feature_columns),
             "feature_names": list(dataset.feature_columns),
             "per_symbol_rows": {str(k): int(v) for k, v in per_symbol_rows.items()},
+            # Rows are no longer destroyed for a NaN in a single feature, so
+            # sparsity no longer announces itself as a collapsed row count.
+            # These two blocks are the replacement signal: which columns are
+            # actually empty, and whether the emptiness is uniform or
+            # concentrated in particular symbols and periods.
+            "null_counts_by_feature": dict(dataset.null_counts_by_feature),
+            "null_rate_by_symbol_month": dict(dataset.null_rate_by_symbol_month),
+            "split_coverage_pct": _split_coverage(dataset, train_index, validation_index, test_index),
         },
         "data_quality": await _qc_telemetry(database),
         "features": {
