@@ -27,7 +27,11 @@ from core.utils import longest_clean_trailing_run
 from module_a_data.db_handler import DatabaseHandler
 from module_a_data.models import QCIssue, QCSeverity
 from module_a_data.qc_validator import QCValidator
-from module_b_features.features import FEATURE_COLUMNS, FeatureService
+from module_b_features.features import (
+    FEATURE_COLUMNS,
+    REQUIRED_FEATURE_COLUMNS,
+    FeatureService,
+)
 from module_b_features.labeler import LABEL_ORDER, TradeLabeler
 
 _LOGGER = get_logger(__name__)
@@ -208,6 +212,16 @@ class ProcessedDataset:
     rejected_invalid_label_rows: int = field(default=0)
     dropped_missing_or_inf_rows: int = field(default=0)
     duplicate_feature_rows: int = field(default=0)
+    #: Per-feature null counts *after* cleaning.  Rows are no longer destroyed
+    #: for a NaN in a single feature column (the boosters split on NaN
+    #: natively), so this is the only remaining visibility into which features
+    #: are actually sparse - and it is what turns "the model underperforms"
+    #: into "this one column is 70% empty before 2025".
+    null_counts_by_feature: dict[str, int] = field(default_factory=dict)
+    #: ``{symbol: {"YYYY-MM": null_rate}}`` for the sparsest features, so a
+    #: coverage collapse that is concentrated in one symbol or one period is
+    #: visible instead of being averaged away.
+    null_rate_by_symbol_month: dict[str, dict[str, float]] = field(default_factory=dict)
 
     def __len__(self) -> int:
         return len(self.features)
@@ -415,17 +429,27 @@ class DatasetProcessor:
         feature_columns: list[str] = list(FEATURE_COLUMNS)
         usable = usable.replace([np.inf, -np.inf], np.nan)
 
+        # Only the *targets* justify destroying a row.  A NaN in any one of the
+        # ~56 feature columns used to take the whole sample with it, and because
+        # the sparsest features (flat-market volatility ratios, GARCH warm-up,
+        # archive coverage) cluster in low-liquidity symbols and quiet periods,
+        # that removed 73% of the intended training window while leaving
+        # validation and test nearly intact - a systematic sample-selection bias
+        # logged as harmless warm-up trim.  LightGBM and XGBoost both route NaN
+        # down a learned default branch, so a sparse feature costs only its own
+        # information, not the entire observation.
         before: int = len(usable)
-        usable = usable.dropna(subset=feature_columns + ["label", "target_risk_score"])
+        usable = usable.dropna(subset=["label", "target_risk_score"])
         dropped: int = before - len(usable)
         if dropped:
-            _LOGGER.info("Dropped %d rows with NaN features/labels (rolling-window warm-up)", dropped)
+            _LOGGER.info("Dropped %d rows with an unusable label/target", dropped)
 
         if usable.empty:
             return self._empty_dataset()
 
         usable = usable.reset_index(drop=True)
         duplicate_feature_rows: int = int(usable.duplicated(subset=feature_columns).sum())
+        null_counts, null_rates = self._null_diagnostics(usable, feature_columns)
 
         metadata_columns: list[str] = [
             column for column in ("symbol", *_META_COLUMNS) if column in usable.columns
@@ -446,7 +470,48 @@ class DatasetProcessor:
             rejected_invalid_label_rows=rejected_invalid_label_rows,
             dropped_missing_or_inf_rows=dropped,
             duplicate_feature_rows=duplicate_feature_rows,
+            null_counts_by_feature=null_counts,
+            null_rate_by_symbol_month=null_rates,
         )
+
+    @staticmethod
+    def _null_diagnostics(
+        usable: pd.DataFrame,
+        feature_columns: list[str],
+        top_n: int = 5,
+    ) -> tuple[dict[str, int], dict[str, dict[str, float]]]:
+        """Per-feature null counts, plus a symbol x month map for the worst ones.
+
+        Rows survive NaN features now, so without this the sparsity that used to
+        announce itself as a catastrophic row drop would instead be completely
+        silent.  The per-symbol/per-month breakdown is what distinguishes
+        "this feature is uniformly 3% sparse" from "this feature is 90% empty
+        for eight symbols before March", which are very different problems.
+        """
+        null_counts: dict[str, int] = {
+            column: int(usable[column].isna().sum())
+            for column in feature_columns
+            if column in usable.columns
+        }
+
+        sparsest: list[str] = [
+            column
+            for column, count in sorted(null_counts.items(), key=lambda item: -item[1])
+            if count > 0
+        ][:top_n]
+        if not sparsest or "symbol" not in usable.columns or "timestamp" not in usable.columns:
+            return null_counts, {}
+
+        month: pd.Series = pd.to_datetime(
+            usable["timestamp"], unit="ms", utc=True
+        ).dt.strftime("%Y-%m")
+        any_null: pd.Series = usable[sparsest].isna().any(axis=1)
+        grouped: pd.Series = any_null.groupby([usable["symbol"], month]).mean()
+
+        null_rates: dict[str, dict[str, float]] = {}
+        for (symbol, period), rate in grouped.items():
+            null_rates.setdefault(str(symbol), {})[str(period)] = round(float(rate), 4)
+        return null_counts, null_rates
 
     @staticmethod
     def _empty_dataset() -> ProcessedDataset:
@@ -492,8 +557,13 @@ class DatasetProcessor:
             return None
 
         feature_columns: list[str] = list(FEATURE_COLUMNS)
+        # Only the *required* block gates tradeability.  The optional
+        # micro-structure columns are allowed through as NaN so a momentary gap
+        # in book coverage does not silently stop the system from trading -
+        # which is also exactly how those columns were encoded during training,
+        # so the booster sees the same thing either way.
         candidates: pd.DataFrame = featured.replace([np.inf, -np.inf], np.nan).dropna(
-            subset=feature_columns
+            subset=list(REQUIRED_FEATURE_COLUMNS)
         )
         if candidates.empty:
             _LOGGER.warning("All feature rows for %s are still warming up", symbol)
@@ -668,32 +738,15 @@ class DatasetProcessor:
         return trimmed
 
     async def _load_order_book_frame(self, symbol: str, depth: int) -> pd.DataFrame:
-        """Load recent order-book snapshots into a timestamp-keyed frame."""
-        from sqlalchemy import desc, select  # local import keeps the ORM out of the hot path
+        """Load the 5m micro-structure buckets backing the order-book features.
 
-        from module_a_data.db_models import OrderBookRow
-
-        query = (
-            select(
-                OrderBookRow.timestamp,
-                OrderBookRow.spread_bps,
-                OrderBookRow.imbalance,
-                OrderBookRow.microprice,
-            )
-            .where(OrderBookRow.symbol == symbol)
-            .order_by(desc(OrderBookRow.timestamp))
-            .limit(depth)
-        )
-        factory = self._db._factory()  # noqa: SLF001 - intentional internal reuse
-        async with factory() as session:
-            result = await session.execute(query)
-            rows = result.all()
-
-        columns: list[str] = ["timestamp", "spread_bps", "imbalance", "microprice"]
-        if not rows:
-            return pd.DataFrame(columns=columns)
-        frame: pd.DataFrame = pd.DataFrame(rows, columns=columns)
-        return frame.sort_values("timestamp").reset_index(drop=True)
+        Reads ``market_microstructure`` - the archive-backfilled, candle-grid
+        aligned table - rather than ``order_book_snapshots``, which holds
+        irregular live snapshots taken whenever a cycle happened to fire.  The
+        feature layer joins these on the exact bucket key, so they must sit on
+        the candle grid; an irregular snapshot stream cannot.
+        """
+        return await self._db.load_microstructure_frame(symbol, limit=depth)
 
 
 #: Re-exported so consumers do not need to import the labeler directly.

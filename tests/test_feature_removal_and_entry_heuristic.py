@@ -1,12 +1,19 @@
-"""Task 6 - remove the 5 permanently-unobtainable microstructure features.
+"""Micro-structure feature contract and the Entry heuristic fallback.
+
+History: task 6 removed five order-book/liquidation columns on the premise that
+Binance "exposes no historical endpoint for either, ever".  That is true of the
+REST API and false of Binance's own bulk archive - ``bookTicker`` and
+``liquidationSnapshot`` are published as daily ZIPs for the full life of each
+contract - so the five columns are back, sourced from
+``module_a_data.archive_loader``.
 
 Covers:
-* FEATURE_COLUMNS no longer contains ob_imbalance, ob_imbalance_delta,
-  ob_spread_bps, ob_spread_rank or liquidation_imbalance, and still contains
-  the 7 real-but-retention-limited derivatives/microstructure columns.
-* EntryModel._heuristic's redesigned fallback (taker_buy_sell_ratio +
-  atr_rank substituting for the removed ob_imbalance/ob_spread_rank) runs
-  end-to-end and responds to its new inputs in the expected direction.
+* FEATURE_COLUMNS carries the five archive-backed micro-structure columns
+  again, alongside the 7 derivatives/positioning columns that were retained.
+* The five are declared *optional*, so a bar the archive did not cover is
+  still tradeable rather than silently halting the system.
+* EntryModel._heuristic runs end-to-end and responds to its inputs in the
+  expected direction.
 """
 
 from __future__ import annotations
@@ -14,11 +21,15 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from module_b_features.features import FEATURE_COLUMNS
+from module_b_features.features import (
+    FEATURE_COLUMNS,
+    OPTIONAL_FEATURE_COLUMNS,
+    REQUIRED_FEATURE_COLUMNS,
+)
 from module_c_ml.ml_models import EntryModel
 from module_c_ml.schemas import TradeAction
 
-_REMOVED_FEATURES = (
+_ARCHIVE_BACKED_FEATURES = (
     "ob_imbalance",
     "ob_imbalance_delta",
     "ob_spread_bps",
@@ -36,9 +47,27 @@ _RETAINED_DERIVATIVES_FEATURES = (
 )
 
 
-def test_feature_columns_drop_permanently_unobtainable_features() -> None:
-    for name in _REMOVED_FEATURES:
-        assert name not in FEATURE_COLUMNS, f"{name} should have been removed from FEATURE_COLUMNS"
+def test_feature_columns_carry_the_archive_backed_microstructure_block() -> None:
+    for name in _ARCHIVE_BACKED_FEATURES:
+        assert name in FEATURE_COLUMNS, f"{name} should be restored to FEATURE_COLUMNS"
+    assert "microstructure_is_missing" in FEATURE_COLUMNS
+
+
+def test_archive_backed_features_are_optional_not_required() -> None:
+    """A gap in book coverage must not make the bar untradeable.
+
+    These columns gate nothing: they are NaN wherever the archive has no
+    bucket, and both training and inference are expected to carry that NaN
+    straight into the booster rather than dropping the row.
+    """
+    for name in _ARCHIVE_BACKED_FEATURES:
+        assert name in OPTIONAL_FEATURE_COLUMNS
+        assert name not in REQUIRED_FEATURE_COLUMNS
+
+
+def test_required_and_optional_columns_partition_the_contract() -> None:
+    assert set(REQUIRED_FEATURE_COLUMNS) | set(OPTIONAL_FEATURE_COLUMNS) == set(FEATURE_COLUMNS)
+    assert not set(REQUIRED_FEATURE_COLUMNS) & set(OPTIONAL_FEATURE_COLUMNS)
 
 
 def test_feature_columns_retain_real_but_retention_limited_features() -> None:

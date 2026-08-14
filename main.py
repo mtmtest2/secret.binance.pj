@@ -374,11 +374,9 @@ class TradingSystem:
         )
 
         # Backfill funding-rate/open-interest/positioning history so the
-        # micro-structure/derivatives features are not stuck at their neutral
-        # default for the whole training window - see
-        # `DataPipeline.backfill_futures_metrics` for why this is a separate
-        # pass from the candle backfill above (order book has no historical
-        # endpoint at all; the rest are capped by Binance's own retention).
+        # derivatives features are not stuck at their neutral default for the
+        # whole training window - see `DataPipeline.backfill_futures_metrics`
+        # for why this is a separate pass from the candle backfill above.
         self.progress.advance(0, len(usable), "backfilling derivatives/positioning history")
         futures_written: dict[str, int] = await self.pipeline.backfill_futures_metrics(
             usable, progress=report
@@ -387,6 +385,21 @@ class TradingSystem:
             "Futures-metrics backfill complete: %d row(s) across %d symbol(s)",
             sum(futures_written.values()),
             len(futures_written),
+        )
+
+        # Order-book and liquidation history, from Binance's bulk archive
+        # rather than the REST API - the REST API has no historical endpoint
+        # for either, which is why these five features were previously deleted
+        # as unobtainable. This is the slowest step of the whole setup (one ZIP
+        # per symbol-day), so it is fully cached on disk and resumable.
+        self.progress.advance(0, len(usable), "backfilling order-book/liquidation archive")
+        microstructure: dict[str, Any] = await self.pipeline.backfill_market_microstructure(
+            usable, progress=report
+        )
+        _LOGGER.info(
+            "Micro-structure archive backfill: %s%% coverage across %s symbol-days",
+            round(float(microstructure.get("overall_coverage_pct", 0.0)) * 100.0, 1),
+            microstructure.get("days_requested", 0),
         )
 
     async def _run_final_backtest(
@@ -516,8 +529,10 @@ class TradingSystem:
         # regardless of what `_setup_collect` already did upstream, so that any
         # future call path that reaches `_setup_train` without first going
         # through `_setup_collect` still gets funding_rate/open_interest/
-        # long_short_ratio/taker_buy_sell_ratio history before training reads it.
+        # long_short_ratio/taker_buy_sell_ratio history before training reads it,
+        # and the same for the archive-sourced order-book/liquidation block.
         await self.pipeline.backfill_futures_metrics(symbols)
+        await self.pipeline.backfill_market_microstructure(symbols)
 
         dataset: ProcessedDataset = await self.processor.build_training_dataset(symbols=symbols)
         if dataset.is_empty:
@@ -1271,8 +1286,10 @@ class TradingSystem:
         # `train` is a standalone CLI path - it never runs `_setup_collect`, so
         # without this the funding_rate/open_interest/long_short_ratio/
         # taker_buy_sell_ratio history stays at its neutral default no matter
-        # how many times the model is retrained from this entry point.
+        # how many times the model is retrained from this entry point - and the
+        # archive-sourced order-book/liquidation block stays empty likewise.
         await self.pipeline.backfill_futures_metrics(symbols)
+        await self.pipeline.backfill_market_microstructure(symbols)
         dataset: ProcessedDataset = await self.processor.build_training_dataset(
             symbols=symbols, max_candles_per_symbol=max_candles
         )

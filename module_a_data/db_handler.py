@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 from types import TracebackType
 from typing import Any, Final, Sequence
 
+import numpy as np
 import pandas as pd
 from sqlalchemy import Select, delete, desc, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -43,6 +44,7 @@ from module_a_data.db_models import (
     Base,
     EquityRow,
     FuturesMetricsRow,
+    MicrostructureRow,
     OHLCVRow,
     OrderBookRow,
     SystemStateRow,
@@ -524,6 +526,114 @@ class DatabaseHandler:
             "imbalance": float(row.imbalance),
             "microprice": float(row.microprice),
         }
+
+    async def upsert_microstructure_batch(
+        self,
+        symbol: str,
+        buckets: pd.DataFrame,
+        source: str = "archive",
+    ) -> int:
+        """Bulk-upsert 5m micro-structure buckets for one symbol.
+
+        ``buckets`` must carry a ``timestamp`` column on the 5-minute grid; any
+        of ``bid_qty``/``ask_qty``/``spread_bps``/``liquidation_buy_volume``/
+        ``liquidation_sell_volume`` may be absent or NaN, and NaN is persisted
+        as SQL ``NULL`` rather than 0.0 so "unobserved" survives the round trip.
+        """
+        if buckets.empty or "timestamp" not in buckets.columns:
+            return 0
+
+        value_columns: list[str] = [
+            "bid_qty",
+            "ask_qty",
+            "spread_bps",
+            "liquidation_buy_volume",
+            "liquidation_sell_volume",
+        ]
+        frame: pd.DataFrame = buckets.copy()
+        for column in value_columns:
+            if column not in frame.columns:
+                frame[column] = np.nan
+
+        payload: list[dict[str, Any]] = []
+        for row in frame.itertuples(index=False):
+            record: dict[str, Any] = {
+                "symbol": symbol,
+                "timestamp": int(getattr(row, "timestamp")),
+                "source": source,
+            }
+            for column in value_columns:
+                value = getattr(row, column, None)
+                record[column] = (
+                    None if value is None or pd.isna(value) else float(value)
+                )
+            payload.append(record)
+
+        if not payload:
+            return 0
+        batch_rows: int = _detect_upsert_batch_rows(len(payload[0]))
+
+        try:
+            async with self._write_lock, self._factory()() as session:
+                async with session.begin():
+                    for batch in chunked(payload, batch_rows):
+                        statement = sqlite_insert(MicrostructureRow).values(batch)
+                        statement = statement.on_conflict_do_update(
+                            index_elements=[MicrostructureRow.symbol, MicrostructureRow.timestamp],
+                            set_={
+                                key: statement.excluded[key]
+                                for key in batch[0]
+                                if key not in ("symbol", "timestamp")
+                            },
+                        )
+                        await session.execute(statement)
+        except SQLAlchemyError as error:
+            raise DatabaseError(
+                "failed to upsert micro-structure buckets", symbol=symbol, cause=str(error)
+            ) from error
+        return len(payload)
+
+    async def load_microstructure_frame(self, symbol: str, limit: int = 1_000) -> pd.DataFrame:
+        """Load recent 5m micro-structure buckets as a timestamp-keyed frame."""
+        query: Select[Any] = (
+            select(
+                MicrostructureRow.timestamp,
+                MicrostructureRow.bid_qty,
+                MicrostructureRow.ask_qty,
+                MicrostructureRow.spread_bps,
+                MicrostructureRow.liquidation_buy_volume,
+                MicrostructureRow.liquidation_sell_volume,
+            )
+            .where(MicrostructureRow.symbol == symbol)
+            .order_by(desc(MicrostructureRow.timestamp))
+            .limit(limit)
+        )
+        async with self._factory()() as session:
+            result: Result[Any] = await session.execute(query)
+            rows: list[Any] = result.all()
+
+        columns: list[str] = [
+            "timestamp",
+            "bid_qty",
+            "ask_qty",
+            "spread_bps",
+            "liquidation_buy_volume",
+            "liquidation_sell_volume",
+        ]
+        if not rows:
+            return pd.DataFrame(columns=columns)
+        frame: pd.DataFrame = pd.DataFrame(rows, columns=columns)
+        return frame.sort_values("timestamp").reset_index(drop=True)
+
+    async def earliest_microstructure_timestamp(self, symbol: str) -> int | None:
+        """Oldest stored bucket for ``symbol``, or ``None`` when there is none."""
+        query: Select[Any] = select(func.min(MicrostructureRow.timestamp)).where(
+            MicrostructureRow.symbol == symbol
+        )
+        async with self._factory()() as session:
+            result: Result[Any] = await session.execute(query)
+            value: Any = result.scalar_one_or_none()
+        return int(value) if value is not None else None
 
     async def load_futures_metrics_frame(self, symbol: str, limit: int = 1_000) -> pd.DataFrame:
         """Load recent futures metrics as a timestamp-indexed frame."""

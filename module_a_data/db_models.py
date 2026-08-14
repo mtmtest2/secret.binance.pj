@@ -81,6 +81,47 @@ class OrderBookRow(Base):
     inserted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class MicrostructureRow(Base):
+    """Order-book and liquidation aggregates on the 5-minute candle grid.
+
+    Distinct from :class:`OrderBookRow`, which stores irregular live snapshots
+    taken whenever a cycle happened to fire.  This table is keyed to the candle
+    grid itself and is populated from two sources that must agree on that key:
+
+    * ``data.binance.vision``'s ``bookTicker`` / ``liquidationSnapshot`` daily
+      archives, backfilled across the full training window
+      (``PipelineOrchestrator.backfill_market_microstructure``), and
+    * the live 5-minute cycle, which folds its own snapshot into the current
+      bucket so the series stays continuous past the archive's ~1-day lag.
+
+    A missing row means "not observed" and is carried into the feature layer as
+    ``NaN`` - never as a neutral zero, which is what made the previous
+    incarnation of these features useless.
+    """
+
+    __tablename__ = "market_microstructure"
+    __table_args__ = (
+        UniqueConstraint("symbol", "timestamp", name="uq_micro_symbol_ts"),
+        Index("ix_micro_symbol_ts", "symbol", "timestamp"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(40), nullable=False)
+    #: 5m bucket open time in epoch milliseconds - the candle's own key.
+    timestamp: Mapped[int] = mapped_column(Integer, nullable=False)
+    #: Mean top-of-book sizes across the bucket.  Nullable: a bucket may have
+    #: liquidation coverage without book coverage, or vice versa.
+    bid_qty: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ask_qty: Mapped[float | None] = mapped_column(Float, nullable=True)
+    spread_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    liquidation_buy_volume: Mapped[float | None] = mapped_column(Float, nullable=True)
+    liquidation_sell_volume: Mapped[float | None] = mapped_column(Float, nullable=True)
+    #: ``"archive"`` or ``"live"`` - kept so a coverage audit can tell which
+    #: part of the series came from where without re-deriving it from dates.
+    source: Mapped[str] = mapped_column(String(16), nullable=False, default="archive")
+    inserted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class FuturesMetricsRow(Base):
     """Perpetual-specific state: funding, open interest, positioning, liquidations."""
 

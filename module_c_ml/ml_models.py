@@ -757,8 +757,18 @@ class BaseModelHead(ABC):
         """Reindex incoming features onto the exact training-time column layout.
 
         A booster indexes features positionally, so silently reordered columns
-        would produce confident nonsense.  Missing columns are filled with 0.0
-        and logged - the model contract is enforced here, not hoped for.
+        would produce confident nonsense.  Missing columns are filled with
+        ``NaN`` and logged - the model contract is enforced here, not hoped for.
+
+        ``NaN`` rather than ``0.0`` is deliberate and is a train/serve
+        correctness fix, not a style choice.  Training keeps rows with missing
+        features and lets the booster learn a default branch for them, so a
+        ``0.0`` here would feed the model a *different encoding of the same
+        state* than it was fitted on - and ``0.0`` is a perfectly ordinary
+        value for ``log_return_*``, ``di_spread``, ``ob_imbalance`` and
+        ``funding_rate``, so the model would read "unknown" as "flat" and act
+        on it with full confidence.  Infinities still collapse to ``NaN``
+        because no split threshold can be meaningful against them.
         """
         missing: list[str] = [
             column for column in self._feature_columns if column not in features.columns
@@ -766,8 +776,8 @@ class BaseModelHead(ABC):
         if missing:
             _LOGGER.warning("%s: %d feature(s) missing at inference: %s", self.name, len(missing), missing[:5])
 
-        aligned: pd.DataFrame = features.reindex(columns=list(self._feature_columns), fill_value=0.0)
-        return aligned.astype(np.float64).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        aligned: pd.DataFrame = features.reindex(columns=list(self._feature_columns), fill_value=np.nan)
+        return aligned.astype(np.float64).replace([np.inf, -np.inf], np.nan)
 
     def _require_model(self) -> Any:
         """Return the fitted estimator or raise."""

@@ -126,6 +126,28 @@ class DataSettings(BaseModel):
     #: missing last bar, so a small offset is the operationally correct default.
     cycle_second_offset: int = Field(default=10, ge=0, le=59)
 
+    # --- data.binance.vision bulk archive ---------------------------------
+    #: Where parsed 5m archive aggregates are cached.  The cache holds the
+    #: *reduced* 288-rows-per-day frames, not the raw ZIPs, so a full 27-symbol
+    #: two-year backfill costs tens of MB rather than tens of GB.  Deleting the
+    #: directory only forces a re-download.
+    archive_cache_dir: str = Field(default="data/archive_cache")
+    #: Master switch for archive-sourced micro-structure features.  With this
+    #: off, ob_*/liquidation_imbalance stay NaN and the models simply route
+    #: them down their missing-value branch - the system still trains and
+    #: trades, just without that block.
+    archive_enabled: bool = Field(default=True)
+    #: Concurrent daily-file downloads.  data.binance.vision is a plain CDN and
+    #: is not covered by the exchange's per-IP weight budget, but it does rate
+    #: limit; 4 is comfortably inside it.
+    archive_max_concurrent_downloads: int = Field(default=4, ge=1, le=16)
+    archive_timeout_seconds: float = Field(default=120.0, gt=0.0)
+    archive_max_retries: int = Field(default=3, ge=1, le=10)
+    #: How far back to pull micro-structure history.  Defaults to matching the
+    #: OHLCV window so the block covers the whole training set rather than
+    #: reintroducing the sparse-recent-data problem it exists to solve.
+    archive_backfill_days: int = Field(default=740, ge=1)
+
 
 class UniverseSettings(BaseModel):
     """Screening rules for the tradeable symbol universe.

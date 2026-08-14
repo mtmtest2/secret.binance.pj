@@ -39,7 +39,11 @@ from core.exceptions import InsufficientDataError
 from core.logger import get_logger
 from core.utils import ms_to_datetime
 from module_a_data.db_handler import DatabaseHandler
-from module_b_features.features import FEATURE_COLUMNS, FeatureService
+from module_b_features.features import (
+    FEATURE_COLUMNS,
+    REQUIRED_FEATURE_COLUMNS,
+    FeatureService,
+)
 from module_b_features.processor import InferencePayload
 from module_c_ml.decision_engine import DecisionContext, DecisionEngine
 from module_c_ml.ml_models import MLSubsystem
@@ -210,8 +214,13 @@ class Backtester:
                 _LOGGER.error("Feature build failed for %s: %s", symbol, error)
                 continue
 
+            # Gate on the required block only, matching the live inference path
+            # (DatasetProcessor.build_inference_payload) and the training path.
+            # Dropping on the optional micro-structure columns too would make the
+            # backtest silently skip any symbol whose book archive starts later
+            # than its klines - i.e. exactly the symbols worth checking.
             usable: pd.DataFrame = frame.replace([np.inf, -np.inf], np.nan).dropna(
-                subset=list(FEATURE_COLUMNS)
+                subset=list(REQUIRED_FEATURE_COLUMNS)
             )
             if usable.empty:
                 _LOGGER.warning("Skipping %s: every feature row is still warming up", symbol)

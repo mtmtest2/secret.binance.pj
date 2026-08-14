@@ -12,7 +12,7 @@ interpolated data.  Trading on invented candles is worse than not trading.
 from __future__ import annotations
 
 import asyncio
-from typing import Callable, Final
+from typing import Any, Callable, Final
 
 import pandas as pd
 
@@ -269,13 +269,130 @@ class DataPipeline:
         written_by_symbol: dict[str, int] = dict(results)
         _LOGGER.info(
             "Futures-metrics backfill complete: %d row(s) across %d symbol(s). "
-            "Order-book and liquidation history cannot be backfilled (no exchange "
-            "endpoint for either) and will only accumulate real data from the live "
-            "5-minute cycle going forward.",
+            "Order-book and liquidation history is backfilled separately from the "
+            "data.binance.vision archive - see backfill_market_microstructure.",
             sum(written_by_symbol.values()),
             len(written_by_symbol),
         )
         return written_by_symbol
+
+    async def backfill_market_microstructure(
+        self,
+        symbols: list[str] | None = None,
+        progress: ProgressCallback | None = None,
+        days: int | None = None,
+    ) -> dict[str, Any]:
+        """Backfill order-book and liquidation history from Binance's archive.
+
+        This is what makes ``ob_imbalance``, ``ob_imbalance_delta``,
+        ``ob_spread_bps``, ``ob_spread_rank`` and ``liquidation_imbalance``
+        trainable.  Those five columns were previously removed on the premise
+        that Binance has no historical endpoint for either - true of the REST
+        API, false of ``data.binance.vision``, which publishes ``bookTicker``
+        and ``liquidationSnapshot`` as daily ZIPs for the full life of each
+        contract.
+
+        Runs over the operator's own selected universe, downloads one ZIP per
+        symbol-day, unzips and parses it, reduces it to 288 five-minute buckets
+        keyed on the candle grid, and upserts those into
+        ``market_microstructure``.  Days the archive does not publish are
+        recorded as absent and stay ``NaN`` downstream rather than being
+        zero-filled.
+
+        Args:
+            symbols: Universe to backfill (defaults to the configured/selected one).
+            progress: ``(symbol, completed, total)`` reporter for the panel.
+            days: History depth; defaults to ``DataSettings.archive_backfill_days``.
+
+        Returns:
+            The ``coverage_summary`` block: per-symbol days requested vs
+            downloaded, plus the overall coverage percentage.  A low number here
+            is the first thing to check when the micro-structure block looks
+            empty in the diagnostic report.
+        """
+        from module_a_data.archive_loader import (
+            DATASET_BOOK_TICKER,
+            DATASET_LIQUIDATION,
+            ArchiveCoverage,
+            BinanceArchiveLoader,
+            coverage_summary,
+            merge_microstructure,
+        )
+
+        settings = self._settings.data
+        if not settings.archive_enabled:
+            _LOGGER.info("Archive backfill is disabled (data.archive_enabled=False)")
+            return {"status": "DISABLED", "reason": "data.archive_enabled is False"}
+
+        universe: list[str] = symbols if symbols is not None else list(settings.symbols)
+        window_days: int = days or settings.archive_backfill_days
+        end_ms: int = last_closed_candle_open_ms(settings.timeframe_ms)
+        start_ms: int = end_ms - window_days * 86_400_000
+
+        completed: int = 0
+        total: int = len(universe)
+        reports: list[ArchiveCoverage] = []
+
+        async with BinanceArchiveLoader(
+            self._settings,
+            max_concurrent_downloads=settings.archive_max_concurrent_downloads,
+        ) as loader:
+
+            async def _one(symbol: str) -> None:
+                nonlocal completed
+                async with self._symbol_semaphore:
+                    try:
+                        # Resume from the oldest stored bucket, mirroring
+                        # backfill_futures_metrics: the live cycle keeps writing
+                        # "now" buckets, so a newest-first resume rule would make
+                        # start_ms exceed end_ms and write nothing forever.
+                        oldest: int | None = await self._db.earliest_microstructure_timestamp(symbol)
+                        symbol_start: int = start_ms
+                        if oldest is not None and oldest <= start_ms:
+                            symbol_start = oldest
+
+                        book, book_coverage = await loader.load_5m_buckets(
+                            symbol, DATASET_BOOK_TICKER, symbol_start, end_ms
+                        )
+                        liquidations, liquidation_coverage = await loader.load_5m_buckets(
+                            symbol, DATASET_LIQUIDATION, symbol_start, end_ms
+                        )
+                        merged = merge_microstructure(book, liquidations)
+                        written: int = await self._db.upsert_microstructure_batch(
+                            symbol, merged, source="archive"
+                        )
+                        book_coverage.buckets_written = written
+                        reports.append(book_coverage)
+                        reports.append(liquidation_coverage)
+                        _LOGGER.info(
+                            "Micro-structure backfill %s: %d bucket(s), book %.0f%% / "
+                            "liquidations %.0f%% of %d day(s)",
+                            symbol,
+                            written,
+                            book_coverage.coverage_pct * 100.0,
+                            liquidation_coverage.coverage_pct * 100.0,
+                            book_coverage.days_requested,
+                        )
+                    except (DatabaseError, OSError) as error:
+                        # One bad symbol must not abort the rest of the universe.
+                        _LOGGER.error("Micro-structure backfill failed for %s: %s", symbol, error)
+                    finally:
+                        completed += 1
+                        if progress is not None:
+                            try:
+                                progress(symbol, completed, total)
+                            except Exception as callback_error:  # pragma: no cover
+                                _LOGGER.debug("Progress callback failed: %s", callback_error)
+
+            await asyncio.gather(*(_one(symbol) for symbol in universe))
+
+        summary: dict[str, Any] = coverage_summary(reports)
+        _LOGGER.info(
+            "Micro-structure backfill complete: %.1f%% of %s requested symbol-days",
+            float(summary.get("overall_coverage_pct", 0.0)) * 100.0,
+            summary.get("days_requested", 0),
+        )
+        return summary
 
     @staticmethod
     def _merge_futures_history(
