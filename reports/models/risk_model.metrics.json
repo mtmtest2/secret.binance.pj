@@ -1,0 +1,257 @@
+{
+  "artifact_version": "1.0.0",
+  "head": "risk_model",
+  "feature_columns": [
+    "kama_distance",
+    "kama_slope",
+    "kama_slope_fast",
+    "ema_fast_slow_spread",
+    "close_ema_slow_ratio",
+    "adx",
+    "di_spread",
+    "fdi",
+    "fdi_trending",
+    "fdi_delta",
+    "bb_width",
+    "bb_position",
+    "rsi",
+    "rsi_delta",
+    "log_return_1",
+    "log_return_3",
+    "log_return_12",
+    "log_return_48",
+    "momentum_rank",
+    "atr_pct",
+    "atr_rank",
+    "realized_vol_12",
+    "realized_vol_48",
+    "garch_volatility",
+    "garch_vol_rank",
+    "garch_vol_ratio",
+    "vol_of_vol",
+    "realized_vol_12_is_zero",
+    "wick_ratio",
+    "whipsaw_rate",
+    "hmm_regime",
+    "hmm_prob_bull",
+    "hmm_prob_bear",
+    "hmm_prob_high_vol",
+    "hmm_prob_sideways",
+    "hmm_regime_age",
+    "volume_zscore",
+    "volume_rank",
+    "volume_trend",
+    "dollar_volume_rank",
+    "ob_imbalance",
+    "ob_imbalance_delta",
+    "ob_spread_bps",
+    "ob_spread_rank",
+    "liquidation_imbalance",
+    "microstructure_is_missing",
+    "funding_rate",
+    "funding_rate_delta",
+    "funding_rate_rank",
+    "open_interest_change",
+    "open_interest_rank",
+    "long_short_ratio",
+    "taker_buy_sell_ratio",
+    "hour_sin",
+    "hour_cos",
+    "dow_sin",
+    "dow_cos"
+  ],
+  "trained_at": "2026-08-22T21:16:52+00:00",
+  "git_commit": "ebb1fb8c6bcf",
+  "rows": 4041,
+  "validation_rows": 5273,
+  "hyperparameters": {
+    "booster": "lightgbm",
+    "n_estimators": 20,
+    "learning_rate": 0.05,
+    "max_depth": 6,
+    "num_leaves": 63,
+    "min_child_samples": 40,
+    "subsample": 0.85,
+    "colsample_bytree": 0.85,
+    "reg_lambda": 1.0,
+    "reg_alpha": 0.0,
+    "random_state": 42,
+    "train_months": 12.0,
+    "validation_months": 6.0,
+    "test_months": 6.0,
+    "purge_bars": 10,
+    "early_stopping_rounds": 5,
+    "direction_stage2_hyperparameters": {
+      "n_estimators": 700,
+      "learning_rate": 0.03,
+      "max_depth": 5,
+      "num_leaves": 31,
+      "subsample": 0.8,
+      "colsample_bytree": 0.7,
+      "min_child_samples": 100,
+      "reg_lambda": 2.0,
+      "reg_alpha": 0.5
+    },
+    "risk_hyperparameters": {
+      "n_estimators": 600,
+      "learning_rate": 0.04,
+      "max_depth": 7,
+      "num_leaves": 95,
+      "subsample": 0.85,
+      "colsample_bytree": 0.85,
+      "min_child_samples": 25,
+      "reg_lambda": 1.5,
+      "reg_alpha": 0.1
+    }
+  },
+  "metrics": {
+    "mae": 0.148126922256809,
+    "rmse": 0.18832393119762456,
+    "r2": 0.14279742602841405,
+    "median_absolute_error": 0.12120701807380141,
+    "target_stats": {
+      "mean": 0.552771627321825,
+      "median": 0.5570816226267464,
+      "std": 0.20340600874513434,
+      "min": 0.09258203633539419,
+      "max": 0.9968814235842572
+    },
+    "prediction_stats": {
+      "mean": 0.5816862536269525,
+      "median": 0.5820464722381812,
+      "std": 0.07761590397846015,
+      "min": 0.41921869864547795,
+      "max": 0.8003758917558668
+    }
+  },
+  "feature_importance": {
+    "status": "AVAILABLE",
+    "method": "native_gain_or_split",
+    "top_features": [
+      {
+        "feature": "garch_vol_rank",
+        "importance": 199.0,
+        "importance_pct": 0.07899960301707026
+      },
+      {
+        "feature": "hour_sin",
+        "importance": 101.0,
+        "importance_pct": 0.04009527590313616
+      },
+      {
+        "feature": "volume_trend",
+        "importance": 100.0,
+        "importance_pct": 0.03969829297340215
+      },
+      {
+        "feature": "adx",
+        "importance": 93.0,
+        "importance_pct": 0.03691941246526399
+      },
+      {
+        "feature": "wick_ratio",
+        "importance": 87.0,
+        "importance_pct": 0.03453751488685986
+      },
+      {
+        "feature": "hour_cos",
+        "importance": 86.0,
+        "importance_pct": 0.034140531957125846
+      },
+      {
+        "feature": "vol_of_vol",
+        "importance": 76.0,
+        "importance_pct": 0.03017070265978563
+      },
+      {
+        "feature": "dollar_volume_rank",
+        "importance": 76.0,
+        "importance_pct": 0.03017070265978563
+      },
+      {
+        "feature": "rsi_delta",
+        "importance": 75.0,
+        "importance_pct": 0.029773719730051607
+      },
+      {
+        "feature": "realized_vol_48",
+        "importance": 72.0,
+        "importance_pct": 0.028582770940849545
+      },
+      {
+        "feature": "fdi",
+        "importance": 69.0,
+        "importance_pct": 0.02739182215164748
+      },
+      {
+        "feature": "log_return_3",
+        "importance": 69.0,
+        "importance_pct": 0.02739182215164748
+      },
+      {
+        "feature": "fdi_delta",
+        "importance": 68.0,
+        "importance_pct": 0.026994839221913456
+      },
+      {
+        "feature": "log_return_1",
+        "importance": 68.0,
+        "importance_pct": 0.026994839221913456
+      },
+      {
+        "feature": "garch_volatility",
+        "importance": 66.0,
+        "importance_pct": 0.026200873362445413
+      },
+      {
+        "feature": "hmm_prob_bear",
+        "importance": 66.0,
+        "importance_pct": 0.026200873362445413
+      },
+      {
+        "feature": "di_spread",
+        "importance": 65.0,
+        "importance_pct": 0.025803890432711394
+      },
+      {
+        "feature": "kama_distance",
+        "importance": 63.0,
+        "importance_pct": 0.02500992457324335
+      },
+      {
+        "feature": "atr_pct",
+        "importance": 61.0,
+        "importance_pct": 0.02421595871377531
+      },
+      {
+        "feature": "bb_position",
+        "importance": 60.0,
+        "importance_pct": 0.023818975784041286
+      }
+    ],
+    "shap": {
+      "status": "NOT_AVAILABLE",
+      "reason": "shap is not an installed project dependency"
+    }
+  },
+  "training_row_filter": "direction_target != NO_TRADE_OR_FAIL - see RiskModel.train docstring",
+  "split": {
+    "train": {
+      "start": "2024-01-10T05:00:00+00:00",
+      "end": "2024-01-16T12:05:00+00:00",
+      "rows": 4041
+    },
+    "validation": {
+      "start": "2024-01-16T13:00:00+00:00",
+      "end": "2024-01-24T06:35:00+00:00",
+      "rows": 5273
+    },
+    "test": {
+      "start": "2024-01-24T07:30:00+00:00",
+      "end": "2024-02-01T01:55:00+00:00",
+      "rows": 5131
+    },
+    "embargo_ms": 3000000,
+    "scaled_down_from_nominal_months": true
+  }
+}

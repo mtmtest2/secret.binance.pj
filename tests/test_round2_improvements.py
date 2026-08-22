@@ -176,13 +176,43 @@ def test_entry_select_recommended_threshold_prefers_precision() -> None:
         {"threshold": 0.6, "precision": 0.70, "recall": 0.55, "f1": 0.61, "meets_min_sample_size": True},
         {"threshold": 0.9, "precision": 0.95, "recall": 0.02, "f1": 0.04, "meets_min_sample_size": True},
     ]
-    chosen = EntryModel._select_recommended_threshold(sweep, floor=0.55)
+    chosen = EntryModel._select_recommended_threshold(sweep, configured_floor=0.55)
     assert chosen == 0.6
 
 
 def test_entry_select_recommended_threshold_falls_back_when_nothing_qualifies() -> None:
     sweep = [{"threshold": 0.5, "precision": 0.9, "recall": 0.9, "f1": 0.9, "meets_min_sample_size": False}]
-    assert EntryModel._select_recommended_threshold(sweep, floor=0.55) == 0.55
+    assert EntryModel._select_recommended_threshold(sweep, configured_floor=0.55) == 0.55
+
+
+def test_entry_select_recommended_threshold_never_returns_below_the_floor() -> None:
+    """The configured floor is a bound, not just an empty-sweep fallback.
+
+    The tuner used to consult it only when no row qualified, so a sweep whose
+    best F-beta sat at a loose threshold could hand back a value below the
+    operator's configured minimum - silently loosening a risk control that
+    looks authoritative in config.
+    """
+    sweep = [
+        {"threshold": 0.30, "precision": 0.90, "recall": 0.95, "f1": 0.92, "meets_min_sample_size": True},
+        {"threshold": 0.80, "precision": 0.20, "recall": 0.05, "f1": 0.08, "meets_min_sample_size": True},
+    ]
+    # F-beta clearly favours 0.30, but the operator configured 0.55.
+    assert EntryModel._select_recommended_threshold(sweep, configured_floor=0.55) == 0.55
+
+
+def test_entry_select_recommended_threshold_refuses_a_flat_sweep() -> None:
+    """A sweep with no knee means the model does not discriminate.
+
+    Returning the argmax there presents noise as a considered recommendation;
+    returning the floor says the same thing honestly.
+    """
+    sweep = [
+        {"threshold": 0.30, "precision": 0.50, "recall": 0.90, "f1": 0.64, "meets_min_sample_size": True},
+        {"threshold": 0.40, "precision": 0.505, "recall": 0.89, "f1": 0.64, "meets_min_sample_size": True},
+        {"threshold": 0.50, "precision": 0.51, "recall": 0.88, "f1": 0.64, "meets_min_sample_size": True},
+    ]
+    assert EntryModel._select_recommended_threshold(sweep, configured_floor=0.55) == 0.55
 
 
 def test_microstructure_coverage_flags_unpopulated_features() -> None:

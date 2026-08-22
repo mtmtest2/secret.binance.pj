@@ -177,6 +177,12 @@ class EntryPrediction(BaseModel):
 
     probability: float = Field(ge=0.0, le=1.0)
     should_enter: bool
+    #: The cutoff `should_enter` was actually compared against. The head may use
+    #: an auto-tuned threshold from its own metadata rather than the configured
+    #: one, and the rejection log used to print the configured value regardless -
+    #: so an audit trail existing to let decisions be reconstructed stated a
+    #: threshold the system had not applied.
+    threshold: float = Field(default=0.0, ge=0.0, le=1.0)
     source: ModelSource = Field(default=ModelSource.TRAINED)
     reason: str = Field(default="")
 
@@ -272,6 +278,11 @@ class TradeSignal(BaseModel):
 
     take_profit_pct: float = Field(gt=0.0, le=1.0)
     stop_loss_pct: float = Field(gt=0.0, le=1.0)
+    #: Distance from entry at which the trail arms, as a fraction. Carried
+    #: alongside the absolute `trailing_trigger` so a consumer that re-anchors
+    #: the geometry to an actual fill price (the backtester does) can reproduce
+    #: the Exit model's own activation level instead of inventing a rule.
+    trailing_activation_pct: float = Field(default=0.0, ge=0.0, le=1.0)
 
     confidence: float = Field(ge=0.0, le=1.0)
     risk_tier: str = Field(default="UNKNOWN")

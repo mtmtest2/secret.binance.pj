@@ -96,8 +96,19 @@ def test_ai_summary_is_good_with_no_issues_and_no_baseline() -> None:
     }
     summary = diagnostics._ai_summary(report, comparison=[])
     assert summary["overall_status"] == "GOOD"
-    assert summary["weakest_component"] == "risk"  # lowest of 0.7/0.65/0.6
-    assert summary["strongest_component"] == "direction"
+    # Heads are ranked on lift over their own chance baseline, not on the raw
+    # magnitude of three incommensurable metrics. Balanced accuracy 0.70 against
+    # a 1/3 floor is 0.55 of the available headroom; ROC-AUC 0.65 against a 0.50
+    # floor is only 0.30; R^2 0.60 against a 0 floor is 0.60. Ranking the raw
+    # numbers instead made the verdict an artifact of which metric happens to
+    # live nearest zero - it would call R^2 0.60 "weakest" purely for being the
+    # smallest float on the page.
+    assert summary["weakest_component"] == "entry"
+    assert summary["strongest_component"] == "risk"
+    lift = summary["component_lift_over_chance"]
+    assert lift["direction"] == pytest.approx(0.55, abs=0.01)
+    assert lift["entry"] == pytest.approx(0.30, abs=0.01)
+    assert lift["risk"] == pytest.approx(0.60, abs=0.01)
 
 
 def test_backtest_reliability_flags_low_trade_count() -> None:

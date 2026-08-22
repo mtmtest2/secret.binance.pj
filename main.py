@@ -93,13 +93,58 @@ _MAX_STORED_CYCLE_TIMINGS: Final[int] = 500
 #: loosened copy replays the *same* window to check whether the strategy's
 #: edge is visible at all with a larger sample, without ever touching the
 #: thresholds that gate real orders.
-_RELAXED_DECISION_SETTINGS: Final[DecisionSettings] = DecisionSettings(
-    min_gate_confidence=0.50,
-    min_direction_given_trade_confidence=0.52,
-    max_no_trade_probability=0.50,
-    min_entry_probability=0.50,
-    min_reward_risk_ratio=1.0,
-)
+#: Overrides applied *on top of* the operator's live DecisionSettings for the
+#: relaxed diagnostic replay. Kept as a dict rather than a whole
+#: ``DecisionSettings`` so every field not listed here keeps its configured
+#: value - constructing a fresh settings object reset leverage bands, allocation
+#: caps, accepted risk tiers and position limits to class defaults, which meant
+#: the "same run with looser thresholds" differed in far more than thresholds.
+_RELAXED_DECISION_OVERRIDES: Final[dict[str, float]] = {
+    "min_gate_confidence": 0.50,
+    "min_direction_given_trade_confidence": 0.52,
+    "max_no_trade_probability": 0.50,
+    "min_entry_probability": 0.50,
+    "min_reward_risk_ratio": 1.0,
+}
+
+
+def _oos_disclosure(
+    report: "BacktestReport",
+    split: Any,
+    in_sample_timestamps: np.ndarray,
+) -> dict[str, Any]:
+    """Measure how much of a replay was genuinely out of sample.
+
+    This used to be a hardcoded ``"oos_fraction": 1.0`` attached to both
+    replays, describing a window neither of them actually ran. A field asserted
+    rather than measured cannot detect the thing it exists to detect: had a
+    later change to the split logic introduced real overlap, it would still have
+    read 1.0.
+    """
+    replayed = np.array(
+        sorted({int(point["timestamp"]) for point in (report.equity_curve or [])}), dtype=np.int64
+    )
+    if replayed.size == 0 or in_sample_timestamps.size == 0:
+        overlap = 0
+        fraction = 1.0 if replayed.size else float("nan")
+    else:
+        overlap = int(np.intersect1d(replayed, np.unique(in_sample_timestamps)).size)
+        fraction = 1.0 - overlap / float(replayed.size)
+    return {
+        "note": (
+            "This replay is the model's held-out test split: it was never used "
+            "for training, early stopping, calibration, threshold selection or "
+            "model selection for any of the four heads - see "
+            "ProcessedDataset.chronological_split. `oos_fraction` below is "
+            "measured against the train+validation timestamps, not assumed."
+        ),
+        "test_start": ms_to_datetime(split.test_start_ms).isoformat(),
+        "test_end": ms_to_datetime(split.test_end_ms).isoformat(),
+        "test_rows_in_training_dataset": int(len(split.test_index)),
+        "replayed_bars": int(replayed.size),
+        "bars_overlapping_train_or_validation": overlap,
+        "oos_fraction": fraction,
+    }
 
 
 def _final_backtest_window(
@@ -458,41 +503,60 @@ class TradingSystem:
                 timeframe_ms=self.settings.data.timeframe_ms,
                 warmup_padding=warmup_padding,
             )
-            oos_disclosure: dict[str, Any] = {
-                "note": (
-                    "This replay is the model's held-out test split: it was never "
-                    "used for training, early stopping, calibration, threshold "
-                    "selection or model selection for any of the four heads - see "
-                    "ProcessedDataset.chronological_split. Always 100% "
-                    "out-of-sample by construction."
-                ),
-                "test_start": ms_to_datetime(split.test_start_ms).isoformat(),
-                "test_end": ms_to_datetime(split.test_end_ms).isoformat(),
-                "test_rows_in_training_dataset": int(len(split.test_index)),
-                "oos_fraction": 1.0,
-            }
+            # The window is pinned to the split's own timestamps rather than
+            # left as "the most recent N bars". The database keeps growing while
+            # training runs, so a bar count drifts forward between the strict and
+            # relaxed passes - which is how two replays of what the report called
+            # "the same out-of-sample window" ended up 3h15m apart at both ends,
+            # with different signal counts, making the comparison they exist for
+            # meaningless.
+            in_sample_timestamps: np.ndarray = dataset.metadata["timestamp"].to_numpy(dtype=np.int64)[
+                np.concatenate([split.train_index, split.validation_index])
+            ] if len(split.train_index) or len(split.validation_index) else np.array([], dtype=np.int64)
 
             backtester = Backtester(
                 self.settings, self.database, self.features, self.ml, self.decisions
             )
             strict: BacktestReport = await backtester.run(
-                symbols=symbols, max_candles=max_candles, warmup_bars=warmup_padding
+                symbols=symbols,
+                max_candles=max_candles,
+                warmup_bars=warmup_padding,
+                start_ms=split.test_start_ms,
+                end_ms=split.test_end_ms,
             )
-            strict.oos_disclosure = oos_disclosure
+            strict.oos_disclosure = _oos_disclosure(strict, split, in_sample_timestamps)
 
             relaxed: BacktestReport | None = None
             try:
+                # Derived from the live settings so only the five intended
+                # thresholds differ. Constructing a fresh DecisionSettings reset
+                # every other field - leverage bands, allocation caps, accepted
+                # risk tiers, position limits - to class defaults, silently
+                # discarding operator configuration in the run whose whole
+                # purpose is an apples-to-apples comparison.
+                relaxed_decision = self.settings.decision.model_copy(update=_RELAXED_DECISION_OVERRIDES)
                 relaxed_settings: Settings = self.settings.model_copy(
-                    update={"decision": _RELAXED_DECISION_SETTINGS}
+                    update={"decision": relaxed_decision}
                 )
                 relaxed_engine = DecisionEngine(relaxed_settings)
                 relaxed_backtester = Backtester(
                     relaxed_settings, self.database, self.features, self.ml, relaxed_engine
                 )
                 relaxed = await relaxed_backtester.run(
-                    symbols=symbols, max_candles=max_candles, warmup_bars=warmup_padding
+                    symbols=symbols,
+                    max_candles=max_candles,
+                    warmup_bars=warmup_padding,
+                    start_ms=split.test_start_ms,
+                    end_ms=split.test_end_ms,
                 )
-                relaxed.oos_disclosure = oos_disclosure
+                relaxed.oos_disclosure = _oos_disclosure(relaxed, split, in_sample_timestamps)
+                relaxed.settings_delta = {
+                    field: {
+                        "strict": getattr(self.settings.decision, field),
+                        "relaxed": getattr(relaxed_decision, field),
+                    }
+                    for field in _RELAXED_DECISION_OVERRIDES
+                }
             except Exception as error:  # noqa: BLE001 - diagnostic-only pass, never fatal
                 _LOGGER.error("Relaxed diagnostic backtest failed: %s", error, exc_info=True)
 

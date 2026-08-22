@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Sequence
 
 import numpy as np
 import pandas as pd
@@ -40,6 +40,20 @@ from module_c_ml.ml_models import MLSubsystem
 _LOGGER = get_logger(__name__)
 
 NOT_AVAILABLE: Final[str] = "NOT_AVAILABLE"
+
+#: Fold-to-fold accuracy spread above which a single train/validation split
+#: cannot be trusted on its own.
+_WALK_FORWARD_STD_LIMIT: Final[float] = 0.05
+#: Null rate at or above which a feature is not a feature - it is a column of
+#: NaN being handed to a booster on every row.
+_DEAD_FEATURE_NULL_RATE: Final[float] = 0.98
+#: Train-vs-validation mean shift (in train sigma) that makes a feature's
+#: learned split thresholds meaningless outside the training window.
+_DRIFT_CRITICAL_SIGMA: Final[float] = 1.5
+_DRIFT_WARNING_SIGMA: Final[float] = 1.0
+#: Total-variation distance between train and validation label distributions
+#: worth surfacing as an explanation for a head behaving differently.
+_LABEL_SHIFT_LIMIT: Final[float] = 0.05
 LATEST_REPORT_STATE_KEY: Final[str] = "ml_diagnostic_latest_report"
 REPORTS_DIR_NAME: Final[str] = "reports"
 
@@ -425,15 +439,251 @@ def _label_configuration(settings: Settings) -> dict[str, Any]:
     }
 
 
+def _spearman_rho(values: Sequence[float]) -> float:
+    """Rank correlation of ``values`` against their position.
+
+    Written out rather than imported so the diagnostic does not grow a scipy
+    dependency for eight lines of arithmetic.  Values are already a fold
+    sequence, so ties are rare and average-rank handling is enough.
+    """
+    n = len(values)
+    if n < 3:
+        return float("nan")
+    order = sorted(range(n), key=lambda i: values[i])
+    ranks = [0.0] * n
+    for rank_position, original_index in enumerate(order):
+        ranks[original_index] = float(rank_position + 1)
+    positions = [float(i + 1) for i in range(n)]
+    mean_rank = sum(ranks) / n
+    mean_position = sum(positions) / n
+    numerator = sum((r - mean_rank) * (p - mean_position) for r, p in zip(ranks, positions))
+    denominator = (
+        sum((r - mean_rank) ** 2 for r in ranks) * sum((p - mean_position) ** 2 for p in positions)
+    ) ** 0.5
+    return float(numerator / denominator) if denominator else float("nan")
+
+
 def _walk_forward_problem_summary(walk_forward: dict[str, Any]) -> str:
-    """One-line, measurement-derived read on walk-forward validation health."""
+    """One-line, measurement-derived read on walk-forward validation health.
+
+    This used to begin every AVAILABLE-path answer with "none measured" and
+    summarise the folds by their standard deviation alone.  A spread is the
+    wrong statistic for a fold sequence: it takes the same value however the
+    folds are ordered, so a run whose accuracy fell monotonically from 0.80 to
+    0.46 - the single most important measurement in that report - was
+    indistinguishable from benign noise.
+    """
     if not isinstance(walk_forward, dict) or walk_forward.get("status") != "AVAILABLE":
         return "walk-forward evaluation not available (single train/validation split only)"
+
+    folds = walk_forward.get("folds") or []
+    accuracies = [f.get("accuracy") for f in folds if isinstance(f.get("accuracy"), (int, float))]
     std = walk_forward.get("accuracy_std")
-    folds = walk_forward.get("n_folds", "?")
+    n_folds = walk_forward.get("n_folds", len(accuracies) or "?")
+
+    if len(accuracies) >= 3:
+        rho = _spearman_rho(accuracies)
+        if rho <= -0.9:
+            return (
+                f"accuracy degrades monotonically across all {n_folds} folds "
+                f"({accuracies[0]:.3f} -> {accuracies[-1]:.3f}, Spearman rho={rho:.2f}); the "
+                "earliest fold is not representative of the period the model will trade, so the "
+                f"mean overstates it - the latest fold ({accuracies[-1]:.3f}) is the honest read"
+            )
+        if isinstance(std, (int, float)) and std > _WALK_FORWARD_STD_LIMIT:
+            return (
+                f"accuracy varies widely across {n_folds} folds (std={std:.3f}, "
+                f"range {min(accuracies):.3f}-{max(accuracies):.3f}); a single split cannot be "
+                "trusted at this spread"
+            )
     if isinstance(std, (int, float)):
-        return f"none measured (walk-forward across {folds} folds, accuracy std={std:.3f})"
-    return f"none measured (walk-forward across {folds} folds)"
+        return f"none measured (walk-forward across {n_folds} folds, accuracy std={std:.3f})"
+    return f"none measured (walk-forward across {n_folds} folds)"
+
+
+def _dataset_health_checks(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Predicates over the report that decide whether the *data* is usable.
+
+    Everything these read - per-feature null counts, train/validation drift in
+    sigma units, label distribution per split, duplicate counts, split coverage -
+    was already being computed and written into the report.  None of it was ever
+    read back, so a run with four all-NaN feature columns, 72% degenerate
+    training rows and four features past one train-sigma of drift still
+    summarised as "biggest data problem: none measured".
+
+    Collecting the checks in one list rather than scattering them through
+    ``_ai_summary`` and ``_recommendations`` means a check cannot exist in the
+    data without also reaching the verdict.  Each entry carries a ``weight`` so
+    the worst finding can be picked deterministically for the one-line summary.
+    """
+    checks: list[dict[str, Any]] = []
+    dataset = report.get("dataset", {}) or {}
+    total = dataset.get("valid_samples") or 0
+    nulls = dataset.get("null_counts_by_feature") or {}
+
+    dead = sorted(
+        name
+        for name, count in nulls.items()
+        if total and isinstance(count, (int, float)) and count / total >= _DEAD_FEATURE_NULL_RATE
+    )
+    if dead:
+        checks.append(
+            {
+                "id": "dead_features",
+                "severity": "CRITICAL",
+                "weight": 100.0,
+                "message": (
+                    f"{len(dead)} feature(s) are effectively empty on every row "
+                    f"({', '.join(dead)}) - they occupy the feature contract and force a "
+                    "retrain on every change without contributing anything; remove them or "
+                    "fix the backfill that should be populating them"
+                ),
+            }
+        )
+
+    drift = ((report.get("features", {}) or {}).get("drift", {}) or {}).get(
+        "most_drifted_features", []
+    ) or []
+    worst = drift[0] if drift else None
+    if isinstance(worst, dict):
+        shift = worst.get("mean_shift_in_train_std")
+        if isinstance(shift, (int, float)) and shift >= _DRIFT_WARNING_SIGMA:
+            severe = shift >= _DRIFT_CRITICAL_SIGMA
+            drifted = [
+                f["feature"]
+                for f in drift
+                if isinstance(f, dict)
+                and isinstance(f.get("mean_shift_in_train_std"), (int, float))
+                and f["mean_shift_in_train_std"] >= _DRIFT_WARNING_SIGMA
+            ]
+            checks.append(
+                {
+                    "id": "feature_drift",
+                    "severity": "CRITICAL" if severe else "HIGH",
+                    "weight": 50.0 + float(shift),
+                    "message": (
+                        f"{len(drifted)} feature(s) shift by more than {_DRIFT_WARNING_SIGMA:.1f} "
+                        f"train-sigma between train and validation (worst: {worst.get('feature')} at "
+                        f"{shift:.2f} sigma) - split thresholds learned on the training window do "
+                        "not transfer, so validation metrics understate what live will see"
+                    ),
+                }
+            )
+
+    distribution = (report.get("direction", {}) or {}).get("distribution", {}) or {}
+    shift_value = distribution.get("label_distribution_shift")
+    if isinstance(shift_value, (int, float)) and shift_value >= _LABEL_SHIFT_LIMIT:
+        checks.append(
+            {
+                "id": "label_shift",
+                "severity": "HIGH",
+                "weight": 40.0 + float(shift_value),
+                "message": (
+                    f"the label distribution moves by {shift_value:.3f} (total-variation) between "
+                    "train and validation - a directional head trained on one balance and scored "
+                    "on another will look worse than it is, or better"
+                ),
+            }
+        )
+
+    coverage = dataset.get("split_coverage_pct", {}) or {}
+    for name, block in coverage.items():
+        if not isinstance(block, dict):
+            continue
+        rows, capacity = block.get("rows"), block.get("capacity_rows")
+        if isinstance(rows, int) and isinstance(capacity, int) and capacity and rows > capacity:
+            checks.append(
+                {
+                    "id": f"split_over_capacity_{name}",
+                    "severity": "HIGH",
+                    "weight": 30.0,
+                    "message": (
+                        f"the {name} split holds {rows} rows against a theoretical capacity of "
+                        f"{capacity} - a split cannot exceed its own time span unless timestamps "
+                        "repeat, so the dataset carries duplicates"
+                    ),
+                }
+            )
+
+    duplicates = dataset.get("duplicate_feature_rows")
+    if isinstance(duplicates, int) and duplicates > 0:
+        checks.append(
+            {
+                "id": "duplicate_rows",
+                "severity": "MEDIUM",
+                "weight": 20.0,
+                "message": (
+                    f"{duplicates} duplicate feature row(s) survived into the dataset - identical "
+                    "rows split across train and test are exact-match leakage"
+                ),
+            }
+        )
+
+    dq = report.get("data_quality", {}) or {}
+    exclusions = dq.get("symbol_exclusions_total")
+    if isinstance(exclusions, int) and exclusions > 0:
+        checks.append(
+            {
+                "id": "symbol_exclusions",
+                "severity": "MEDIUM",
+                "weight": 10.0,
+                "message": f"{exclusions} symbol-cycle exclusion(s) recorded this run",
+            }
+        )
+
+    coverage_block = (report.get("features", {}) or {}).get("microstructure_coverage", {}) or {}
+    if coverage_block.get("status") == "AVAILABLE":
+        unpopulated = sorted(
+            name
+            for name, info in (coverage_block.get("features", {}) or {}).items()
+            if isinstance(info, dict) and not info.get("likely_populated", True)
+        )
+        if unpopulated:
+            checks.append(
+                {
+                    "id": "unpopulated_feeds",
+                    "severity": "HIGH",
+                    "weight": 35.0,
+                    "message": (
+                        "Microstructure/derivatives feed(s) sit at their neutral default for "
+                        f"nearly every row (likely not being collected): {', '.join(unpopulated)} "
+                        "- check data collection before trusting feature importance involving them"
+                    ),
+                }
+            )
+
+    return sorted(checks, key=lambda c: -float(c["weight"]))
+
+
+def _degenerate_sweep_checks(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flag a confidence sweep whose accuracy rises only by going silent.
+
+    Accuracy climbing while balanced accuracy sinks toward the chance floor is
+    the generic signature of a classifier collapsing onto its majority class.
+    Detected once here rather than per-table, because the same shape can appear
+    in any head's sweep.
+    """
+    checks: list[dict[str, Any]] = []
+    analysis = ((report.get("direction", {}) or {}).get("metrics", {}) or {}).get(
+        "confidence_threshold_analysis", []
+    ) or []
+    degenerate = [row for row in analysis if isinstance(row, dict) and row.get("is_degenerate")]
+    if degenerate:
+        best = max(degenerate, key=lambda r: float(r.get("accuracy", 0.0) or 0.0))
+        checks.append(
+            {
+                "id": "degenerate_confidence_sweep",
+                "severity": "HIGH",
+                "weight": 45.0,
+                "message": (
+                    f"the confidence sweep reaches {float(best.get('accuracy', 0.0)):.1%} accuracy at "
+                    f"threshold {best.get('confidence_threshold')} only by predicting a single class "
+                    "- that number is the surviving subset's base rate, not skill, and raising the "
+                    "live threshold toward it would produce a system that never trades"
+                ),
+            }
+        )
+    return checks
 
 
 def _ai_summary(report: dict[str, Any], comparison: list[dict[str, Any]]) -> dict[str, Any]:
@@ -452,9 +702,15 @@ def _ai_summary(report: dict[str, Any], comparison: list[dict[str, Any]]) -> dic
         if head.get("status") == "NOT_TRAINED":
             critical.append(f"{name} model has no trained artifact")
 
-    dq = report.get("data_quality", {})
-    if isinstance(dq.get("symbol_exclusions_total"), int) and dq["symbol_exclusions_total"] > 0:
-        warnings.append(f"{dq['symbol_exclusions_total']} symbol-cycle exclusion(s) recorded")
+    # Data health is decided by the check registry, not by one hand-picked
+    # scalar. Everything it reads was already in the report and simply was not
+    # being consulted.
+    data_checks: list[dict[str, Any]] = _dataset_health_checks(report) + _degenerate_sweep_checks(report)
+    for check in data_checks:
+        if check["severity"] == "CRITICAL":
+            critical.append(check["message"])
+        elif check["severity"] == "HIGH":
+            warnings.append(check["message"])
 
     reliability: dict[str, Any] = report.get("backtest_reliability", {})
     backtest_unreliable: bool = (
@@ -467,16 +723,44 @@ def _ai_summary(report: dict[str, Any], comparison: list[dict[str, Any]]) -> dic
             "win rate/profit factor/Sharpe as a performance estimate"
         )
 
+    # Heads are scored on lift over their own chance baseline, so the four are
+    # comparable.  Ranking balanced accuracy (chance 1/3), ROC-AUC (chance 0.5)
+    # and R^2 (chance 0) against each other on raw magnitude made the verdict an
+    # artifact of which metric happens to live nearest zero: it named "risk" the
+    # weakest head at R^2 0.079 (+0.079 over chance) while "direction" sat at
+    # balanced accuracy 0.356 - just +0.023 over chance, three times worse, and
+    # the head the entire strategy depends on.
     direction_metrics: dict[str, Any] = heads["direction"].get("metrics", {}) or {}
     entry_metrics: dict[str, Any] = heads["entry"].get("metrics", {}) or {}
-    scored: dict[str, float] = {}
-    if isinstance(direction_metrics.get("balanced_accuracy"), (int, float)):
-        scored["direction"] = float(direction_metrics["balanced_accuracy"])
-    if isinstance(entry_metrics.get("roc_auc"), (int, float)) and entry_metrics["roc_auc"] == entry_metrics["roc_auc"]:
-        scored["entry"] = float(entry_metrics["roc_auc"])
+    exit_metrics: dict[str, Any] = heads["exit"].get("metrics", {}) or {}
     risk_metrics: dict[str, Any] = heads["risk"].get("metrics", {}) or {}
-    if isinstance(risk_metrics.get("r2"), (int, float)) and risk_metrics["r2"] == risk_metrics["r2"]:
-        scored["risk"] = float(risk_metrics["r2"])
+
+    def _finite(value: Any) -> float | None:
+        return float(value) if isinstance(value, (int, float)) and value == value else None
+
+    scored: dict[str, float] = {}
+    n_classes: int = max(2, len(direction_metrics.get("class_distribution", {}) or {}) or 3)
+    chance: float = 1.0 / n_classes
+    balanced = _finite(direction_metrics.get("balanced_accuracy"))
+    if balanced is not None:
+        scored["direction"] = (balanced - chance) / (1.0 - chance)
+    roc_auc = _finite(entry_metrics.get("roc_auc"))
+    if roc_auc is not None:
+        scored["entry"] = (roc_auc - 0.5) / 0.5
+    # Exit was collected into `heads` but never scored, so its problems could
+    # never surface here however bad they were.
+    exit_r2s = [
+        value
+        for target in (exit_metrics or {}).values()
+        if isinstance(target, dict)
+        for value in (_finite(target.get("r2")),)
+        if value is not None
+    ]
+    if exit_r2s:
+        scored["exit"] = max(0.0, sum(exit_r2s) / len(exit_r2s))
+    risk_r2 = _finite(risk_metrics.get("r2"))
+    if risk_r2 is not None:
+        scored["risk"] = max(0.0, risk_r2)
 
     strongest: str = max(scored, key=scored.get) if scored else NOT_AVAILABLE
     weakest: str = min(scored, key=scored.get) if scored else NOT_AVAILABLE
@@ -496,8 +780,15 @@ def _ai_summary(report: dict[str, Any], comparison: list[dict[str, Any]]) -> dic
         next_action = f"Fix before anything else: {critical[0]}"
     elif regressions:
         next_action = f"Investigate the regression in {regressions[0]} before promoting this run"
-    elif weakest != NOT_AVAILABLE and scored.get(weakest, 1.0) < 0.55:
-        next_action = f"Improve the {weakest} model - it is the weakest measured component"
+    elif warnings:
+        next_action = f"Address before trusting this run's model metrics: {warnings[0]}"
+    elif weakest != NOT_AVAILABLE and scored.get(weakest, 1.0) < 0.10:
+        # Lift over chance, so the bar is "captures less than a tenth of the
+        # headroom available to it", not "some metric happens to be below 0.55".
+        next_action = (
+            f"Improve the {weakest} model - it captures {scored[weakest]:.1%} of the lift "
+            "available over its own chance baseline"
+        )
     else:
         next_action = "No critical issues measured; continue with the walk-forward/backtest checklist"
 
@@ -505,12 +796,15 @@ def _ai_summary(report: dict[str, Any], comparison: list[dict[str, Any]]) -> dic
         "overall_status": status,
         "strongest_component": strongest,
         "weakest_component": weakest,
-        "biggest_data_problem": (
-            f"{dq['symbol_exclusions_total']} symbol exclusion(s) this run"
-            if isinstance(dq.get("symbol_exclusions_total"), int) and dq["symbol_exclusions_total"] > 0
-            else "none measured"
+        "biggest_data_problem": (data_checks[0]["message"] if data_checks else "none measured"),
+        "data_health_checks": data_checks,
+        "component_lift_over_chance": {name: round(value, 4) for name, value in scored.items()},
+        "biggest_ml_problem": (
+            f"{weakest} captures the least of its available headroom "
+            f"({scored[weakest]:.1%} lift over chance)"
+            if scored and weakest in scored
+            else NOT_AVAILABLE
         ),
-        "biggest_ml_problem": f"{weakest} is the weakest scored component" if scored else NOT_AVAILABLE,
         "biggest_validation_problem": _walk_forward_problem_summary(report.get("walk_forward", {})),
         "biggest_trading_problem": (
             "backtest not available for this run"
@@ -786,19 +1080,26 @@ def _recommendations(report: dict[str, Any], comparison: list[dict[str, Any]]) -
                     "over-rejection bug rather than assuming intended selectivity"
                 )
 
-    coverage = report.get("features", {}).get("microstructure_coverage", {})
-    if coverage.get("status") == "AVAILABLE":
-        unpopulated = sorted(
-            name
-            for name, info in coverage.get("features", {}).items()
-            if isinstance(info, dict) and not info.get("likely_populated", True)
-        )
-        if unpopulated:
-            high.append(
-                "Microstructure/derivatives feed(s) sit at their neutral default for nearly "
-                f"every row (likely not being collected): {', '.join(unpopulated)} - check "
-                "data collection for these sources before trusting Entry/Direction feature "
-                "importance that involves them"
+    # Same registry the AI summary reads, so a check can never appear in one
+    # output and be missing from the other.
+    buckets: dict[str, list[str]] = {"CRITICAL": critical, "HIGH": high, "MEDIUM": medium, "LOW": low}
+    for check in _dataset_health_checks(report) + _degenerate_sweep_checks(report):
+        buckets.get(str(check["severity"]), medium).append(check["message"])
+
+    walk_forward = report.get("walk_forward", {}) or {}
+    if walk_forward.get("status") == "AVAILABLE":
+        summary_line = _walk_forward_problem_summary(walk_forward)
+        if not summary_line.startswith("none measured"):
+            folds = walk_forward.get("folds") or []
+            accuracies = [
+                f.get("accuracy") for f in folds if isinstance(f.get("accuracy"), (int, float))
+            ]
+            severity = high
+            if accuracies and _spearman_rho(accuracies) <= -0.9:
+                severity = critical
+            severity.append(
+                f"Walk-forward: {summary_line} - prefer the latest fold over the mean when "
+                "deciding whether this artifact is fit to trade"
             )
 
     for row in comparison:

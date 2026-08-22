@@ -33,7 +33,7 @@ import asyncio
 from collections import deque
 from datetime import date, datetime, timezone
 from enum import Enum
-from typing import Any, Awaitable, Callable, Deque, Final
+from typing import Any, Awaitable, Callable, Deque, Final, Sequence
 
 from config.settings import RiskSettings, Settings
 from core.logger import get_logger
@@ -54,6 +54,120 @@ class SystemState(str, Enum):
     GREEN = "GREEN"
     YELLOW = "YELLOW"
     RED = "RED"
+
+
+class RiskLadder:
+    """The state ladder, as a pure synchronous function of observed history.
+
+    :class:`RiskGuard` is the live object: async, SQLite-backed, and it rolls its
+    trading day off the wall clock.  None of that suits a bar-by-bar replay,
+    where "today" is a property of the bar being replayed and there is no event
+    loop to await.  Reimplementing the thresholds inside the backtester would
+    have meant two copies of the rule that decides when trading stops - and the
+    copy the backtest used would inevitably drift from the one production runs.
+
+    So the ladder lives here, owns the thresholds, and both callers drive it.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self._config: RiskSettings = settings.risk
+        self.state: SystemState = SystemState.GREEN
+        self.halt_reason: str = ""
+        self.consecutive_losses: int = 0
+        self.trades_today: int = 0
+        self.peak_equity: float = float(settings.risk.starting_equity)
+        self.day_start_equity: float = float(settings.risk.starting_equity)
+        self._current_day: date | None = None
+
+    def daily_drawdown_pct(self, equity: float) -> float:
+        if self.day_start_equity <= 0.0:
+            return 0.0
+        return max(0.0, (self.day_start_equity - equity) / self.day_start_equity)
+
+    def total_drawdown_pct(self, equity: float) -> float:
+        if self.peak_equity <= 0.0:
+            return 0.0
+        return max(0.0, (self.peak_equity - equity) / self.peak_equity)
+
+    @property
+    def size_multiplier(self) -> float:
+        if self.state is SystemState.RED:
+            return 0.0
+        if self.state is SystemState.YELLOW:
+            return self._config.yellow_size_multiplier
+        return 1.0
+
+    @property
+    def can_trade(self) -> bool:
+        return self.state is not SystemState.RED and self.trades_today < self._config.max_daily_trades
+
+    def observe(
+        self,
+        *,
+        equity: float,
+        realised_pnls: Sequence[float],
+        day: date,
+    ) -> tuple[SystemState, str]:
+        """Advance the ladder by one bar. Returns ``(state, reason_if_changed)``.
+
+        RED latches: ``require_manual_reset`` means a live deployment stops and
+        stays stopped until a human intervenes, so a replay that trips RED must
+        stop too.  Reporting the equity curve it *would* have had afterwards is
+        the difference between "the strategy returned 52%" and "the strategy
+        returned 52% and would have been halted on day 40".
+        """
+        if self._current_day is None:
+            self._current_day = day
+            self.day_start_equity = equity
+        elif day != self._current_day:
+            self._current_day = day
+            self.day_start_equity = equity
+            self.trades_today = 0
+
+        self.peak_equity = max(self.peak_equity, equity)
+        previous: SystemState = self.state
+
+        for pnl in realised_pnls:
+            self.trades_today += 1
+            if pnl < 0.0:
+                self.consecutive_losses += 1
+            elif pnl > 0.0:
+                self.consecutive_losses = 0
+
+        if self.state is SystemState.RED and self._config.require_manual_reset:
+            return self.state, ""
+
+        daily: float = self.daily_drawdown_pct(equity)
+        total: float = self.total_drawdown_pct(equity)
+        reason: str = ""
+        if daily >= self._config.daily_drawdown_red_pct:
+            self.state = SystemState.RED
+            reason = f"daily drawdown {daily:.2%} breached the {self._config.daily_drawdown_red_pct:.2%} limit"
+        elif total >= self._config.total_drawdown_red_pct:
+            self.state = SystemState.RED
+            reason = (
+                f"peak-to-trough drawdown {total:.2%} breached the "
+                f"{self._config.total_drawdown_red_pct:.2%} limit"
+            )
+        elif self.consecutive_losses >= self._config.consecutive_losses_red:
+            self.state = SystemState.RED
+            reason = (
+                f"{self.consecutive_losses} consecutive losing trades "
+                f"(limit {self._config.consecutive_losses_red})"
+            )
+        elif (
+            daily >= self._config.daily_drawdown_yellow_pct
+            or self.consecutive_losses >= self._config.consecutive_losses_yellow
+        ):
+            self.state = SystemState.YELLOW
+            reason = f"daily drawdown {daily:.2%} / streak {self.consecutive_losses}"
+        else:
+            self.state = SystemState.GREEN
+            reason = "warning conditions cleared" if previous is SystemState.YELLOW else ""
+
+        if self.state is SystemState.RED and previous is not SystemState.RED:
+            self.halt_reason = reason
+        return self.state, (reason if self.state is not previous else "")
 
 
 class RiskGuard:

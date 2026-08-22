@@ -101,6 +101,11 @@ class DecisionContext:
     trading_mode: str = "paper"
     open_positions: int = 0
     open_symbols: frozenset[str] = field(default_factory=frozenset)
+    #: Open position count per symbol, so ``max_positions_per_symbol`` can mean
+    #: something. Callers that track only a symbol set may leave this empty -
+    #: membership in ``open_symbols`` is then read as a single open position,
+    #: which is the behaviour every caller had before the setting was honoured.
+    positions_per_symbol: dict[str, int] = field(default_factory=dict)
     equity: float = 0.0
     size_multiplier: float = 1.0
 
@@ -208,11 +213,19 @@ class DecisionEngine:
             )
 
         # --- R4: entry timing -----------------------------------------------
+        # The applied cutoff, not the configured one: EntryModel may use an
+        # auto-tuned threshold from its own metadata, and printing
+        # `min_entry_probability` here stated a bar the signal was never measured
+        # against - in the log whose purpose is reconstructing decisions.
+        applied_entry_threshold: float = (
+            entry.threshold if entry.threshold > 0.0 else self._config.min_entry_probability
+        )
         self._record(
             checks,
             Rule.ENTRY_REJECTED,
             entry.should_enter,
-            f"entry_probability={entry.probability:.4f} ({entry.reason})",
+            f"entry_probability={entry.probability:.4f} threshold={applied_entry_threshold:.4f} "
+            f"configured_floor={self._config.min_entry_probability:.4f} ({entry.reason})",
         )
         if not entry.should_enter:
             return self._reject(
@@ -220,7 +233,7 @@ class DecisionEngine:
                 Rule.ENTRY_REJECTED,
                 (
                     f"Rejected: entry model says wait for the next 5m candle "
-                    f"(p={entry.probability:.3f} < {self._config.min_entry_probability:.3f})"
+                    f"(p={entry.probability:.3f} < {applied_entry_threshold:.3f})"
                 ),
                 checks,
             )
@@ -477,9 +490,19 @@ class DecisionEngine:
                 verdict=DecisionVerdict.BLOCKED,
             )
 
-        already_open: bool = inference.symbol in state.open_symbols
+        # `max_positions_per_symbol` was declared in config and read by nobody:
+        # the only per-symbol check was set membership, which hardcodes a limit
+        # of one. A configurable that silently does nothing is worse than none.
+        open_for_symbol: int = state.positions_per_symbol.get(
+            inference.symbol, 1 if inference.symbol in state.open_symbols else 0
+        )
+        already_open: bool = open_for_symbol >= self._config.max_positions_per_symbol
         self._record(
-            checks, Rule.SYMBOL_ALREADY_OPEN, not already_open, f"symbol={inference.symbol}"
+            checks,
+            Rule.SYMBOL_ALREADY_OPEN,
+            not already_open,
+            f"symbol={inference.symbol} open={open_for_symbol} "
+            f"cap={self._config.max_positions_per_symbol}",
         )
         if already_open:
             return self._reject(
@@ -538,6 +561,7 @@ class DecisionEngine:
                 stop_loss=stop_loss,
                 trailing_trigger=trailing_trigger,
                 trailing_distance_pct=exit_params.trailing_distance_pct,
+                trailing_activation_pct=trailing_pct,
                 take_profit_pct=take_profit_pct,
                 stop_loss_pct=stop_loss_pct,
                 confidence=confidence,

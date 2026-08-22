@@ -104,6 +104,11 @@ _MAX_SL_PCT: Final[float] = 0.0800
 #: prediction rather than a real edge, so the target is trimmed back to it.
 _MAX_REWARD_RISK: Final[float] = 6.0
 
+#: Minimum spread a stage's raw probabilities must cover before isotonic
+#: calibration is allowed to reshape them. Below this the score carries no
+#: usable ordering and calibration becomes noise amplification.
+_MIN_CALIBRATABLE_SPAN: Final[float] = 0.20
+
 
 def load_artifact(path: Path) -> dict[str, Any] | None:
     """Safely load a joblib artifact.
@@ -131,6 +136,29 @@ def load_artifact(path: Path) -> dict[str, Any] | None:
         _LOGGER.error("Model artifact %s has an unexpected layout", path)
         return None
     return payload
+
+
+def _underlying_estimator(estimator: Any) -> Any:
+    """Unwrap a calibration wrapper down to the booster underneath.
+
+    ``CalibratedClassifierCV`` and :class:`_SigmoidScoreClassifier` both hide the
+    fitted booster, and feature importance only exists on the booster.  Reaching
+    through the wrapper keeps importance reportable once calibration is wired in
+    - the alternative, reporting importance off the pre-calibration estimator,
+    is the same mistake as reporting its metrics.
+    """
+    if estimator is None:
+        return None
+    for attribute in ("estimator", "base_estimator"):
+        inner = getattr(estimator, attribute, None)
+        if inner is not None and hasattr(inner, "feature_importances_"):
+            return inner
+    calibrated = getattr(estimator, "calibrated_classifiers_", None)
+    if calibrated:
+        inner = getattr(calibrated[0], "estimator", None)
+        if inner is not None:
+            return _underlying_estimator(inner)
+    return estimator
 
 
 def _hyperparameter_snapshot(config: MLSettings) -> dict[str, Any]:
@@ -287,6 +315,52 @@ class BaseModelHead(ABC):
         return self._config.model_dir / f"{self.name}.joblib"
 
     # ------------------------------------------------------------------
+    # Metrics/model identity
+    # ------------------------------------------------------------------
+    def _metrics_fingerprint(self) -> str:
+        """Stable identity of the estimator(s) currently held in ``self._model``.
+
+        Training code is free to replace ``self._model`` after fitting - the
+        Direction cascade swaps both stages onto isotonic wrappers, and any head
+        may grow a similar step.  When metrics are computed before such a swap
+        they describe an object that is then discarded, and the report ends up
+        characterising a model nobody runs.  That is not hypothetical: it is how
+        a cascade measured as never predicting LONG shipped as one that goes
+        long on most bars.
+
+        The fingerprint is recorded next to the metrics and re-checked at save
+        time, so the mistake becomes a loud failure instead of a silent one.
+        """
+        model = self._model
+        parts: list[str] = []
+        if isinstance(model, dict):
+            for key in sorted(model):
+                component = model[key]
+                parts.append(f"{key}:{type(component).__name__}:{id(component):x}")
+        elif model is not None:
+            parts.append(f"{type(model).__name__}:{id(model):x}")
+        return "|".join(parts)
+
+    def _assert_metrics_describe_this_model(self) -> None:
+        """Refuse to persist an artifact whose metrics describe something else."""
+        recorded = self._metadata.get("metrics_source")
+        if recorded is None:
+            # Heads that have not yet adopted the convention, and any artifact
+            # reloaded from disk (where object identity is meaningless), simply
+            # have nothing to check.
+            return
+        current = self._metrics_fingerprint()
+        if recorded != current:
+            raise ModelTrainingError(
+                f"{self.name}: refusing to save - metrics were computed against a different "
+                "estimator than the one being written. Score the model after every mutation "
+                "(calibration wrappers included), not before.",
+                head=self.name,
+                metrics_source=recorded,
+                model_source=current,
+            )
+
+    # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
     def save(self, path: Path | None = None) -> Path:
@@ -302,6 +376,7 @@ class BaseModelHead(ABC):
         """
         if self._model is None:
             raise ModelNotLoadedError(f"{self.name}: nothing to save", head=self.name)
+        self._assert_metrics_describe_this_model()
 
         destination: Path = path or self.artifact_path
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -349,6 +424,12 @@ class BaseModelHead(ABC):
         columns: Sequence[str] = payload.get("feature_columns") or FEATURE_COLUMNS
         self._feature_columns = tuple(str(column) for column in columns)
         self._metadata = dict(payload.get("metadata") or {})
+        # The fingerprint is object identity, which does not survive a pickle
+        # round-trip. Re-stamp it against the freshly unpickled estimator so a
+        # load/save cycle stays legal while the guard keeps its meaning for the
+        # case it exists for: metrics computed before a post-fit mutation.
+        if "metrics_source" in self._metadata:
+            self._metadata["metrics_source"] = self._metrics_fingerprint()
         self._restore_extra_artifact_state(payload)
         _LOGGER.info(
             "Loaded %s model (trained_at=%s, rows=%s)",
@@ -873,17 +954,51 @@ class DirectionModel(BaseModelHead):
         recommended_gate_threshold: float = self._settings.decision.min_gate_confidence
         direction_sweep: list[dict[str, Any]] = []
         recommended_direction_threshold: float = self._settings.decision.min_direction_given_trade_confidence
+        direction_span: float = float("nan")
 
+        metrics_raw: dict[str, Any] = {}
         if not validation_features.empty:
+            # Calibration first, metrics second.  `_calibrate_cascade` may swap
+            # either stage onto an isotonic-calibrated wrapper, and that wrapper
+            # is what `save()` writes and `predict()` uses from here on.  Scoring
+            # the pre-calibration estimators would describe a model that is
+            # thrown away moments later - which is exactly how a cascade whose
+            # measured form never emitted a single LONG prediction shipped as one
+            # that goes long on most bars.  Metrics must describe the artifact.
+            calibration, self._model, production_calibration = self._calibrate_cascade(
+                gate_estimator, direction_estimator, validation_features, validation_target
+            )
+            shipped_gate: Any = self._model["gate"]
+            shipped_direction: Any | None = self._model.get("direction")
+
             probabilities: np.ndarray = self._combined_probabilities(
-                gate_estimator, direction_estimator, validation_features
+                shipped_gate, shipped_direction, validation_features
             )
             full_metrics = ml_metrics.direction_metrics(validation_target, probabilities, LABEL_ORDER)
+
+            # The raw cascade is still measured, but reported as its own block
+            # rather than in place of the production one.  Keeping both is what
+            # makes the calibration adoption decision (see `_calibrate_cascade`)
+            # inspectable instead of a log-loss coin flip.
+            if production_calibration != {"gate": "raw", "direction": "raw"}:
+                raw_probabilities: np.ndarray = self._combined_probabilities(
+                    gate_estimator, direction_estimator, validation_features
+                )
+                metrics_raw = ml_metrics.direction_metrics(
+                    validation_target, raw_probabilities, LABEL_ORDER
+                )
+
+            # Importance has to come off the underlying booster: a calibrated
+            # wrapper has no `feature_importances_` of its own.
             importance = {
-                "gate": ml_metrics.feature_importance(gate_estimator, dataset.feature_columns),
+                "gate": ml_metrics.feature_importance(
+                    _underlying_estimator(shipped_gate), dataset.feature_columns
+                ),
                 "direction": (
-                    ml_metrics.feature_importance(direction_estimator, dataset.feature_columns)
-                    if direction_estimator is not None
+                    ml_metrics.feature_importance(
+                        _underlying_estimator(shipped_direction), dataset.feature_columns
+                    )
+                    if shipped_direction is not None
                     else {"status": "NOT_AVAILABLE", "reason": "not enough trade rows to fit stage 2"}
                 ),
             }
@@ -900,8 +1015,11 @@ class DirectionModel(BaseModelHead):
             no_trade_index: int = LABEL_TO_INDEX[LabelClass.NO_TRADE_OR_FAIL.value]
             long_index: int = LABEL_TO_INDEX[LabelClass.LONG_SUCCESS.value]
             is_trade_validation: pd.Series = (validation_target != no_trade_index).astype(int)
+            # Swept on the shipped stages for the same reason the metrics are:
+            # a threshold tuned against the raw estimator is a threshold for a
+            # model nobody runs.
             gate_probabilities: np.ndarray = np.asarray(
-                gate_estimator.predict_proba(validation_features)
+                shipped_gate.predict_proba(validation_features)
             )[:, -1]
             gate_sweep = ml_metrics.gate_threshold_sweep(is_trade_validation, gate_probabilities)
             recommended_gate_threshold = EntryModel._select_recommended_threshold(
@@ -910,23 +1028,25 @@ class DirectionModel(BaseModelHead):
 
             trade_mask_validation: pd.Series = is_trade_validation == 1
             direction_validation_features: pd.DataFrame = validation_features[trade_mask_validation]
-            if direction_estimator is not None and not direction_validation_features.empty:
+            if shipped_direction is not None and not direction_validation_features.empty:
                 long_given_trade_validation: np.ndarray = np.asarray(
-                    direction_estimator.predict_proba(direction_validation_features)
+                    shipped_direction.predict_proba(direction_validation_features)
                 )[:, -1]
                 is_long_validation: pd.Series = (
                     validation_target[trade_mask_validation] == long_index
                 ).astype(int)
-                direction_sweep = ml_metrics.direction_threshold_sweep(
+                direction_sweep = ml_metrics.direction_confidence_sweep(
                     is_long_validation, long_given_trade_validation
                 )
                 recommended_direction_threshold = EntryModel._select_recommended_threshold(
                     direction_sweep, self._settings.decision.min_direction_given_trade_confidence
                 )
-
-            calibration, self._model, production_calibration = self._calibrate_cascade(
-                gate_estimator, direction_estimator, validation_features, validation_target
-            )
+                # P4: an isotonic calibrator handed a score confined to a narrow
+                # band will stretch that band across the whole [0, 1] range,
+                # turning a model with no discriminative power into one that
+                # reports high confidence.  The span is recorded so that failure
+                # mode is visible rather than inferred from a sweep table.
+                direction_span = float(np.ptp(long_given_trade_validation))
 
         self._metadata = {
             "trained_at": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
@@ -934,12 +1054,31 @@ class DirectionModel(BaseModelHead):
             "rows": int(len(train_index)),
             "validation_rows": int(len(validation_index)),
             "classes": list(LABEL_ORDER),
-            "distribution": dataset.class_distribution(),
+            # Per-split, not whole-dataset: printing the pooled distribution
+            # beside a train-only row count reads as the training set's balance
+            # and hides any label shift between the splits.
+            "distribution": dataset.class_distribution_by_split(
+                split.train_index, split.validation_index, split.test_index
+            ),
             "hyperparameters": _hyperparameter_snapshot(self._config),
             "metrics": full_metrics,
+            # Which estimator the numbers above describe.  `save()` refuses to
+            # write an artifact whose metrics were measured on anything other
+            # than the model being written - see `_metrics_fingerprint`.
+            "metrics_source": self._metrics_fingerprint(),
+            "metrics_provenance": (
+                "scored through the shipped (post-calibration) cascade on the "
+                "validation block; that block also drove early stopping, "
+                "threshold selection and calibration fitting"
+            ),
+            "metrics_raw_uncalibrated": metrics_raw or {
+                "status": "NOT_AVAILABLE",
+                "reason": "no calibration was applied, so raw and production metrics are identical",
+            },
             "feature_importance": importance,
             "calibration": calibration,
             "production_calibration": production_calibration,
+            "direction_probability_span": direction_span,
             "per_symbol": per_symbol,
             "architecture": "two_stage_cascade",
             "gate_threshold_sweep": gate_sweep,
@@ -1172,7 +1311,35 @@ class DirectionModel(BaseModelHead):
                 direction_calibration = ml_metrics.calibrate_classifier(
                     direction_estimator, d_calib_x, d_calib_y, d_eval_x, d_eval_y, n_classes=2
                 )
-                if direction_calibration.get("status") == "AVAILABLE" and direction_calibration.get(
+                # Isotonic regression is a free-form monotone step function: hand
+                # it a score confined to a narrow band and it will stretch that
+                # band across the full [0, 1] range.  Applied to a stage with no
+                # discriminative power that does not calibrate anything, it
+                # manufactures confidence - which is how signals displayed at
+                # "88% confidence" were the isotonic image of raw probabilities
+                # that never left a ten-point window.  Refuse, and say so.
+                raw_scores: np.ndarray = np.asarray(
+                    direction_estimator.predict_proba(direction_features)
+                )[:, -1]
+                raw_span: float = float(np.ptp(raw_scores))
+                direction_calibration["raw_probability_span"] = raw_span
+                direction_calibration["minimum_probability_span"] = _MIN_CALIBRATABLE_SPAN
+                if raw_span < _MIN_CALIBRATABLE_SPAN:
+                    direction_calibration["improved"] = False
+                    direction_calibration["recommended_for_production"] = False
+                    direction_calibration["degenerate_score"] = True
+                    direction_calibration["note"] = (
+                        f"stage-2 output spans only {raw_span:.3f} of probability; calibrating a "
+                        "score with no usable range amplifies noise into displayed confidence "
+                        "rather than correcting miscalibration, so the raw estimator is kept"
+                    )
+                    _LOGGER.error(
+                        "%s: long/short stage spans only %.3f - refusing to calibrate a "
+                        "degenerate score",
+                        self.name,
+                        raw_span,
+                    )
+                elif direction_calibration.get("status") == "AVAILABLE" and direction_calibration.get(
                     "improved"
                 ):
                     calibrated_direction: Any = self._fit_production_calibrator(
@@ -1265,10 +1432,23 @@ class DirectionModel(BaseModelHead):
         except ValueError:  # pragma: no cover - degenerate eval slice
             calibrated_logloss = float("nan")
 
-        improved: bool = calibrated_logloss < raw_logloss
+        # Same effect-size bar the per-stage calibration uses - see
+        # ml_metrics.MIN_CALIBRATION_RELATIVE_GAIN for why a strict inequality
+        # is not a decision procedure.
+        relative_gain: float = (
+            (raw_logloss - calibrated_logloss) / raw_logloss
+            if raw_logloss and raw_logloss == raw_logloss and raw_logloss > 0.0
+            else float("nan")
+        )
+        improved: bool = bool(
+            relative_gain == relative_gain
+            and relative_gain > ml_metrics.MIN_CALIBRATION_RELATIVE_GAIN
+        )
         return {
             "status": "AVAILABLE",
             "method": "isotonic_per_class",
+            "log_loss_relative_gain": relative_gain,
+            "minimum_relative_gain": ml_metrics.MIN_CALIBRATION_RELATIVE_GAIN,
             "calibration_rows": int(len(calib_probs)),
             "eval_rows": int(len(eval_probs)),
             "brier_score_raw": raw_brier,
@@ -1579,23 +1759,34 @@ class EntryModel(BaseModelHead):
         return full_metrics
 
     @staticmethod
-    def _select_recommended_threshold(sweep: list[dict[str, Any]], floor: float) -> float:
-        """Pick the best threshold from the sweep by F-beta=0.5 (precision
-        weighted 2x over recall), restricted to thresholds carrying enough
-        signals to trust (``meets_min_sample_size``).
+    def _select_recommended_threshold(
+        sweep: list[dict[str, Any]],
+        configured_floor: float,
+        *,
+        min_f_beta_gain: float = 0.02,
+    ) -> float:
+        """Pick a threshold by F-beta=0.5 (precision weighted 2x over recall),
+        never returning below ``configured_floor``.
 
         A plain F1 pick tends to land on the loosest threshold in the sweep
         (highest recall), which is the wrong bias for an entry filter: a
-        false-positive entry commits real capital, while a missed true
-        positive only costs a smaller position count later. Falls back to
-        ``floor`` (the configured default) when nothing in the sweep
-        qualifies, so a sparse validation slice can never hand back a
-        threshold nobody could act on.
+        false-positive entry commits real capital, while a missed true positive
+        only costs a smaller position count later.
+
+        Two guards matter as much as the objective:
+
+        * ``configured_floor`` is a *floor*, not a fallback.  It used to be
+          consulted only when the sweep was empty, so the tuner could - and did -
+          hand back a value below the operator's configured minimum, silently
+          loosening a risk control.
+        * When the best row barely beats the loosest one, the sweep has no knee
+          and the model is not discriminating.  Returning the floor there is
+          honest; returning the argmax dresses up noise as a recommendation.
         """
         beta_squared: float = 0.25  # beta = 0.5
         candidates: list[dict[str, Any]] = [row for row in sweep if row.get("meets_min_sample_size")]
         if not candidates:
-            return floor
+            return configured_floor
 
         def f_beta(row: dict[str, Any]) -> float:
             precision: float = float(row.get("precision", 0.0) or 0.0)
@@ -1606,7 +1797,10 @@ class EntryModel(BaseModelHead):
             return (1.0 + beta_squared) * precision * recall / denominator
 
         best: dict[str, Any] = max(candidates, key=f_beta)
-        return float(best["threshold"])
+        loosest: dict[str, Any] = min(candidates, key=lambda row: float(row.get("threshold", 0.0)))
+        if f_beta(best) - f_beta(loosest) < min_f_beta_gain:
+            return configured_floor
+        return max(float(best["threshold"]), configured_floor)
 
     def predict(
         self,
@@ -1630,6 +1824,7 @@ class EntryModel(BaseModelHead):
         return EntryPrediction(
             probability=clamp(probability, 0.0, 1.0),
             should_enter=probability >= cutoff,
+            threshold=float(cutoff),
             source=ModelSource.TRAINED,
             reason=f"p(clean entry)={probability:.3f} vs threshold {cutoff:.3f}",
         )
@@ -1775,6 +1970,22 @@ class ExitModel(BaseModelHead):
 
         self._model = estimators
         self._feature_columns = dataset.feature_columns
+        override_rates: dict[str, Any] = self._rail_override_rates(validation_features, estimators)
+        # A head whose prediction is discarded by a rail on almost every bar is
+        # not in the loop, however good its R^2 looks.  Since the stop floor was
+        # widened to the labelled barrier (`labels.sl_atr_multiple` x ATR), the
+        # stop regressor is out-competed by that floor on most rows, and the
+        # take-profit is then clamped to a band derived from it.  Reporting the
+        # rate makes "this metric describes an output nobody consumes" visible.
+        for column, rate in override_rates.items():
+            if column in full_metrics:
+                full_metrics[column]["rail_override_rate"] = rate
+                if rate is not None and rate > 0.5:
+                    full_metrics[column]["beats_rule_based_baseline_note"] = (
+                        f"the model's prediction is overridden by a hard rail on {rate:.0%} of "
+                        "validation rows, so this comparison describes an output that rarely "
+                        "reaches the exchange"
+                    )
         self._metadata = {
             "trained_at": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
             "git_commit": git_commit_hash(),
@@ -1782,6 +1993,8 @@ class ExitModel(BaseModelHead):
             "validation_rows": int(len(validation_index)),
             "hyperparameters": _hyperparameter_snapshot(self._config),
             "metrics": full_metrics,
+            "metrics_source": self._metrics_fingerprint(),
+            "rail_override_rates": override_rates,
             "feature_importance": importance,
             "split": self._filtered_split_period_metadata(
                 usable_timestamps, train_index, validation_index, test_index, boundaries
@@ -1792,6 +2005,48 @@ class ExitModel(BaseModelHead):
         }
         _LOGGER.info("Exit model trained: %s", headline)
         return full_metrics
+
+    def _rail_override_rates(
+        self, validation_features: pd.DataFrame, estimators: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Share of validation rows where ``_assemble``'s rails beat the model.
+
+        Measured against the same rails inference applies, so the answer is
+        "how often does this head actually decide the geometry", not "how good
+        is its regression".  Those are different questions and only the first
+        one tells you whether the head is worth training.
+        """
+        if validation_features.empty or not estimators:
+            return {column: None for column in self._TARGETS}
+
+        atr_pct: np.ndarray = (
+            validation_features.get("atr_pct", pd.Series(0.0, index=validation_features.index))
+            .fillna(0.0)
+            .to_numpy(dtype=np.float64)
+        )
+        floor: np.ndarray = atr_pct * self._settings.labels.sl_atr_multiple
+        rates: dict[str, Any] = {}
+
+        raw_sl: np.ndarray = np.asarray(estimators["target_sl_pct"].predict(validation_features))
+        sl_overridden: np.ndarray = (floor > 0.0) & (floor > raw_sl)
+        rates["target_sl_pct"] = float(np.mean(sl_overridden))
+
+        effective_sl: np.ndarray = np.clip(
+            np.where(floor > 0.0, np.maximum(raw_sl, floor), raw_sl), _MIN_SL_PCT, _MAX_SL_PCT
+        )
+        raw_tp: np.ndarray = np.asarray(estimators["target_tp_pct"].predict(validation_features))
+        clamped_tp: np.ndarray = np.clip(
+            np.clip(raw_tp, _MIN_TP_PCT, _MAX_TP_PCT),
+            effective_sl * 1.1,
+            effective_sl * _MAX_REWARD_RISK,
+        )
+        rates["target_tp_pct"] = float(np.mean(~np.isclose(clamped_tp, raw_tp)))
+
+        # The trailing target is a fixed multiple of the take-profit target, so
+        # its regressor cannot express anything the TP head does not already
+        # say - see `_assemble`, which now derives it directly.
+        rates["target_trailing_pct"] = 1.0
+        return rates
 
     def _baseline_predictions(self, features: pd.DataFrame) -> dict[str, np.ndarray]:
         """Vectorised twin of :meth:`_heuristic`'s ATR-scaled rule, for comparison.
@@ -2015,9 +2270,19 @@ class RiskModel(BaseModelHead):
         full_metrics: dict[str, Any] = {}
         importance: dict[str, Any] = {"status": "NOT_AVAILABLE", "reason": "no validation rows"}
         if len(validation_features) > 0:
-            predictions: np.ndarray = estimator.predict(validation_features)
+            raw_predictions: np.ndarray = estimator.predict(validation_features)
+            # `predict()` clamps the opportunity score into [0, 1] before anything
+            # downstream sees it, so measuring the bare estimator characterises a
+            # function the system never executes - which is how a head documented
+            # as bounded came to report a maximum above 1.0.  The clip rate is
+            # kept because a regressor that is constantly being clamped is itself
+            # a finding.
+            predictions: np.ndarray = np.clip(raw_predictions, 0.0, 1.0)
             full_metrics = ml_metrics.regression_metrics(
                 target.iloc[validation_index].to_numpy(), predictions
+            )
+            full_metrics["clipped_prediction_rate"] = float(
+                np.mean((raw_predictions < 0.0) | (raw_predictions > 1.0))
             )
             importance = ml_metrics.feature_importance(estimator, dataset.feature_columns)
 
@@ -2102,6 +2367,11 @@ class RiskModel(BaseModelHead):
                 ),
                 source=source,
             )
+        # Defence in depth, not a live gate: DecisionEngine.evaluate's R1b tests
+        # the same quantity against the same threshold and returns first, so this
+        # branch is unreachable through the normal cascade. It stays because
+        # `infer_sync` is callable directly (the panel's audit tooling does so)
+        # and a head that sizes capital should not assume a caller ran R1b.
         if direction_confidence < decision.min_direction_given_trade_confidence:
             return RiskAllocation(
                 leverage=0,

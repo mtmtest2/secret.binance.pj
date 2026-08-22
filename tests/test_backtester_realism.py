@@ -134,7 +134,7 @@ class TestBookCloseAppliesExitSlippageFeeAndFunding:
         assert delta == pytest.approx(expected_delta)
         assert position.realized_pnl == pytest.approx(expected_delta)
 
-    def test_liquidation_close_uses_the_raw_price_with_no_slippage_and_caps_the_loss(self) -> None:
+    def test_liquidation_close_applies_slippage_and_still_caps_the_loss(self) -> None:
         settings = Settings(execution={"slippage_bps": 10.0, "taker_fee": 0.0004})
         backtester = _backtester(settings)
         signal = _signal(TradeAction.LONG, reference_price=100.0)
@@ -150,10 +150,16 @@ class TestBookCloseAppliesExitSlippageFeeAndFunding:
         liquidation_price = 90.0
         delta = backtester._book_close(position, liquidation_price, CloseReason.LIQUIDATION, timestamp=1)
 
-        # Liquidation fills at the raw liquidation price - no slippage benefit
-        # or penalty is modelled on a forced exit.
-        assert position.exit_price == pytest.approx(liquidation_price)
-        # The loss is bounded at the committed margin, never more.
+        # A forced close during the move that triggered it is the fill most
+        # likely to be *worse* than its trigger price. Exempting liquidation
+        # from slippage - as this path used to - modelled it as the single best
+        # fill in the system, understating tail risk on the trades that matter
+        # most. It now pays the same penalty as any other adverse exit.
+        expected_exit_price = liquidation_price * (1.0 - 10.0 / 10_000.0)
+        assert position.exit_price == pytest.approx(expected_exit_price)
+        assert position.exit_price < liquidation_price
+        # The loss is still bounded at the committed margin, never more - the
+        # isolated-margin cap is applied after slippage, not instead of it.
         assert delta >= -position.margin - 1e-9
 
     def test_zero_cost_config_reproduces_pure_price_pnl(self) -> None:

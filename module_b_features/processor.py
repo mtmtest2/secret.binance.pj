@@ -39,6 +39,21 @@ _LOGGER = get_logger(__name__)
 #: Columns carried alongside the features for bookkeeping / backtesting.
 _META_COLUMNS: Final[tuple[str, ...]] = ("timestamp", "open", "high", "low", "close", "volume")
 
+
+def _total_variation_distance(left: dict[str, int], right: dict[str, int]) -> float:
+    """Total-variation distance between two label count dictionaries.
+
+    Zero when the two splits carry the same class proportions, one when they
+    share no mass at all.  Missing classes count as zero on their side.
+    """
+    left_total, right_total = sum(left.values()), sum(right.values())
+    if left_total <= 0 or right_total <= 0:
+        return float("nan")
+    labels = set(left) | set(right)
+    return 0.5 * sum(
+        abs(left.get(label, 0) / left_total - right.get(label, 0) / right_total) for label in labels
+    )
+
 #: Average Gregorian month length - used only to translate the "N months"
 #: split configuration into millisecond boundaries. Precise to well under an
 #: hour over a 24-month window, which is immaterial next to the multi-hour
@@ -231,10 +246,41 @@ class ProcessedDataset:
         """``True`` when no usable training row survived cleaning."""
         return self.features.empty
 
-    def class_distribution(self) -> dict[str, int]:
-        """Row count per direction class, for logging and sanity checks."""
-        counts: dict[str, int] = self.direction_target.value_counts().to_dict()
+    def class_distribution(self, index: np.ndarray | None = None) -> dict[str, int]:
+        """Row count per direction class, over the whole set or one split.
+
+        Reporting the whole-dataset distribution beside a train-only row count
+        reads as "here is the training set and its balance", and hides any
+        label shift between the splits.  Passing a split's positional index
+        makes the two agree.
+        """
+        target: pd.Series = (
+            self.direction_target if index is None else self.direction_target.iloc[index]
+        )
+        counts: dict[str, int] = target.value_counts().to_dict()
         return {str(name): int(count) for name, count in counts.items()}
+
+    def class_distribution_by_split(
+        self, train: np.ndarray, validation: np.ndarray, test: np.ndarray
+    ) -> dict[str, Any]:
+        """Per-split label counts plus the train->validation shift.
+
+        ``label_distribution_shift`` is the total-variation distance between the
+        train and validation class distributions.  A large value is a first-order
+        explanation for a directional model behaving differently in validation
+        than it did in training, and it should not require the reader to
+        subtract two numbers by hand to notice it.
+        """
+        blocks: dict[str, Any] = {
+            "train": self.class_distribution(train),
+            "validation": self.class_distribution(validation),
+            "test": self.class_distribution(test),
+            "all": self.class_distribution(),
+        }
+        blocks["label_distribution_shift"] = _total_variation_distance(
+            blocks["train"], blocks["validation"]
+        )
+        return blocks
 
     def _timestamps(self) -> np.ndarray:
         if "timestamp" not in self.metadata.columns:

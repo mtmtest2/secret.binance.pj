@@ -47,14 +47,57 @@ from module_b_features.features import (
 from module_b_features.processor import InferencePayload
 from module_c_ml.decision_engine import DecisionContext, DecisionEngine
 from module_c_ml.ml_models import MLSubsystem
-from module_c_ml.schemas import DecisionResult, TradeAction, TradeSignal
+from module_c_ml.schemas import DecisionResult, ModelInferenceResult, TradeAction, TradeSignal
 from module_e_execution.models import CloseReason, Position, PositionStatus
+from module_e_execution.risk_guard import RiskLadder
 
 _LOGGER = get_logger(__name__)
 
 #: 5-minute bars in a 365-day year - the annualisation factor for Sharpe.
 _BARS_PER_YEAR: Final[int] = 365 * 24 * 12
 _MS_PER_HOUR: Final[int] = 3_600_000
+
+#: Feature-snapshot keys the Decision Engine reads, with the neutral value used
+#: when a bar does not carry one. Declared once rather than spelled out at the
+#: call site: `atr_pct` was missing from the backtester's hand-written dict, so
+#: R5's stop_vs_labelled_atr telemetry - added specifically to stop a geometry
+#: mismatch from being reintroduced silently - evaluated to NaN on every
+#: backtest bar, in the one environment where it would first have been exercised.
+_SNAPSHOT_KEYS: Final[dict[str, float]] = {
+    "hmm_regime": -1.0,
+    "garch_volatility": 0.0,
+    "garch_vol_rank": 0.5,
+    "kama_slope": 0.0,
+    "fdi": 1.5,
+    "atr": 0.0,
+    "atr_pct": 0.0,
+}
+
+
+def _accumulate_rule_counts(
+    decision: "DecisionResult",
+    independent: dict[str, int],
+    evaluations: dict[str, dict[str, int]],
+) -> None:
+    """Count every rule that was evaluated and every one that objected.
+
+    `rejection_breakdown` records only the rule that stopped a signal, because
+    `evaluate` returns on the first failure. That makes a late rule look
+    harmless when it is merely rarely reached. Each DecisionResult already
+    carries the full `checks` list, so the independent view costs nothing but
+    the bookkeeping.
+    """
+    for check in decision.checks or []:
+        rule = str(check.get("rule", ""))
+        if not rule:
+            continue
+        counts = evaluations.setdefault(rule, {"reached": 0, "passed": 0})
+        counts["reached"] += 1
+        if check.get("passed"):
+            counts["passed"] += 1
+        else:
+            independent[rule] = independent.get(rule, 0) + 1
+
 
 
 @dataclass(slots=True)
@@ -75,12 +118,32 @@ class BacktestReport:
     #: count), so "why were 99.9% of signals rejected" has a real, measured
     #: answer instead of a guess - see ``module_c_ml.decision_engine.Rule``.
     rejection_breakdown: dict[str, int] = field(default_factory=dict)
+    #: How often each rule would have objected *on its own*, independent of
+    #: which rule happened to fire first. ``rejection_breakdown`` records only
+    #: the rule that stopped a signal, so a rule sitting late in the cascade
+    #: reads as harmless purely because it is rarely reached: the audited run
+    #: showed R4 rejecting 568 signals under live thresholds and 1,268,257 under
+    #: looser ones, a factor of 2,233 in the *opposite* direction to intuition.
+    #: This breakdown is the one that supports tuning.
+    rejection_breakdown_independent: dict[str, int] = field(default_factory=dict)
+    #: ``rule -> {"reached": n, "passed": n}``: a rule's pass rate conditional on
+    #: being evaluated at all.
+    rule_evaluation_counts: dict[str, dict[str, int]] = field(default_factory=dict)
     #: Set by ``TradingSystem._run_validation_backtest`` (never by ``run()``
     #: itself, which has no notion of a train/validation split) to disclose
     #: what fraction of this replay window is genuinely out-of-sample versus
     #: overlapping the model's own training data. ``None`` for a backtest run
     #: outside that diagnostic path (e.g. the plain CLI ``backtest`` command).
     oos_disclosure: dict[str, Any] | None = field(default=None)
+    #: Field-by-field difference from the live DecisionSettings, set on the
+    #: relaxed diagnostic replay so any unintended divergence is visible in the
+    #: report rather than only in the source.
+    settings_delta: dict[str, Any] | None = field(default=None)
+    #: Risk Guard state transitions during the replay, with the equity and
+    #: reason that triggered each. A run that would have halted is a result.
+    risk_guard_transitions: list[dict[str, Any]] = field(default_factory=list)
+    #: Set when the Risk Guard halted the replay and never released it.
+    halted_at: str | None = field(default=None)
 
     def summary(self) -> str:
         """Multi-line, human-readable report for logs and the CLI."""
@@ -130,7 +193,12 @@ class BacktestReport:
             "signals_generated": self.signals_generated,
             "signals_rejected": self.signals_rejected,
             "rejection_breakdown": self.rejection_breakdown,
+            "rejection_breakdown_independent": self.rejection_breakdown_independent,
+            "rule_evaluation_counts": self.rule_evaluation_counts,
             "oos_disclosure": self.oos_disclosure,
+            "settings_delta": self.settings_delta,
+            "risk_guard_transitions": self.risk_guard_transitions,
+            "halted_at": self.halted_at,
             "trades": self.trades[-500:],
             "equity_curve": self.equity_curve[-2_000:],
         }
@@ -165,14 +233,28 @@ class Backtester:
         max_candles: int | None = None,
         initial_equity: float | None = None,
         warmup_bars: int | None = None,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
     ) -> BacktestReport:
         """Run a full backtest across the requested universe.
 
         Args:
             symbols: Universe (defaults to the configured one).
-            max_candles: History depth per symbol.
+            max_candles: History depth per symbol to load.
             initial_equity: Starting virtual equity.
             warmup_bars: Bars skipped at the start so slow features are warm.
+                Ignored when ``start_ms`` is given - the explicit window already
+                says where the replay begins, and applying both trims the front
+                of the window twice.
+            start_ms: Replay only bars at or after this timestamp.
+            end_ms: Replay only bars at or before this timestamp.
+
+        ``start_ms``/``end_ms`` pin the replay to a known window.  Without them
+        the window is "the most recent N bars", which is a moving target while
+        the ingestion pipeline keeps writing: two replays launched minutes apart
+        cover different periods, which is how a strict and a relaxed pass
+        described as "the same out-of-sample window" ended up hours apart at
+        both ends with different signal counts.
 
         Returns:
             A :class:`BacktestReport` with the standard quantitative metrics.
@@ -190,8 +272,12 @@ class Backtester:
             for symbol in featured
         }
 
-        skip: int = warmup_bars if warmup_bars is not None else 0
-        return await asyncio.to_thread(self._simulate, featured, funding, equity, skip)
+        # `_prepare` has already dropped un-warmed rows via the REQUIRED feature
+        # gate, so the explicit-window path needs no further trim.
+        skip: int = 0 if start_ms is not None else (warmup_bars if warmup_bars is not None else 0)
+        return await asyncio.to_thread(
+            self._simulate, featured, funding, equity, skip, start_ms, end_ms
+        )
 
     # ------------------------------------------------------------------
     # Data preparation
@@ -238,11 +324,17 @@ class Backtester:
         funding: dict[str, pd.DataFrame],
         initial_equity: float,
         warmup_bars: int,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
     ) -> BacktestReport:
         """Bar-by-bar replay.  Runs off the event loop (called via ``to_thread``)."""
         timeline: list[int] = sorted(
             {int(value) for frame in featured.values() for value in frame["timestamp"]}
         )
+        if start_ms is not None:
+            timeline = [ts for ts in timeline if ts >= start_ms]
+        if end_ms is not None:
+            timeline = [ts for ts in timeline if ts <= end_ms]
         if warmup_bars > 0:
             timeline = timeline[warmup_bars:]
         if not timeline:
@@ -265,23 +357,15 @@ class Backtester:
         generated: int = 0
         rejected: int = 0
         rejection_breakdown: dict[str, int] = {}
+        rejection_breakdown_independent: dict[str, int] = {}
+        rule_evaluation_counts: dict[str, dict[str, int]] = {}
+        closed_pnl_this_bar: list[float] = []
+        report_transitions: list[dict[str, Any]] = []
+        halted_at: str | None = None
+        guard: RiskLadder = RiskLadder(self._settings)
 
         for timestamp in timeline:
-            # --- 1. Resolve barriers on open positions with THIS bar ----------
-            for symbol in list(positions):
-                row: pd.Series | None = indexed.get(symbol, {}).get(timestamp)
-                if row is None:
-                    continue
-                position: Position = positions[symbol]
-                self._accrue_funding(position, row, funding_lookup.get(symbol, {}), timestamp)
-                resolution: tuple[CloseReason, float] | None = self._resolve_bar(position, row)
-                if resolution is not None:
-                    reason, price = resolution
-                    balance += self._book_close(position, price, reason, timestamp)
-                    closed.append(position.to_row() | {"closed_ts": timestamp})
-                    positions.pop(symbol, None)
-
-            # --- 2. Fill signals raised on the PREVIOUS bar -------------------
+            # --- 1. Fill signals raised on the PREVIOUS bar, at THIS bar's open -
             # A signal is good for exactly one bar: if it cannot be filled on the
             # very next open it is dropped rather than chased at a worse price.
             equity: float = balance + self._unrealized(positions, indexed, timestamp)
@@ -298,31 +382,74 @@ class Backtester:
                 positions[signal.symbol] = opened
             pending = []
 
-            # --- 3. Generate new signals from THIS bar's close ----------------
+            # --- 2. Resolve barriers against THIS bar, newly-filled included ---
+            # Filling before resolving is the whole point: a position opened at
+            # this bar's open is exposed to this bar's high and low, and must be
+            # tested against them.  Resolving first gave every new position a
+            # free bar of adverse movement - a systematic optimism landing
+            # precisely on the trades that would otherwise stop out immediately,
+            # which flatters win rate and average loss at the same time.
+            for symbol in list(positions):
+                row: pd.Series | None = indexed.get(symbol, {}).get(timestamp)
+                if row is None:
+                    continue
+                position: Position = positions[symbol]
+                self._accrue_funding(position, row, funding_lookup.get(symbol, {}), timestamp)
+                resolution: tuple[CloseReason, float] | None = self._resolve_bar(position, row)
+                if resolution is not None:
+                    reason, price = resolution
+                    realised = self._book_close(position, price, reason, timestamp)
+                    balance += realised
+                    closed.append(position.to_row() | {"closed_ts": timestamp})
+                    positions.pop(symbol, None)
+                    closed_pnl_this_bar.append(realised)
+
+            # --- 3. Risk Guard: the policy a live deployment would run under ---
             equity = balance + self._unrealized(positions, indexed, timestamp)
+            guard_state, size_multiplier = self._guard_state(
+                guard, equity, closed_pnl_this_bar, timestamp, report_transitions
+            )
+            closed_pnl_this_bar = []
+            if guard_state == "RED" and halted_at is None:
+                halted_at = ms_to_datetime(timestamp).isoformat()
+
+            # --- 4. Generate new signals from THIS bar's close ------------------
             context = DecisionContext(
-                risk_guard_state="GREEN",
+                risk_guard_state=guard_state,
                 trading_enabled=True,
                 trading_mode="backtest",
                 open_positions=len(positions),
                 open_symbols=frozenset(positions),
+                positions_per_symbol={symbol: 1 for symbol in positions},
                 equity=equity,
-                size_multiplier=1.0,
+                size_multiplier=size_multiplier,
             )
+            # Every eligible symbol is scored, then the batch is ranked by
+            # directional confidence and filled through the *same*
+            # `evaluate_many` the live path uses.  Iterating a dict and breaking
+            # at the concurrency cap allocated slots by insertion order, so the
+            # backtest measured a selection policy nobody runs - and stopped
+            # counting candidates the moment the book filled, making
+            # `signals_generated` a function of how fast positions opened rather
+            # than of how many opportunities existed.
+            batch: list[ModelInferenceResult] = []
             for symbol, rows in indexed.items():
                 row = rows.get(timestamp)
                 if row is None or symbol in positions:
                     continue
-                if len(positions) + len(pending) >= self._settings.decision.max_concurrent_positions:
-                    break
-                decision: DecisionResult = self._decide(symbol, row, context)
-                generated += 1
-                if decision.is_executable and decision.signal is not None:
-                    pending.append(decision.signal)
-                else:
-                    rejected += 1
-                    rejection_breakdown[decision.rule_triggered] = (
-                        rejection_breakdown.get(decision.rule_triggered, 0) + 1
+                batch.append(self._infer(symbol, row))
+            if batch:
+                generated += len(batch)
+                for decision in self._decisions.evaluate_many(batch, context):
+                    if decision.is_executable and decision.signal is not None:
+                        pending.append(decision.signal)
+                    else:
+                        rejected += 1
+                        rejection_breakdown[decision.rule_triggered] = (
+                            rejection_breakdown.get(decision.rule_triggered, 0) + 1
+                        )
+                    _accumulate_rule_counts(
+                        decision, rejection_breakdown_independent, rule_evaluation_counts
                     )
 
             # --- 4. Mark to market -------------------------------------------
@@ -364,6 +491,10 @@ class Backtester:
             signals_generated=generated,
             signals_rejected=rejected,
             rejection_breakdown=rejection_breakdown,
+            rejection_breakdown_independent=rejection_breakdown_independent,
+            rule_evaluation_counts=rule_evaluation_counts,
+            risk_guard_transitions=report_transitions,
+            halted_at=halted_at,
         )
         report.metrics = self._compute_metrics(report)
         return report
@@ -371,6 +502,45 @@ class Backtester:
     # ------------------------------------------------------------------
     # Bar mechanics
     # ------------------------------------------------------------------
+    def _guard_state(
+        self,
+        guard: RiskLadder,
+        equity: float,
+        realised: Sequence[float],
+        timestamp: int,
+        transitions: list[dict[str, Any]],
+    ) -> tuple[str, float]:
+        """Advance the risk ladder and record any state change."""
+        state, reason = guard.observe(
+            equity=equity,
+            realised_pnls=realised,
+            day=ms_to_datetime(timestamp).date(),
+        )
+        if reason:
+            transitions.append(
+                {
+                    "timestamp": timestamp,
+                    "at": ms_to_datetime(timestamp).isoformat(),
+                    "state": state.value,
+                    "equity": equity,
+                    "reason": reason,
+                }
+            )
+            _LOGGER.info("Backtest risk guard -> %s at %s: %s", state.value, timestamp, reason)
+        return state.value, guard.size_multiplier
+
+    def _infer(self, symbol: str, row: pd.Series) -> ModelInferenceResult:
+        """Run all four heads on one bar."""
+        features: pd.DataFrame = row[list(FEATURE_COLUMNS)].to_frame().T.astype(float)
+        payload = InferencePayload(
+            symbol=symbol,
+            timestamp=int(row["timestamp"]),
+            close=float(row["close"]),
+            features=features,
+            snapshot={key: float(row.get(key, default)) for key, default in _SNAPSHOT_KEYS.items()},
+        )
+        return self._ml.infer_sync(payload)
+
     def _decide(
         self,
         symbol: str,
@@ -378,23 +548,7 @@ class Backtester:
         context: DecisionContext,
     ) -> DecisionResult:
         """Run inference plus the decision cascade for one bar."""
-        features: pd.DataFrame = row[list(FEATURE_COLUMNS)].to_frame().T.astype(float)
-        payload = InferencePayload(
-            symbol=symbol,
-            timestamp=int(row["timestamp"]),
-            close=float(row["close"]),
-            features=features,
-            snapshot={
-                "hmm_regime": float(row.get("hmm_regime", -1.0)),
-                "garch_volatility": float(row.get("garch_volatility", 0.0)),
-                "garch_vol_rank": float(row.get("garch_vol_rank", 0.5)),
-                "kama_slope": float(row.get("kama_slope", 0.0)),
-                "fdi": float(row.get("fdi", 1.5)),
-                "atr": float(row.get("atr", 0.0)),
-            },
-        )
-        inference = self._ml.infer_sync(payload)
-        return self._decisions.evaluate(inference, context)
+        return self._decisions.evaluate(self._infer(symbol, row), context)
 
     def _fill(self, signal: TradeSignal, row: pd.Series, equity: float) -> Position | None:
         """Fill a pending signal at this bar's **open**, with slippage.
@@ -430,19 +584,29 @@ class Backtester:
         )
         # The barriers were computed off the decision-bar close; re-anchor them to
         # the actual fill so the geometry the models asked for is preserved.
+        # Re-anchored from the *model's* activation distance, not a hardcoded
+        # half of the take-profit. `_assemble` clamps trailing activation into
+        # [TP*0.25, TP*0.95] and the live path arms against that value, so
+        # substituting 0.5*TP here made the backtest trail on a different rule
+        # from production - on a quarter of all exits.
+        trailing_pct: float = signal.trailing_activation_pct
         if signal.action is TradeAction.LONG:
             position.take_profit = fill_price * (1.0 + signal.take_profit_pct)
             position.stop_loss = fill_price * (1.0 - signal.stop_loss_pct)
-            position.trailing_trigger = fill_price * (
-                1.0 + signal.take_profit_pct * 0.5
-            )
+            position.trailing_trigger = fill_price * (1.0 + trailing_pct)
         else:
             position.take_profit = fill_price * (1.0 - signal.take_profit_pct)
             position.stop_loss = fill_price * (1.0 + signal.stop_loss_pct)
-            position.trailing_trigger = fill_price * (1.0 - signal.take_profit_pct * 0.5)
+            position.trailing_trigger = fill_price * (1.0 - trailing_pct)
 
         position.fees_paid = fill_price * quantity * self._config.taker_fee
         position.last_funding_ms = int(row["timestamp"])
+        # Simulated time, not wall clock. `Position.opened_at` defaults to
+        # datetime.now(), while `_book_close` stamps `closed_at` from the bar -
+        # so every backtested trade recorded a close *before* its open and a
+        # negative holding period, making any duration or time-of-day analysis
+        # (and the exported trades CSV) meaningless.
+        position.opened_at = ms_to_datetime(int(row["timestamp"]))
         return position
 
     def _resolve_bar(self, position: Position, row: pd.Series) -> tuple[CloseReason, float] | None:
@@ -552,10 +716,11 @@ class Backtester:
         ``gross - exit_fee - funding``.
         """
         penalty: float = self._config.slippage_bps / 10_000.0
-        if reason is CloseReason.LIQUIDATION:
-            exit_price: float = raw_price
-        elif position.is_long:
-            exit_price = raw_price * (1.0 - penalty)
+        # Liquidation used to be exempt from slippage, which has it backwards:
+        # a forced close during the move that triggered it is the fill most
+        # likely to be worse than its trigger price, not better.
+        if position.is_long:
+            exit_price: float = raw_price * (1.0 - penalty)
         else:
             exit_price = raw_price * (1.0 + penalty)
 
@@ -643,6 +808,22 @@ class Backtester:
             "max_drawdown_pct": max_drawdown,
             "sharpe_ratio": self._sharpe(equity_values),
             "sortino_ratio": self._sortino(equity_values),
+            # The bar-based ratios above annualise ~105k near-degenerate,
+            # heavily autocorrelated per-bar observations per year as if they
+            # were independent draws, when the effective sample is the trade
+            # count. These report the same thing on the sample that actually
+            # exists, so a headline Sharpe cannot be read without its n.
+            "trades_per_year": float(pnls.size / years) if years > 0.0 else 0.0,
+            "per_trade_sharpe": (
+                float(pnls.mean() / pnls.std(ddof=1)) if pnls.size > 1 and pnls.std(ddof=1) > 0 else 0.0
+            ),
+            "annualised_sharpe_from_trades": (
+                float(pnls.mean() / pnls.std(ddof=1) * math.sqrt(pnls.size / years))
+                if pnls.size > 1 and pnls.std(ddof=1) > 0 and years > 0.0
+                else 0.0
+            ),
+            "equity_curve_points": float(equity_values.size),
+            "nonzero_return_bars": float(np.count_nonzero(self._period_returns(equity_values))),
             "calmar_ratio": (annualised / max_drawdown) if max_drawdown > 0.0 else 0.0,
             "total_fees": float(sum(float(trade.get("fees_paid", 0.0)) for trade in trades)),
             "total_funding": float(sum(float(trade.get("funding_paid", 0.0)) for trade in trades)),
@@ -688,9 +869,15 @@ class Backtester:
         returns: np.ndarray = cls._period_returns(equity)
         if returns.size < 2:
             return 0.0
-        downside: np.ndarray = returns[returns < 0.0]
-        if downside.size == 0:
+        # Downside deviation divides by the total number of periods, not by the
+        # count of negative ones. Dividing by `downside.size` inflates the
+        # deviation by sqrt(N_total / N_down) and deflates Sortino by the same
+        # factor - which is why the audited run reported Sortino *below* Sharpe
+        # on a distribution with a 2.4:1 win/loss payoff, where the opposite
+        # relationship is the only coherent one.
+        if not np.any(returns < 0.0):
             return 0.0
+        downside: np.ndarray = np.minimum(returns, 0.0)
         deviation: float = float(np.sqrt(np.mean(np.square(downside))))
         if deviation <= 0.0:
             return 0.0

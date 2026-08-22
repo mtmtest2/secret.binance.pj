@@ -1,0 +1,474 @@
+{
+  "artifact_version": "1.0.0",
+  "head": "entry_model",
+  "feature_columns": [
+    "kama_distance",
+    "kama_slope",
+    "kama_slope_fast",
+    "ema_fast_slow_spread",
+    "close_ema_slow_ratio",
+    "adx",
+    "di_spread",
+    "fdi",
+    "fdi_trending",
+    "fdi_delta",
+    "bb_width",
+    "bb_position",
+    "rsi",
+    "rsi_delta",
+    "log_return_1",
+    "log_return_3",
+    "log_return_12",
+    "log_return_48",
+    "momentum_rank",
+    "atr_pct",
+    "atr_rank",
+    "realized_vol_12",
+    "realized_vol_48",
+    "garch_volatility",
+    "garch_vol_rank",
+    "garch_vol_ratio",
+    "vol_of_vol",
+    "realized_vol_12_is_zero",
+    "wick_ratio",
+    "whipsaw_rate",
+    "hmm_regime",
+    "hmm_prob_bull",
+    "hmm_prob_bear",
+    "hmm_prob_high_vol",
+    "hmm_prob_sideways",
+    "hmm_regime_age",
+    "volume_zscore",
+    "volume_rank",
+    "volume_trend",
+    "dollar_volume_rank",
+    "ob_imbalance",
+    "ob_imbalance_delta",
+    "ob_spread_bps",
+    "ob_spread_rank",
+    "liquidation_imbalance",
+    "microstructure_is_missing",
+    "funding_rate",
+    "funding_rate_delta",
+    "funding_rate_rank",
+    "open_interest_change",
+    "open_interest_rank",
+    "long_short_ratio",
+    "taker_buy_sell_ratio",
+    "hour_sin",
+    "hour_cos",
+    "dow_sin",
+    "dow_cos"
+  ],
+  "trained_at": "2026-08-22T21:16:52+00:00",
+  "git_commit": "ebb1fb8c6bcf",
+  "rows": 17864,
+  "validation_rows": 8912,
+  "positive_rate": 0.26739834673815904,
+  "decision_threshold": 0.5,
+  "configured_floor_threshold": 0.55,
+  "hyperparameters": {
+    "booster": "lightgbm",
+    "n_estimators": 20,
+    "learning_rate": 0.05,
+    "max_depth": 6,
+    "num_leaves": 63,
+    "min_child_samples": 40,
+    "subsample": 0.85,
+    "colsample_bytree": 0.85,
+    "reg_lambda": 1.0,
+    "reg_alpha": 0.0,
+    "random_state": 42,
+    "train_months": 12.0,
+    "validation_months": 6.0,
+    "test_months": 6.0,
+    "purge_bars": 10,
+    "early_stopping_rounds": 5,
+    "direction_stage2_hyperparameters": {
+      "n_estimators": 700,
+      "learning_rate": 0.03,
+      "max_depth": 5,
+      "num_leaves": 31,
+      "subsample": 0.8,
+      "colsample_bytree": 0.7,
+      "min_child_samples": 100,
+      "reg_lambda": 2.0,
+      "reg_alpha": 0.5
+    },
+    "risk_hyperparameters": {
+      "n_estimators": 600,
+      "learning_rate": 0.04,
+      "max_depth": 7,
+      "num_leaves": 95,
+      "subsample": 0.85,
+      "colsample_bytree": 0.85,
+      "min_child_samples": 25,
+      "reg_lambda": 1.5,
+      "reg_alpha": 0.1
+    }
+  },
+  "metrics": {
+    "threshold": 0.5,
+    "accuracy": 0.4756508078994614,
+    "precision": 0.4247318456417211,
+    "recall": 0.9979721900347625,
+    "f1": 0.5958661247081207,
+    "roc_auc": 0.5639264438728518,
+    "pr_auc": 0.4202800000520984,
+    "confusion_matrix": {
+      "labels": [
+        0,
+        1
+      ],
+      "raw": [
+        [
+          794,
+          4666
+        ],
+        [
+          7,
+          3445
+        ]
+      ]
+    },
+    "class_distribution": {
+      "positive": 3452,
+      "negative": 5460
+    },
+    "predicted_positive_rate": 0.91012118491921,
+    "probability_stats": {
+      "mean": 0.5314136342433295,
+      "median": 0.5355784818771747,
+      "std": 0.011744402582818888,
+      "min": 0.4949535499596524,
+      "max": 0.5425726181954457
+    }
+  },
+  "threshold_sweep": [
+    {
+      "threshold": 0.3,
+      "signals": 8912,
+      "precision": 0.387342908438061,
+      "recall": 1.0,
+      "f1": 0.5583953413134908,
+      "meets_min_sample_size": true,
+      "average_r": "NOT_AVAILABLE",
+      "win_rate": "NOT_AVAILABLE",
+      "profit_factor": "NOT_AVAILABLE",
+      "expectancy": "NOT_AVAILABLE",
+      "net_pnl": "NOT_AVAILABLE",
+      "max_drawdown": "NOT_AVAILABLE"
+    },
+    {
+      "threshold": 0.35,
+      "signals": 8912,
+      "precision": 0.387342908438061,
+      "recall": 1.0,
+      "f1": 0.5583953413134908,
+      "meets_min_sample_size": true,
+      "average_r": "NOT_AVAILABLE",
+      "win_rate": "NOT_AVAILABLE",
+      "profit_factor": "NOT_AVAILABLE",
+      "expectancy": "NOT_AVAILABLE",
+      "net_pnl": "NOT_AVAILABLE",
+      "max_drawdown": "NOT_AVAILABLE"
+    },
+    {
+      "threshold": 0.4,
+      "signals": 8912,
+      "precision": 0.387342908438061,
+      "recall": 1.0,
+      "f1": 0.5583953413134908,
+      "meets_min_sample_size": true,
+      "average_r": "NOT_AVAILABLE",
+      "win_rate": "NOT_AVAILABLE",
+      "profit_factor": "NOT_AVAILABLE",
+      "expectancy": "NOT_AVAILABLE",
+      "net_pnl": "NOT_AVAILABLE",
+      "max_drawdown": "NOT_AVAILABLE"
+    },
+    {
+      "threshold": 0.45,
+      "signals": 8912,
+      "precision": 0.387342908438061,
+      "recall": 1.0,
+      "f1": 0.5583953413134908,
+      "meets_min_sample_size": true,
+      "average_r": "NOT_AVAILABLE",
+      "win_rate": "NOT_AVAILABLE",
+      "profit_factor": "NOT_AVAILABLE",
+      "expectancy": "NOT_AVAILABLE",
+      "net_pnl": "NOT_AVAILABLE",
+      "max_drawdown": "NOT_AVAILABLE"
+    },
+    {
+      "threshold": 0.5,
+      "signals": 8111,
+      "precision": 0.4247318456417211,
+      "recall": 0.9979721900347625,
+      "f1": 0.5958661247081207,
+      "meets_min_sample_size": true,
+      "average_r": "NOT_AVAILABLE",
+      "win_rate": "NOT_AVAILABLE",
+      "profit_factor": "NOT_AVAILABLE",
+      "expectancy": "NOT_AVAILABLE",
+      "net_pnl": "NOT_AVAILABLE",
+      "max_drawdown": "NOT_AVAILABLE"
+    },
+    {
+      "threshold": 0.55,
+      "signals": 0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "meets_min_sample_size": false,
+      "average_r": "NOT_AVAILABLE",
+      "win_rate": "NOT_AVAILABLE",
+      "profit_factor": "NOT_AVAILABLE",
+      "expectancy": "NOT_AVAILABLE",
+      "net_pnl": "NOT_AVAILABLE",
+      "max_drawdown": "NOT_AVAILABLE"
+    },
+    {
+      "threshold": 0.6,
+      "signals": 0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "meets_min_sample_size": false,
+      "average_r": "NOT_AVAILABLE",
+      "win_rate": "NOT_AVAILABLE",
+      "profit_factor": "NOT_AVAILABLE",
+      "expectancy": "NOT_AVAILABLE",
+      "net_pnl": "NOT_AVAILABLE",
+      "max_drawdown": "NOT_AVAILABLE"
+    },
+    {
+      "threshold": 0.65,
+      "signals": 0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "meets_min_sample_size": false,
+      "average_r": "NOT_AVAILABLE",
+      "win_rate": "NOT_AVAILABLE",
+      "profit_factor": "NOT_AVAILABLE",
+      "expectancy": "NOT_AVAILABLE",
+      "net_pnl": "NOT_AVAILABLE",
+      "max_drawdown": "NOT_AVAILABLE"
+    },
+    {
+      "threshold": 0.7,
+      "signals": 0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "meets_min_sample_size": false,
+      "average_r": "NOT_AVAILABLE",
+      "win_rate": "NOT_AVAILABLE",
+      "profit_factor": "NOT_AVAILABLE",
+      "expectancy": "NOT_AVAILABLE",
+      "net_pnl": "NOT_AVAILABLE",
+      "max_drawdown": "NOT_AVAILABLE"
+    },
+    {
+      "threshold": 0.75,
+      "signals": 0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "meets_min_sample_size": false,
+      "average_r": "NOT_AVAILABLE",
+      "win_rate": "NOT_AVAILABLE",
+      "profit_factor": "NOT_AVAILABLE",
+      "expectancy": "NOT_AVAILABLE",
+      "net_pnl": "NOT_AVAILABLE",
+      "max_drawdown": "NOT_AVAILABLE"
+    },
+    {
+      "threshold": 0.8,
+      "signals": 0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "meets_min_sample_size": false,
+      "average_r": "NOT_AVAILABLE",
+      "win_rate": "NOT_AVAILABLE",
+      "profit_factor": "NOT_AVAILABLE",
+      "expectancy": "NOT_AVAILABLE",
+      "net_pnl": "NOT_AVAILABLE",
+      "max_drawdown": "NOT_AVAILABLE"
+    },
+    {
+      "threshold": 0.85,
+      "signals": 0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "meets_min_sample_size": false,
+      "average_r": "NOT_AVAILABLE",
+      "win_rate": "NOT_AVAILABLE",
+      "profit_factor": "NOT_AVAILABLE",
+      "expectancy": "NOT_AVAILABLE",
+      "net_pnl": "NOT_AVAILABLE",
+      "max_drawdown": "NOT_AVAILABLE"
+    },
+    {
+      "threshold": 0.9,
+      "signals": 0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "meets_min_sample_size": false,
+      "average_r": "NOT_AVAILABLE",
+      "win_rate": "NOT_AVAILABLE",
+      "profit_factor": "NOT_AVAILABLE",
+      "expectancy": "NOT_AVAILABLE",
+      "net_pnl": "NOT_AVAILABLE",
+      "max_drawdown": "NOT_AVAILABLE"
+    }
+  ],
+  "feature_importance": {
+    "status": "AVAILABLE",
+    "method": "native_gain_or_split",
+    "top_features": [
+      {
+        "feature": "kama_slope",
+        "importance": 2.0,
+        "importance_pct": 0.125
+      },
+      {
+        "feature": "dollar_volume_rank",
+        "importance": 2.0,
+        "importance_pct": 0.125
+      },
+      {
+        "feature": "hour_cos",
+        "importance": 2.0,
+        "importance_pct": 0.125
+      },
+      {
+        "feature": "kama_distance",
+        "importance": 1.0,
+        "importance_pct": 0.0625
+      },
+      {
+        "feature": "log_return_48",
+        "importance": 1.0,
+        "importance_pct": 0.0625
+      },
+      {
+        "feature": "realized_vol_48",
+        "importance": 1.0,
+        "importance_pct": 0.0625
+      },
+      {
+        "feature": "garch_volatility",
+        "importance": 1.0,
+        "importance_pct": 0.0625
+      },
+      {
+        "feature": "garch_vol_rank",
+        "importance": 1.0,
+        "importance_pct": 0.0625
+      },
+      {
+        "feature": "garch_vol_ratio",
+        "importance": 1.0,
+        "importance_pct": 0.0625
+      },
+      {
+        "feature": "wick_ratio",
+        "importance": 1.0,
+        "importance_pct": 0.0625
+      },
+      {
+        "feature": "hmm_prob_bull",
+        "importance": 1.0,
+        "importance_pct": 0.0625
+      },
+      {
+        "feature": "hmm_prob_bear",
+        "importance": 1.0,
+        "importance_pct": 0.0625
+      },
+      {
+        "feature": "dow_sin",
+        "importance": 1.0,
+        "importance_pct": 0.0625
+      },
+      {
+        "feature": "kama_slope_fast",
+        "importance": 0.0,
+        "importance_pct": 0.0
+      },
+      {
+        "feature": "ema_fast_slow_spread",
+        "importance": 0.0,
+        "importance_pct": 0.0
+      },
+      {
+        "feature": "close_ema_slow_ratio",
+        "importance": 0.0,
+        "importance_pct": 0.0
+      },
+      {
+        "feature": "adx",
+        "importance": 0.0,
+        "importance_pct": 0.0
+      },
+      {
+        "feature": "di_spread",
+        "importance": 0.0,
+        "importance_pct": 0.0
+      },
+      {
+        "feature": "fdi",
+        "importance": 0.0,
+        "importance_pct": 0.0
+      },
+      {
+        "feature": "fdi_trending",
+        "importance": 0.0,
+        "importance_pct": 0.0
+      }
+    ],
+    "shap": {
+      "status": "NOT_AVAILABLE",
+      "reason": "shap is not an installed project dependency"
+    }
+  },
+  "calibration": {
+    "status": "AVAILABLE",
+    "method": "isotonic",
+    "calibration_rows": 4456,
+    "eval_rows": 4456,
+    "brier_score_raw": 0.5113161849762184,
+    "brier_score_calibrated": 0.44945115087299303,
+    "log_loss_raw": 0.7044855668080364,
+    "log_loss_calibrated": 0.6793054118866009,
+    "improved": true,
+    "recommended_for_production": true,
+    "note": "Measured here; the caller (DirectionModel/EntryModel) swaps this stage onto the isotonic-calibrated estimator for live inference whenever `improved` is True, and leaves it on the raw estimator otherwise - see the model artifact's own `production_calibration` field for what was actually applied to this run."
+  },
+  "production_calibration": "isotonic",
+  "split": {
+    "train": {
+      "start": "2024-01-01T00:00:00+00:00",
+      "end": "2024-01-16T12:05:00+00:00",
+      "rows": 17864
+    },
+    "validation": {
+      "start": "2024-01-16T13:00:00+00:00",
+      "end": "2024-01-24T06:35:00+00:00",
+      "rows": 8912
+    },
+    "test": {
+      "start": "2024-01-24T07:30:00+00:00",
+      "end": "2024-02-01T01:55:00+00:00",
+      "rows": 8952
+    },
+    "embargo_ms": 3000000,
+    "scaled_down_from_nominal_months": true
+  }
+}

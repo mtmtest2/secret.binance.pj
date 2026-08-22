@@ -23,6 +23,12 @@ import pandas as pd
 #: Sentinel used throughout instead of a fabricated or approximated value.
 NOT_AVAILABLE: Final[str] = "NOT_AVAILABLE"
 
+#: Minimum *relative* log-loss improvement before isotonic calibration is
+#: wired into inference. A strict inequality alone lets noise in the fourth
+#: decimal place decide which estimator ships, on the strength of a single
+#: temporal half-split with no error bar.
+MIN_CALIBRATION_RELATIVE_GAIN: Final[float] = 0.01
+
 #: Confidence/threshold grids requested by the diagnostic reporting spec.
 #: Extended downward from a 0.50 floor (task 7a): a production diagnostic
 #: report's auto-tuner recommended the F-beta-optimal gate AND direction
@@ -151,6 +157,23 @@ def direction_metrics(
                 recall=float(r_sub),
                 f1=float(f_sub),
             )
+            # Accuracy climbing while balanced accuracy sinks toward 1/n_classes
+            # is the signature of the classifier collapsing onto one class:
+            # everything that survives the threshold is the majority label, so
+            # "accuracy" is just that label's base rate.  Without this flag the
+            # sweep reads as "raise the threshold and accuracy improves", and
+            # acting on it produces a system that never trades.
+            distinct: int = int(len(np.unique(pred_sub)))
+            row["distinct_predicted_classes"] = distinct
+            row["is_degenerate"] = bool(distinct < 2)
+            row["per_class_recall"] = {
+                class_order[index]: float(value)
+                for index, value in enumerate(
+                    precision_recall_fscore_support(
+                        y_sub, pred_sub, labels=labels, average=None, zero_division=0
+                    )[1]
+                )
+            }
         confidence_analysis.append(row)
 
     return {
@@ -301,6 +324,73 @@ def direction_threshold_sweep(
     return entry_threshold_sweep(target, probabilities, thresholds, min_signal_sample_size)
 
 
+#: Grid for a two-sided confidence gate.  A rule of the form
+#: ``max(p, 1 - p) >= t`` cannot be satisfied below 0.5, so sweeping there
+#: describes a rule the decision engine has no way to express.
+TWO_SIDED_CONFIDENCE_THRESHOLDS: Final[tuple[float, ...]] = (
+    0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95,
+)
+
+
+def direction_confidence_sweep(
+    target: pd.Series,
+    long_probabilities: np.ndarray,
+    thresholds: Sequence[float] = TWO_SIDED_CONFIDENCE_THRESHOLDS,
+    min_signal_sample_size: int = 20,
+) -> list[dict[str, Any]]:
+    """Sweep the quantity R1b actually gates on: ``max(p, 1 - p)``.
+
+    :func:`direction_threshold_sweep` sweeps ``p >= t`` one-sided, which does not
+    correspond to the live rule: the engine picks a side from ``p >= 0.5`` and
+    then gates on how far the probability sits from the coin flip.  Tuning
+    against the one-sided form produced recommendations below 0.5 - thresholds
+    that cannot reject anything.
+
+    Each row reports, for signals clearing the confidence bar, how often the
+    chosen side was the correct one.  ``side_accuracy`` is directly comparable to
+    0.5, so a model with no directional edge is obvious rather than inferred.
+    """
+    y: np.ndarray = np.asarray(target, dtype=int)
+    probabilities: np.ndarray = np.asarray(long_probabilities, dtype=float)
+    confidence: np.ndarray = np.maximum(probabilities, 1.0 - probabilities)
+    chosen_long: np.ndarray = probabilities >= 0.5
+    correct: np.ndarray = chosen_long == (y == 1)
+    total: int = len(y)
+
+    rows: list[dict[str, Any]] = []
+    for threshold in thresholds:
+        selected: np.ndarray = confidence >= threshold
+        n_signals: int = int(selected.sum())
+        accuracy: float = float(correct[selected].mean()) if n_signals else 0.0
+        coverage: float = float(n_signals / total) if total else 0.0
+        rows.append(
+            {
+                "threshold": float(threshold),
+                "signals": n_signals,
+                "signal_rate": coverage,
+                # "precision"/"recall"/"f1" keep the row shape compatible with the
+                # other sweeps and with _select_recommended_threshold's F-beta.
+                "precision": accuracy,
+                "recall": coverage,
+                "f1": (
+                    2 * accuracy * coverage / (accuracy + coverage)
+                    if n_signals and (accuracy + coverage) > 0
+                    else 0.0
+                ),
+                "side_accuracy": accuracy,
+                "long_share": float(chosen_long[selected].mean()) if n_signals else 0.0,
+                "meets_min_sample_size": n_signals >= min_signal_sample_size,
+                "average_r": NOT_AVAILABLE,
+                "win_rate": NOT_AVAILABLE,
+                "profit_factor": NOT_AVAILABLE,
+                "expectancy": NOT_AVAILABLE,
+                "net_pnl": NOT_AVAILABLE,
+                "max_drawdown": NOT_AVAILABLE,
+            }
+        )
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Regression (Exit targets, Risk)
 # ---------------------------------------------------------------------------
@@ -397,7 +487,20 @@ def calibrate_classifier(
     except ValueError:  # pragma: no cover - degenerate eval slice
         raw_logloss = calibrated_logloss = float("nan")
 
-    improved: bool = calibrated_logloss < raw_logloss
+    # A bare `calibrated < raw` lets an improvement in the fourth decimal place
+    # decide which estimator ships. On the audited run the gate "improved" by
+    # 0.0007 nats (0.11%) on a single temporal half-split, and that coin flip
+    # was what separated a cascade that never predicts LONG from one that goes
+    # long on most bars. Requiring a material effect size makes the decision
+    # mean something; the measured delta is reported either way.
+    relative_gain: float = (
+        (raw_logloss - calibrated_logloss) / raw_logloss
+        if raw_logloss and raw_logloss == raw_logloss and raw_logloss > 0.0
+        else float("nan")
+    )
+    improved: bool = bool(
+        relative_gain == relative_gain and relative_gain > MIN_CALIBRATION_RELATIVE_GAIN
+    )
     return {
         "status": "AVAILABLE",
         "method": "isotonic",
@@ -407,6 +510,8 @@ def calibrate_classifier(
         "brier_score_calibrated": calibrated_brier,
         "log_loss_raw": raw_logloss,
         "log_loss_calibrated": calibrated_logloss,
+        "log_loss_relative_gain": relative_gain,
+        "minimum_relative_gain": MIN_CALIBRATION_RELATIVE_GAIN,
         "improved": bool(improved),
         "recommended_for_production": bool(improved),
         "note": (
