@@ -237,3 +237,59 @@ def test_calibration_gain_threshold_rejects_noise_and_accepts_a_real_gain() -> N
 
     real_gain = (0.70 - 0.60) / 0.70
     assert real_gain > ml_metrics.MIN_CALIBRATION_RELATIVE_GAIN
+
+
+# --------------------------------------------------------------------------
+# Split capacity: bars, not intervals
+# --------------------------------------------------------------------------
+def _dataset_with(timestamps: np.ndarray, symbols: tuple[str, ...]):
+    import pandas as pd
+
+    from module_b_features.features import FEATURE_COLUMNS
+    from module_b_features.processor import ProcessedDataset
+
+    rows = len(timestamps)
+    return ProcessedDataset(
+        features=pd.DataFrame(0.0, index=range(rows), columns=list(FEATURE_COLUMNS)),
+        direction_target=pd.Series(["NO_TRADE_OR_FAIL"] * rows),
+        entry_target=pd.Series([0] * rows),
+        exit_targets=pd.DataFrame({"target_tp_pct": [0.02] * rows, "target_sl_pct": [0.01] * rows}),
+        risk_target=pd.Series([0.5] * rows),
+        metadata=pd.DataFrame({"timestamp": timestamps, "symbol": "X/USDT:USDT"}),
+        feature_columns=tuple(FEATURE_COLUMNS),
+        symbols=symbols,
+        total_candidate_rows=rows,
+    )
+
+
+def test_split_capacity_counts_bars_inclusively() -> None:
+    """A gap-free block must report exactly 100% coverage, not slightly over.
+
+    Capacity was `span / bar_ms`, which counts the gaps between bars rather than
+    the bars themselves - under-counting by one row per symbol. On the audited
+    27-symbol run that produced a 27-row "overflow" which read as duplicated
+    timestamps when it was really this arithmetic.
+    """
+    bar_ms, bars, symbol_count = 300_000, 50, 3
+    timestamps = np.tile(np.arange(bars, dtype=np.int64) * bar_ms, symbol_count)
+    dataset = _dataset_with(timestamps, tuple(f"S{i}/USDT:USDT" for i in range(symbol_count)))
+
+    coverage = diagnostics._split_coverage(
+        dataset, np.arange(len(timestamps)), np.array([], dtype=int), np.array([], dtype=int)
+    )
+    assert coverage["train"]["capacity_rows"] == bars * symbol_count
+    assert coverage["train"]["coverage_pct"] == 1.0
+
+
+def test_split_capacity_reports_over_one_when_timestamps_repeat() -> None:
+    """And the ratio is not clamped, because >1.0 is the duplicate detector."""
+    bar_ms, bars = 300_000, 20
+    timestamps = np.concatenate(
+        [np.arange(bars, dtype=np.int64) * bar_ms, np.array([0, bar_ms], dtype=np.int64)]
+    )
+    dataset = _dataset_with(timestamps, ("X/USDT:USDT",))
+
+    coverage = diagnostics._split_coverage(
+        dataset, np.arange(len(timestamps)), np.array([], dtype=int), np.array([], dtype=int)
+    )
+    assert coverage["train"]["coverage_pct"] > 1.0

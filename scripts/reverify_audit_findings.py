@@ -482,11 +482,18 @@ def json_checks(report: dict) -> list[Result]:
 
     risk_pred = ((report.get("risk", {}) or {}).get("metrics", {}) or {}).get("prediction_stats", {})
     risk_target = ((report.get("risk", {}) or {}).get("metrics", {}) or {}).get("target_stats", {})
+    # Span-relative, not multiplicative: a target floor of 0 makes any
+    # multiple-of-the-floor rule vacuous. The question is whether the head's
+    # output reaches into the lower part of the range it is supposed to cover.
+    target_span = risk_target.get("max", 1.0) - risk_target.get("min", 0.0)
     add(
         "P8",
         "risk head cannot express a bad trade",
-        bool(risk_pred) and risk_pred.get("min", 0) > risk_target.get("min", 0) * 3,
-        f"prediction min={risk_pred.get('min')}, target min={risk_target.get('min')}",
+        bool(risk_pred)
+        and target_span > 0
+        and risk_pred.get("min", 0.0) > risk_target.get("min", 0.0) + 0.4 * target_span,
+        f"prediction min={risk_pred.get('min')}, target range="
+        f"[{risk_target.get('min')}, {risk_target.get('max')}]",
     )
     add(
         "P28",

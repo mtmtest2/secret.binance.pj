@@ -187,12 +187,22 @@ def _split_coverage(
             continue
         block = timestamps[index]
         span_ms: int = int(block.max() - block.min())
-        capacity: int = max(1, (span_ms // bar_ms) * symbol_count)
+        # Bars, not intervals: a block running from the first bar to the Nth
+        # holds N+1 bars but only N gaps between them, so the count is inclusive
+        # of both ends. Dropping the +1 under-counted capacity by exactly one row
+        # per symbol, which is what produced the "rows exceed capacity" signature
+        # the audit read as duplication - on a 27-symbol run the overflow was 27
+        # rows, one per symbol, and it was this arithmetic rather than repeated
+        # timestamps.
+        capacity: int = max(1, ((span_ms // bar_ms) + 1) * symbol_count)
+        # Deliberately not clamped: a ratio above 1.0 is the only automatic
+        # detector of genuinely repeated timestamps, and clamping it hides the
+        # thing the field exists to reveal.
         report[name] = {
             "rows": int(len(index)),
             "span_days": round(span_ms / 86_400_000, 1),
             "capacity_rows": int(capacity),
-            "coverage_pct": round(min(1.0, len(index) / capacity), 4),
+            "coverage_pct": round(len(index) / capacity, 4),
         }
     return report
 

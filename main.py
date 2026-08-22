@@ -47,11 +47,12 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Final, Sequence
 
+import numpy as np
 import uvicorn
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from config.settings import DecisionSettings, Settings, get_settings
+from config.settings import Settings, get_settings
 from core.exceptions import KillSwitchEngaged, QuantSystemError
 from core.logger import configure_logging, get_logger
 from core.utils import ms_to_datetime, utc_now, utc_now_ms
@@ -84,15 +85,11 @@ _CYCLE_MINUTES: Final[str] = "0,5,10,15,20,25,30,35,40,45,50,55"
 _MAX_STORED_CYCLE_TIMINGS: Final[int] = 500
 
 #: Decision-cascade thresholds for the *diagnostic-only* relaxed backtest run
-#: by ``TradingSystem._run_final_backtest`` - never used for real trading.
-#: The live ``DecisionSettings`` defaults (min_gate_confidence=0.55,
-#: min_direction_given_trade_confidence=0.60, min_entry_probability=0.55, ...)
-#: are intentionally strict and, combined with a single ~8-week out-of-sample
-#: window, routinely leave the strict backtest with a single-digit trade
-#: count - too small for win rate/profit factor/Sharpe to mean anything. This
-#: loosened copy replays the *same* window to check whether the strategy's
-#: edge is visible at all with a larger sample, without ever touching the
-#: thresholds that gate real orders.
+#: by ``TradingSystem._run_final_backtest`` - never used for real trading. The
+#: live defaults are intentionally strict and can leave the strict replay with
+#: too few trades for its ratios to mean anything; this loosened pass replays
+#: the *same* window to see whether an edge is visible at a larger sample.
+#:
 #: Overrides applied *on top of* the operator's live DecisionSettings for the
 #: relaxed diagnostic replay. Kept as a dict rather than a whole
 #: ``DecisionSettings`` so every field not listed here keeps its configured
@@ -154,10 +151,10 @@ def _final_backtest_window(
 
     Pure and side-effect free (no DB/network) so it is directly unit
     testable - see ``TradingSystem._run_final_backtest`` for the caller.
-    ``Backtester.run`` loads the *most recent* ``max_candles`` bars per
-    symbol from the database; since this replay always runs immediately
-    after training on the same dataset, "most recent N candles" and "the
-    test split's own date range" are the same window, so a plain bar count
+    This sizes how much history to *load*; which bars are actually replayed is
+    pinned separately by ``start_ms``/``end_ms`` on ``Backtester.run``. Relying
+    on "the most recent N candles" to coincide with the test split was only true
+    on a static database - the ingestion pipeline keeps writing, so a bar count
     is sufficient - no per-symbol date-range query is needed.
     """
     test_bars: int = max(0, -(-(test_end_ms - test_start_ms) // timeframe_ms) + 1)  # ceil, inclusive
