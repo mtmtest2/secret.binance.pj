@@ -18,6 +18,7 @@ Nested groups use a double-underscore delimiter, e.g.::
 
 from __future__ import annotations
 
+import math
 from functools import lru_cache
 from pathlib import Path
 from typing import Final, Literal
@@ -411,7 +412,16 @@ class MLSettings(BaseModel):
     #: weight, one that far again gets a quarter, and so on.  Crypto regimes
     #: drift, so a year-old candle should not vote as loudly as yesterday's.
     #: ``0`` disables recency weighting (every row weighted equally).
-    recency_half_life_days: float = Field(default=45.0, ge=0.0)
+    #: 0 disables recency weighting entirely, which is the default: the
+    #: chronological train/validation/test split already carries the recency
+    #: argument, and an exponential decay on top of it is a second, hidden
+    #: recency policy. At the previous 45-day setting a 372-day training window
+    #: integrated to 64.7 effective days - 17.4% - so `train_months: 12` and a
+    #: 2.9M row count were both nominal fictions, and the older rows a widened
+    #: window had just recovered were weighted to near zero on arrival.
+    #: A half-life below about a quarter of the training span discards most of
+    #: it; see the validator on Settings.
+    recency_half_life_days: float = Field(default=0.0, ge=0.0)
 
     inference_workers: int = Field(default=2, ge=1, le=16)
 
@@ -642,6 +652,23 @@ class Settings(BaseSettings):
                 "purge_bars >= max_holding_bars before training on real data.",
                 self.ml.purge_bars,
                 self.labels.max_holding_bars,
+            )
+
+        # A half-life short relative to the training span quietly turns a long
+        # window into a short one: weight decays as 0.5**(age/half_life), so at
+        # a quarter of the span the oldest rows carry ~6% and the reported row
+        # count stops describing what the model was fitted on.
+        train_span_days: float = self.ml.train_months * 30.4375
+        if 0.0 < self.ml.recency_half_life_days < train_span_days / 4.0:
+            get_logger(__name__).warning(
+                "ml.recency_half_life_days=%.1f is short against a %.0f-day training window: "
+                "the effective sample is roughly %.0f days (%.0f%% of nominal). Report "
+                "effective_train_rows alongside rows, or raise the half-life, before reading "
+                "the row count as the amount of data the model saw.",
+                self.ml.recency_half_life_days,
+                train_span_days,
+                self.ml.recency_half_life_days / math.log(2.0),
+                100.0 * (self.ml.recency_half_life_days / math.log(2.0)) / max(1.0, train_span_days),
             )
         return self
 

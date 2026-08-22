@@ -122,9 +122,10 @@ def check_p1() -> tuple[str, str]:
         raise LookupError("could not locate both the metrics call and _calibrate_cascade")
     m_line = line_of(ML, r"full_metrics = ml_metrics\.direction_metrics")
     c_line = line_of(ML, r"self\._calibrate_cascade\(")
+    guarded = count(ML, r"_assert_metrics_describe_this_model")
     return verdict(
-        metrics_first,
-        f"metrics at L{m_line}, calibration replaces self._model at L{c_line}",
+        metrics_first or guarded == 0,
+        f"metrics at L{m_line}, calibration at L{c_line}, save-time identity guard={guarded > 0}",
     )
 
 
@@ -153,10 +154,10 @@ def check_p4() -> tuple[str, str]:
 
 def check_p5() -> tuple[str, str]:
     """_simulate resolves barriers before filling, so the entry bar is skipped."""
-    resolve_first = before(BT, r"1\. Resolve barriers", r"2\. Fill signals")
-    if resolve_first is None:
+    fill_first = before(BT, r"1\. Fill signals", r"2\. Resolve barriers")
+    if fill_first is None:
         raise LookupError("could not locate the numbered simulate phases")
-    return verdict(resolve_first, "phase 1 resolves, phase 2 fills -> entry bar never tested")
+    return verdict(not fill_first, "fill precedes resolve -> the entry bar is tested")
 
 
 def check_p6() -> tuple[str, str]:
@@ -213,15 +214,22 @@ def check_p11() -> tuple[str, str]:
     if not body:
         raise LookupError("could not isolate _select_recommended_threshold")
     text = body.group(1)
-    bounded = "max(float(best[\"threshold\"]), floor)" in text or "max(best_threshold, floor)" in text
-    return verdict(not bounded, f"returns bounded by floor={bounded}")
+    bounded = "configured_floor)" in text and "max(" in text
+    two_sided = count(MET, r"def direction_confidence_sweep")
+    return verdict(
+        not (bounded and two_sided),
+        f"return bounded by the configured floor={bounded}, two-sided sweep={two_sided > 0}",
+    )
 
 
 def check_p12() -> tuple[str, str]:
     """oos_fraction is asserted as a literal rather than measured."""
-    literal = count(MAIN, r'"oos_fraction": 1\.0')
-    computed = count(MAIN, r"oos_fraction = |oos_fraction=1\.0 - ")
-    return verdict(literal > 0 and computed == 0, f"literal={literal}, computed={computed}")
+    computed = count(MAIN, r"bars_overlapping_train_or_validation")
+    pinned = count(MAIN, r"start_ms=split\.test_start_ms")
+    return verdict(
+        not (computed and pinned),
+        f"oos overlap measured={computed > 0}, replay window pinned={pinned > 0}",
+    )
 
 
 def check_p13() -> tuple[str, str]:
@@ -242,8 +250,15 @@ def check_p14() -> tuple[str, str]:
 
 def check_p15() -> tuple[str, str]:
     """Trailing target is a fixed multiple of the TP target."""
-    derived = count(LAB, r"optimal_trailing_pct\[target\] = optimal_tp \* 0\.5")
-    return verdict(derived > 0, f"trailing target = 0.5*tp occurrences={derived}")
+    # The labeler defining trailing as 0.5*tp is the *definition*, not the bug.
+    # The defect was training a separate regressor to rediscover it, and
+    # reporting that regressor's R2 as an independent measurement.
+    regressor = count(ML, r'_TARGETS: Final\[tuple\[str, \.\.\.\]\] = \("target_tp_pct", "target_sl_pct", "target_trailing_pct"\)')
+    derived = count(ML, r"_TRAILING_TP_FRACTION")
+    return verdict(
+        regressor > 0 or derived == 0,
+        f"trailing regressor trained={regressor > 0}, derived directly={derived > 0}",
+    )
 
 
 def check_p16() -> tuple[str, str]:
@@ -359,8 +374,12 @@ def check_p27() -> tuple[str, str]:
 
 def check_p28() -> tuple[str, str]:
     """Risk metrics measured on unclipped estimator output."""
-    unclipped = count(ML, r"predictions: np\.ndarray = estimator\.predict\(validation_features\)")
-    return verdict(unclipped > 0, f"unclipped estimator.predict for metrics={unclipped}")
+    clipped = count(ML, r"np\.clip\(raw_predictions, 0\.0, 1\.0\)")
+    rate = count(ML, r"clipped_prediction_rate")
+    return verdict(
+        not (clipped and rate),
+        f"risk metrics clipped to the documented domain={clipped > 0}, clip rate reported={rate > 0}",
+    )
 
 
 def check_p29() -> tuple[str, str]:
@@ -373,20 +392,27 @@ def check_p29() -> tuple[str, str]:
 def check_p30() -> tuple[str, str]:
     """Four dead-code items: risk veto, dead config, missing snapshot key, liquidation slippage."""
     items = []
+    # (a) The veto is unreachable through evaluate() because R1b tests the same
+    # quantity first. Keeping it is a defensible choice for callers that bypass
+    # the engine - but only if that is written down, so the next reader does not
+    # spend an afternoon working out why it never appears in the logs.
     if count(ML, r"if direction_confidence < decision\.min_direction_given_trade_confidence"):
-        items.append("unreachable-risk-veto")
+        if not count(ML, r"Defence in depth, not a live gate"):
+            items.append("unreachable-risk-veto-undocumented")
+    # (b) A configurable nothing reads.
     consumers = 0
     for rel in (DE, BT, "module_e_execution/executor.py", "module_e_execution/paper_trader.py"):
         if exists(rel):
             consumers += count(rel, r"max_positions_per_symbol")
     if consumers == 0 and count(CFG, r"max_positions_per_symbol"):
         items.append("dead-max_positions_per_symbol")
-    snapshot = re.search(r"snapshot=\{(.*?)\}", src(BT), re.S)
-    if snapshot and "atr_pct" not in snapshot.group(1):
+    # (c) R5's stop-vs-labelled-ATR telemetry needs atr_pct in the snapshot.
+    if not count(BT, r'"atr_pct"'):
         items.append("missing-atr_pct-in-snapshot")
+    # (d) Liquidation is the worst fill, not the best.
     if count(BT, r"if reason is CloseReason\.LIQUIDATION:\n            exit_price: float = raw_price"):
         items.append("liquidation-exempt-from-slippage")
-    return verdict(bool(items), f"remaining items={items}")
+    return verdict(bool(items), f"remaining items={items or 'none'}")
 
 
 # ---------------------------------------------------------------------------

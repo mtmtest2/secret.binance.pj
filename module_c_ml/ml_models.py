@@ -104,6 +104,10 @@ _MAX_SL_PCT: Final[float] = 0.0800
 #: prediction rather than a real edge, so the target is trimmed back to it.
 _MAX_REWARD_RISK: Final[float] = 6.0
 
+#: The labeler's own definition of the trailing-activation target, as a
+#: fraction of the take-profit distance (labeler._simulate_chunk).
+_TRAILING_TP_FRACTION: Final[float] = 0.5
+
 #: Minimum spread a stage's raw probabilities must cover before isotonic
 #: calibration is allowed to reshape them. Below this the score carries no
 #: usable ordering and calibration becomes noise amplification.
@@ -798,14 +802,19 @@ class BaseModelHead(ABC):
     ) -> Any | None:
         """Wrap a fitted estimator with isotonic calibration for live inference.
 
-        ``module_c_ml.metrics.calibrate_classifier`` already measures whether
-        isotonic calibration improves log loss, on a temporal half-split of
-        the validation block held out purely for that honest before/after
-        comparison.  This is the separate, production-facing step: fit the
-        calibrator that will actually be used for inference, on the *entire*
-        validation block (every held-out row available, not half of it),
-        since a shipped artifact should not throw away data the diagnostic
-        report doesn't need.
+        ``module_c_ml.metrics.calibrate_classifier`` measures whether isotonic
+        calibration helps, on a temporal half-split of the validation block.
+        This is the production-facing step: fit the calibrator inference will
+        actually use.
+
+        Callers pass the *earlier* half - the same rows the adoption decision
+        was measured on - not the whole block.  Fitting on every validation row
+        was justified as "a shipped artifact should not throw away data", but
+        that reasoning is backwards for isotonic regression, which is a
+        free-form monotone step function and will memorise whatever it is
+        given.  Using the whole block left no held-out data behind the most
+        overfit-prone component in the system, on a validation window that had
+        already driven early stopping and threshold selection.
 
         Returns ``None`` - never raises - when there is not enough data or
         the fit fails; the caller then keeps using the raw estimator.
@@ -1289,8 +1298,14 @@ class DirectionModel(BaseModelHead):
             gate_estimator, calib_x, calib_y, eval_x, eval_y, n_classes=2
         )
         if gate_calibration.get("status") == "AVAILABLE" and gate_calibration.get("improved"):
+            # Fit on the earlier half only - the same half the adoption decision
+            # was measured on - so the later half stays untouched for scoring.
+            # Fitting the shipped calibrator on the entire validation block left
+            # no held-out data at all behind the component most prone to
+            # overfitting: isotonic regression is a free-form step function and
+            # will memorise whatever it is given.
             calibrated_gate: Any = self._fit_production_calibrator(
-                gate_estimator, validation_features, is_trade_validation
+                gate_estimator, calib_x, calib_y
             )
             if calibrated_gate is not None:
                 model["gate"] = calibrated_gate
@@ -1343,7 +1358,7 @@ class DirectionModel(BaseModelHead):
                     "improved"
                 ):
                     calibrated_direction: Any = self._fit_production_calibrator(
-                        direction_estimator, direction_features, direction_target
+                        direction_estimator, d_calib_x, d_calib_y
                     )
                     if calibrated_direction is not None:
                         model["direction"] = calibrated_direction
@@ -1730,7 +1745,7 @@ class EntryModel(BaseModelHead):
             )
             if calibration.get("status") == "AVAILABLE" and calibration.get("improved"):
                 calibrated_model: Any = self._fit_production_calibrator(
-                    estimator, validation_features, validation_target
+                    estimator, calib_x, calib_y
                 )
                 if calibrated_model is not None:
                     self._model = calibrated_model
@@ -1895,7 +1910,14 @@ class ExitModel(BaseModelHead):
 
     name = "exit_model"
 
-    _TARGETS: Final[tuple[str, ...]] = ("target_tp_pct", "target_sl_pct", "target_trailing_pct")
+    #: `target_trailing_pct` is deliberately absent: the labeler defines it as
+    #: exactly `0.5 * optimal_tp_pct`, so a third 400-tree regressor over 57
+    #: features was being trained to learn y = 0.5x. Its R^2 matched the
+    #: take-profit head's to 17 significant figures - an identity, reported as an
+    #: independent measurement of model quality. `_assemble` derives the value
+    #: directly; if a genuinely independent trailing target is wanted, it needs
+    #: defining in the labeler first.
+    _TARGETS: Final[tuple[str, ...]] = ("target_tp_pct", "target_sl_pct")
 
     def __init__(self, settings: Settings) -> None:
         super().__init__(settings)
@@ -2042,10 +2064,6 @@ class ExitModel(BaseModelHead):
         )
         rates["target_tp_pct"] = float(np.mean(~np.isclose(clamped_tp, raw_tp)))
 
-        # The trailing target is a fixed multiple of the take-profit target, so
-        # its regressor cannot express anything the TP head does not already
-        # say - see `_assemble`, which now derives it directly.
-        rates["target_trailing_pct"] = 1.0
         return rates
 
     def _baseline_predictions(self, features: pd.DataFrame) -> dict[str, np.ndarray]:
@@ -2074,7 +2092,6 @@ class ExitModel(BaseModelHead):
         return {
             "target_tp_pct": take_profit,
             "target_sl_pct": stop_loss,
-            "target_trailing_pct": take_profit * 0.5,
         }
 
     def predict(self, features: pd.DataFrame) -> ExitParameters:
@@ -2086,7 +2103,11 @@ class ExitModel(BaseModelHead):
         estimators: dict[str, Any] = self._model
         take_profit: float = float(estimators["target_tp_pct"].predict(aligned)[0])
         stop_loss: float = float(estimators["target_sl_pct"].predict(aligned)[0])
-        trailing: float = float(estimators["target_trailing_pct"].predict(aligned)[0])
+        # Derived, not predicted - see `_TARGETS`. The labeler defines the
+        # trailing target as exactly half the take-profit target, so this is the
+        # same number the retired third regressor produced, without the tree
+        # ensemble in between.
+        trailing: float = take_profit * _TRAILING_TP_FRACTION
 
         return self._assemble(
             take_profit, stop_loss, trailing, features.iloc[0], ModelSource.TRAINED
@@ -2199,31 +2220,47 @@ class RiskModel(BaseModelHead):
     def train(self, dataset: ProcessedDataset) -> dict[str, Any]:
         """Fit the opportunity-score regressor.
 
-        Trained only on rows where a directional trade was actually selected
-        (``direction_target != NO_TRADE_OR_FAIL``) - the same restriction
-        :class:`ExitModel` already applies to its own targets, and for the
-        same underlying reason. ``target_risk_score`` is deterministically
-        ``0.0`` for every ``NO_TRADE_OR_FAIL`` row (see
-        ``module_b_features.labeler.TradeLabeler._attach_model_targets``),
-        which is roughly 46% of the pooled dataset in a typical run. Training
-        on the full, unfiltered population forced this regressor to also
-        re-learn Direction's own hard "will either side ever reach
-        take-profit" question on the same 55 features Direction itself only
-        solves at barely-above-random balanced accuracy - diluting the signal
-        this head actually needs (how clean is the path of a trade
-        Direction/Entry have *already* approved, which is the only question
-        :meth:`predict` is ever asked at inference time) and measuring R^2
-        against an out-of-distribution population it will never see live.
-        This was the single largest driver of this head's R^2 sitting far
-        below Exit's, despite identical hyperparameters and features.
+        Trained on every bar in the dataset.
+
+        An earlier revision restricted training to rows where a directional
+        trade was actually selected (``direction_target != NO_TRADE_OR_FAIL``),
+        reasoning that ``predict()`` is only ever asked about trades Direction
+        and Entry have already approved.  That conflates two different things.
+        At inference those heads approve a *candidate* - a bar they predict will
+        work.  The filter selected on the *realised outcome* - bars that did
+        work.  The outcome is not knowable at decision time; it is the entire
+        problem the system exists to solve.  Since Direction's balanced accuracy
+        sits near chance, well under half the candidates it approves are winners,
+        so the head was fitted on a 100%-winner population and deployed on one
+        that is at best ~44% winners.
+
+        The damage was measurable: predictions floored at 0.42 against a target
+        floor of 0.09 - no way to say "this is a bad trade", because the head had
+        never seen one - a systematic +0.094 upward bias that over-sized every
+        position, and a veto that fired on 281 of 1,381,357 candidates.
+
+        What made the unfiltered population look unlearnable was the *target*,
+        not the population: ``target_risk_score`` was a hard ``0.0`` on every
+        non-selected row.  The labeler now scores those rows from the better of
+        the two sides' realised path heat, which is a genuine measurement and is
+        low for genuinely bad setups, so the target is continuous across the
+        whole dataset and the filter is unnecessary.
         """
         if dataset.is_empty:
             raise ModelTrainingError("risk model received an empty dataset")
 
-        usable: pd.Series = dataset.direction_target != LabelClass.NO_TRADE_OR_FAIL.value
+        # Trained on every bar, because that is the population `predict()` is
+        # asked about.  The previous filter selected on `direction_target !=
+        # NO_TRADE_OR_FAIL`, i.e. on the *realised outcome* - bars where a trade
+        # actually won.  At inference Direction and Entry approve a candidate
+        # they predict will work, which is a different thing and is knowable at
+        # decision time; the realised outcome is not.  Fitting on a 100%-winner
+        # population and deploying on a ~44%-winner one is survivorship bias, and
+        # it left the head unable to express a bad trade at all.
+        usable: pd.Series = pd.Series(True, index=dataset.direction_target.index)
         if int(usable.sum()) < 100:
             raise ModelTrainingError(
-                "not enough directional rows to fit the risk model", rows=int(usable.sum())
+                "not enough rows to fit the risk model", rows=int(usable.sum())
             )
 
         features: pd.DataFrame = dataset.features[usable].reset_index(drop=True)
@@ -2295,7 +2332,7 @@ class RiskModel(BaseModelHead):
             "metrics": full_metrics,
             "feature_importance": importance,
             "training_row_filter": (
-                "direction_target != NO_TRADE_OR_FAIL - see RiskModel.train docstring"
+                "none - every bar, matching the population predict() is asked about"
             ),
             "split": self._filtered_split_period_metadata(
                 usable_timestamps, train_index, validation_index, test_index, boundaries

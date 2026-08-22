@@ -683,10 +683,27 @@ class TradeLabeler:
         )
         entry_quality[clean_entry] = 1.0
 
-        heat_component: np.ndarray = 1.0 - np.clip(np.nan_to_num(mae_ratio, nan=1.0), 0.0, 1.0)
+        # The score is defined on *every* bar, not only on the ones a trade was
+        # selected for.  Where no side won, the path heat of the better of the
+        # two sides is still a real, measured statement about how clean that bar
+        # was - and it is low, because neither side got anywhere.  Leaving those
+        # rows at a hard 0.0 made the target look unlearnable, which is what
+        # motivated restricting the Risk head to selected rows: a filter on the
+        # *realised outcome*, which is not knowable at decision time, so the head
+        # was fitted on winners only and never learned to say "this is a bad
+        # trade".  Its predictions floored at 0.42 against a target floor of
+        # 0.09, and its veto fired on 0.02% of candidates.
+        best_side_mae_ratio: np.ndarray = np.fmin(
+            np.nan_to_num(long_side.mae_ratio, nan=1.0),
+            np.nan_to_num(short_side.mae_ratio, nan=1.0),
+        )
+        effective_mae_ratio: np.ndarray = np.where(
+            any_selected, np.nan_to_num(mae_ratio, nan=1.0), best_side_mae_ratio
+        )
+        heat_component: np.ndarray = 1.0 - np.clip(effective_mae_ratio, 0.0, 1.0)
         volatility_component: np.ndarray = 1.0 - np.clip(volatility_percentile, 0.0, 1.0)
         raw_score: np.ndarray = heat_component * (0.5 + 0.5 * volatility_component)
-        risk_score[any_selected] = np.clip(raw_score[any_selected], 0.0, 1.0)
+        risk_score[:] = np.clip(raw_score, 0.0, 1.0)
 
         frame["entry_quality"] = entry_quality
         frame["target_tp_pct"] = target_tp
