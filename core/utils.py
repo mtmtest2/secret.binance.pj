@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import random
+import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Sequence, TypeVar
 
 T = TypeVar("T")
@@ -69,6 +71,63 @@ def expected_timestamps(start_ms: int, end_ms: int, timeframe_ms: int) -> list[i
     if end < start:
         return []
     return list(range(start, end + timeframe_ms, timeframe_ms))
+
+
+def longest_clean_trailing_run(
+    timestamps: Iterable[int],
+    bad: set[int],
+    timeframe_ms: int,
+) -> list[int]:
+    """Return the longest contiguous run of timestamps ending at the newest one.
+
+    Every timestamp in ``bad`` is dropped outright (e.g. a candle flagged
+    corrupt by QC); a timestamp that was never present in ``timestamps`` at
+    all opens the same kind of gap naturally.  Either way, the last such gap -
+    scanning backward from the newest entry - marks where the most recent
+    *unhealable* damage sits, and everything from there forward is what's
+    returned: downstream consumers of a candle series expect a single
+    contiguous grid, never history with a hole punched in the middle of it.
+
+    Shared by :class:`module_a_data.qc_validator.QCValidator` (quarantining an
+    unhealable window at ingestion) and
+    :class:`module_b_features.processor.DatasetProcessor` (trimming a stored
+    window that turns out to be gappy before it reaches feature engineering),
+    so both apply the exact same "keep the newest clean run" rule.
+
+    Returns:
+        The kept timestamps, sorted ascending.  Empty if nothing survives.
+    """
+    cleaned: list[int] = sorted(ts for ts in timestamps if ts not in bad)
+    if not cleaned:
+        return []
+    cut_index: int = 0
+    for index in range(1, len(cleaned)):
+        if cleaned[index] - cleaned[index - 1] > timeframe_ms:
+            cut_index = index
+    return cleaned[cut_index:]
+
+
+def git_commit_hash() -> str:
+    """Best-effort short git commit hash of the running checkout.
+
+    Used to stamp model artifacts and diagnostic reports so a training run is
+    reproducible - never raises: returns ``"unknown"`` outside a git checkout
+    or when the ``git`` binary is unavailable (e.g. a stripped-down
+    deployment image).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            cwd=Path(__file__).resolve().parent.parent,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover - environment-dependent
+        return "unknown"
+    commit: str = result.stdout.strip()
+    return commit if result.returncode == 0 and commit else "unknown"
 
 
 # ---------------------------------------------------------------------------

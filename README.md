@@ -181,15 +181,36 @@ The **labeler** simulates a long *and* a short at every bar close with
 ATR-scaled triple barriers, and is deliberately pessimistic: when one candle
 touches both barriers the **stop is assumed to have been hit first**. Path heat
 (MAE as a fraction of the stop distance) plus the entry volatility percentile
-produce the risk tier, yielding the five classes
-`LONG_SUCCESS_{LOW,HIGH}_RISK`, `SHORT_SUCCESS_{LOW,HIGH}_RISK`,
-`NO_TRADE_OR_FAIL`.
+produce a risk tier, but the tier is kept out of the Direction model's own
+target: fusing "which way" with "how clean was the path" into one label
+diluted the discrete outcome the Direction model can actually learn and
+swamped the majority NO_TRADE class in extra classes worth of noise. Direction
+predicts three classes — `LONG_SUCCESS`, `SHORT_SUCCESS`, `NO_TRADE_OR_FAIL` —
+and the risk tier instead trains the Risk model's continuous opportunity
+score, which is turned back into a discrete tier (for the R7 gate and
+leverage sizing) by inverting that same score formula at inference time.
 
 ### Modules C & D — models and the arbiter
 
 Four heads, each answering exactly one question and knowing nothing about the
 others: **direction**, **entry timing**, **exit geometry**, **sizing**.
 Inference is stateless and runs off the event loop via `asyncio.to_thread`.
+
+The **Direction** head is itself a two-stage cascade rather than one 3-way
+softmax: a binary gate decides trade-vs-NO_TRADE, and — only on rows the gate
+calls a trade — a second binary model decides long-vs-short. The two
+questions lean on different signal (whether-to-trade skews toward
+volatility/regime features, long-vs-short toward directional/momentum ones),
+so splitting them sharpens each decision boundary instead of forcing one
+model to serve both. The **Entry** head auto-selects its decision threshold
+from its own validation sweep (F-beta=0.5, precision-weighted — a
+false-positive entry costs real capital, a missed true positive only costs a
+smaller position count) rather than trusting one fixed config constant. The
+**Risk** head fits the same L1 (robust) objective as Exit, since
+`target_risk_score` is right-skewed the same way exit-geometry percentages
+are, and is fed two additional causal features (`wick_ratio`,
+`whipsaw_rate`) aimed specifically at path-heat/whipsaw rather than raw
+move magnitude.
 
 When an artifact is missing a head falls back to a documented heuristic and
 stamps `source=HEURISTIC` — and rule **R9** refuses to let a heuristic place a
@@ -223,8 +244,8 @@ Every decision cycle is logged, **including every `NO_TRADE`**, with the feature
 snapshot, all four model outputs and the exact rule that fired. Writes are
 batched through an `asyncio.Queue`, so the trading loop never waits on SQLite.
 
-The panel serves `/` (dashboard), `/universe` (pair picker), `/audit` and
-`/trades`, plus a JSON API:
+The panel serves `/` (dashboard), `/universe` (pair picker), `/audit`,
+`/trades` and `/ml-report` (ML diagnostic report), plus a JSON API:
 
 | Endpoint | Purpose |
 |---|---|
@@ -237,6 +258,35 @@ The panel serves `/` (dashboard), `/universe` (pair picker), `/audit` and
 | `POST /api/trading/stop` | Disarm (`{"flatten": true}` to close positions too) |
 | `POST /api/kill_switch` | Trip RED, flatten everything |
 | `POST /api/reset_risk_guard` | Clear a RED latch |
+| `GET /api/ml/diagnostics` | Full ML diagnostic report for the last training run (JSON) |
+| `GET /api/ml/diagnostics/export.json` | Same report, as a download |
+| `GET /api/ml/diagnostics/export.md` | Human-readable Markdown rendering, as a download |
+
+### ML diagnostic report
+
+Every completed training run (`python main.py train`, or the panel's
+COLLECTING_DATA → TRAINING step) builds one structured report covering
+dataset health, QC/healing telemetry, per-head metrics (Direction, Entry,
+Exit, Risk) with confusion matrices, threshold sweeps, calibration and
+feature importance, label distribution, per-symbol breakdown, expanding-window
+walk-forward evaluation of the Direction model across multiple rolling folds,
+microstructure/derivatives data-coverage (is the order-book/funding/OI feed
+actually populated, or silently defaulting to neutral values), pipeline
+timing, and a before/after comparison against the previous run. Training also
+automatically replays the out-of-sample validation window through the full
+decision pipeline (`Backtester`), so win rate, profit factor, expectancy, max
+drawdown and Sharpe are real measured numbers rather than placeholders — see
+`TradingSystem._run_validation_backtest` in `main.py` for the exact window it
+covers and the one documented caveat (production calibrators are fit on that
+same validation block, so it is the best available out-of-sample
+approximation rather than a third, fully untouched split). An AI-ready
+summary sits at the top so the report can be handed to another AI to
+diagnose what changed. Every field with no real source data is the literal
+string `NOT_AVAILABLE` rather than a guess (e.g. walk-forward on a dataset
+too small to carve out honest folds). Reports are written to
+`<model_dir>/../reports/ml_diagnostic_<run_id>.{json,md}` and viewable at
+`/ml-report`. See `AUDIT_REPORT.md` for the full pipeline audit this was
+built from.
 
 ---
 

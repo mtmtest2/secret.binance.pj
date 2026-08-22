@@ -94,6 +94,18 @@ class SetupProgress:
             self.detail = detail
         self.percent = 0.0 if total <= 0 else min(100.0, 100.0 * done / total)
 
+    def set_step(self, step: str, detail: str = "") -> None:
+        """Relabel the current sub-stage without resetting the phase or counters.
+
+        ``advance()`` moves the progress bar but leaves ``step`` untouched, so a
+        multi-stage phase (e.g. training: dataset -> fit -> backtest -> report)
+        would otherwise show a stale label like "building dataset" long after
+        that sub-stage finished.
+        """
+        self.step = step
+        if detail:
+            self.detail = detail
+
     def finish(self, phase: SystemPhase, step: str, detail: str = "") -> None:
         """Mark the pipeline complete."""
         self.phase = phase

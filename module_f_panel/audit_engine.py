@@ -50,6 +50,9 @@ class AuditRecord:
     kama_slope: float = 0.0
     fdi: float = 0.0
     atr: float = 0.0
+    #: Always 0.0 - legacy field, kept only to avoid a DB schema migration.
+    #: ob_imbalance (its source feature) was removed entirely; see
+    #: _build_record (below) for why.
     order_book_imbalance: float = 0.0
     close_price: float = 0.0
 
@@ -324,7 +327,14 @@ class AuditEngine:
             record.kama_slope = float(snapshot.get("kama_slope", 0.0))
             record.fdi = float(snapshot.get("fdi", 0.0))
             record.atr = float(snapshot.get("atr", 0.0))
-            record.order_book_imbalance = float(snapshot.get("ob_imbalance", 0.0))
+            # order_book_imbalance is left at its dataclass default (0.0):
+            # ob_imbalance no longer exists as a feature (Binance has no
+            # historical order-book depth endpoint, so it could never be
+            # backfilled for training - see the commit that removed it from
+            # FEATURE_COLUMNS). The DB column/dataclass field is kept rather
+            # than dropped, to avoid a schema migration for what is otherwise
+            # an in-scope, low-risk feature removal - it is now permanently
+            # an always-zero legacy field.
             record.close_price = inference.close_price
 
             record.prob_long = inference.direction.long_probability

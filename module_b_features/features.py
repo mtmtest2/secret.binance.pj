@@ -26,10 +26,12 @@ to a worker thread (or a process pool) so the asyncio event loop that drives the
 from __future__ import annotations
 
 import asyncio
+import logging
 import warnings
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import contextmanager
 from enum import IntEnum
-from typing import Any, Final, Sequence
+from typing import Any, Final, Iterator, Sequence
 
 import numpy as np
 import pandas as pd
@@ -44,6 +46,33 @@ _LOGGER = get_logger(__name__)
 _EPSILON: Final[float] = 1e-12
 #: arch works best on percent-scaled returns; we divide the result back out.
 _GARCH_SCALE: Final[float] = 100.0
+#: Floor for any denominator derived from `realized_vol_12`.  One tick on a
+#: coarse-tick alt is ~1e-4 in log-return terms, so 1e-8 is far below anything
+#: a real market prints and only ever binds on genuinely flat candles - where
+#: the companion `realized_vol_12_is_zero` flag carries the information instead.
+_MIN_REALIZED_VOL: Final[float] = 1e-8
+
+
+@contextmanager
+def _muted_logger(name: str) -> Iterator[None]:
+    """Temporarily silence a third-party logger.
+
+    ``hmmlearn``'s EM convergence monitor reports a stalled fit through
+    ``logging.warning`` rather than the ``warnings`` module, so it slips past
+    the ``warnings.catch_warnings()`` guard already used around every HMM fit
+    below.  A short window failing to fully converge is expected and benign -
+    the fit still returns its best estimate - so this is pure log noise on a
+    hot path called on every rolling refit; muting the logger for the
+    duration of the fit call is what the surrounding ``catch_warnings`` block
+    already intended to do.
+    """
+    logger: logging.Logger = logging.getLogger(name)
+    previous_level: int = logger.level
+    logger.setLevel(logging.ERROR)
+    try:
+        yield
+    finally:
+        logger.setLevel(previous_level)
 
 
 class HMMRegime(IntEnum):
@@ -96,6 +125,14 @@ FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     "garch_vol_rank",
     "garch_vol_ratio",
     "vol_of_vol",
+    #: 1.0 when the trailing 12 candles were completely flat.  This used to be
+    #: expressed as a NaN in `vol_of_vol`/`garch_vol_ratio`, which cost the whole
+    #: row in the processor's `dropna`; it is real information (a dead market),
+    #: so it is carried explicitly instead of destroying the sample.
+    "realized_vol_12_is_zero",
+    # --- path heat / whipsaw -------------------------------------------------
+    "wick_ratio",
+    "whipsaw_rate",
     # --- regime -------------------------------------------------------------
     "hmm_regime",
     "hmm_prob_bull",
@@ -108,11 +145,30 @@ FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     "volume_rank",
     "volume_trend",
     "dollar_volume_rank",
-    # --- micro-structure ----------------------------------------------------
+    # --- micro-structure / derivatives ---------------------------------------
+    # The five order-book/liquidation columns below were removed in 2b56c8a on
+    # the premise that "Binance exposes no historical endpoint for either,
+    # ever".  That is true of the REST API and false of Binance's own bulk
+    # archive: data.binance.vision publishes `bookTicker`, `bookDepth` and
+    # `liquidationSnapshot` as daily ZIPs for the full life of each contract.
+    # They are restored here and backfilled by
+    # module_a_data/archive_loader.py::BinanceArchiveLoader, aggregated onto the
+    # 5m candle grid by module_a_data/pipeline.py::backfill_market_microstructure.
+    #
+    # Unlike the previous incarnation these are *not* zero-filled when absent:
+    # a missing snapshot is carried as NaN plus an explicit `_is_missing` flag,
+    # so the booster can split on "unobserved" instead of being taught that a
+    # neutral book is a market state (see the module docstring on missingness).
     "ob_imbalance",
     "ob_imbalance_delta",
     "ob_spread_bps",
     "ob_spread_rank",
+    "liquidation_imbalance",
+    "microstructure_is_missing",
+    # funding_rate has full history since contract inception; open interest and
+    # the positioning ratios are ~30-day-retention limited on the REST API but
+    # are also published in full by the archive's `metrics` dataset - see
+    # module_a_data/pipeline.py::backfill_futures_metrics.
     "funding_rate",
     "funding_rate_delta",
     "funding_rate_rank",
@@ -120,12 +176,34 @@ FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     "open_interest_rank",
     "long_short_ratio",
     "taker_buy_sell_ratio",
-    "liquidation_imbalance",
     # --- session ------------------------------------------------------------
     "hour_sin",
     "hour_cos",
     "dow_sin",
     "dow_cos",
+)
+
+
+#: Features whose absence is a legitimate, expected state rather than a broken
+#: pipeline: the archive's micro-structure coverage starts later than klines for
+#: some symbols, and a live cycle may simply have no book reading for the bar.
+#: Training keeps such rows (the boosters split on NaN); live inference is
+#: allowed to score them too, because refusing to trade whenever the order book
+#: is momentarily unobserved would silently halt the whole system.
+OPTIONAL_FEATURE_COLUMNS: Final[frozenset[str]] = frozenset(
+    {
+        "ob_imbalance",
+        "ob_imbalance_delta",
+        "ob_spread_bps",
+        "ob_spread_rank",
+        "liquidation_imbalance",
+    }
+)
+
+#: Everything else must be finite before a bar is tradeable - these are the
+#: rolling-window features whose absence means "not warmed up yet".
+REQUIRED_FEATURE_COLUMNS: Final[tuple[str, ...]] = tuple(
+    column for column in FEATURE_COLUMNS if column not in OPTIONAL_FEATURE_COLUMNS
 )
 
 
@@ -171,8 +249,11 @@ class FeatureEngineer:
                 :meth:`DatabaseHandler.load_ohlcv_dataframe`).
             futures: Optional funding / open-interest / positioning history with
                 a ``timestamp`` column.  Joined backward-asof.
-            order_book: Optional order-book snapshot history with a ``timestamp``
-                column.  Joined backward-asof.
+            order_book: Accepted for backward compatibility but no longer
+                consumed - the order-book depth features it fed (ob_imbalance,
+                ob_imbalance_delta, ob_spread_bps, ob_spread_rank) were removed
+                from FEATURE_COLUMNS; Binance has no historical order-book
+                depth endpoint, so they could never be backfilled for training.
 
         Returns:
             The input frame plus every column in :data:`FEATURE_COLUMNS`.  Rows
@@ -200,6 +281,7 @@ class FeatureEngineer:
         try:
             frame = self._add_price_features(frame)
             frame = self._add_volatility_features(frame)
+            frame = self._add_risk_features(frame)
             frame = self._add_volume_features(frame)
             frame = self._add_garch_features(frame)
             frame = self._add_hmm_features(frame)
@@ -301,12 +383,59 @@ class FeatureEngineer:
         log_returns: pd.Series = frame["log_return_1"].fillna(0.0)
         frame["realized_vol_12"] = ind.realized_volatility(log_returns, 12)
         frame["realized_vol_48"] = ind.realized_volatility(log_returns, 48)
+
+        # A dead market - 12 consecutive candles that all closed at the same
+        # price, which is routine for a coarse-tick alt in a quiet hour - makes
+        # `realized_vol_12` exactly 0.0.  Dividing by it used to emit NaN here
+        # and in `garch_vol_ratio`, and the processor's `dropna` across every
+        # feature column then destroyed the *whole row*.  Because flat candles
+        # cluster in exactly the low-liquidity symbols and quiet periods, that
+        # deleted 73% of the training window while leaving validation and test
+        # nearly intact - a silent, systematic sample-selection bias rather
+        # than the harmless warm-up trim it was logged as.  Flooring the
+        # denominator keeps the ratio finite; `realized_vol_12_is_zero`
+        # preserves the fact that the market was dead, which is real
+        # information the models should be able to split on.
+        is_zero_vol: pd.Series = frame["realized_vol_12"].fillna(0.0).abs() <= _EPSILON
+        floored_vol: pd.Series = frame["realized_vol_12"].clip(lower=_MIN_REALIZED_VOL)
+        frame["realized_vol_12_is_zero"] = is_zero_vol.astype(float)
         frame["vol_of_vol"] = (
             frame["realized_vol_12"]
             .rolling(window=48, min_periods=12)
             .std(ddof=0)
-            .div(frame["realized_vol_12"].replace(0.0, np.nan))
+            .div(floored_vol)
         )
+        return frame
+
+    # ------------------------------------------------------------------
+    # Path heat / whipsaw
+    # ------------------------------------------------------------------
+    def _add_risk_features(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Whipsaw / rejection-wick proxies for the Risk model's path-heat target.
+
+        The Risk model predicts how much a trade is likely to get whipsawed
+        before resolving (the labeler's ``target_risk_score``, built from the
+        max-adverse-excursion ratio). The existing volatility features (ATR,
+        realised vol, GARCH) only capture the *magnitude* of price moves, not
+        how often direction reverses or how much of a candle's range was a
+        rejected wick rather than a genuine directional move - two signals
+        that are conceptually closer to "how choppy has this been" than
+        "how big have moves been". Both are purely trailing/rolling, so they
+        stay causal like every other feature in this module.
+        """
+        high: pd.Series = frame["high"].astype(float)
+        low: pd.Series = frame["low"].astype(float)
+        open_price: pd.Series = frame["open"].astype(float)
+        close: pd.Series = frame["close"].astype(float)
+
+        candle_range: pd.Series = (high - low).replace(0.0, np.nan)
+        body: pd.Series = (close - open_price).abs()
+        raw_wick_ratio: pd.Series = 1.0 - (body / candle_range).clip(0.0, 1.0)
+        frame["wick_ratio"] = raw_wick_ratio.rolling(window=6, min_periods=3).mean().fillna(0.0)
+
+        log_return: pd.Series = frame["log_return_1"].fillna(0.0)
+        sign_flip: pd.Series = (np.sign(log_return) != np.sign(log_return.shift(1))).astype(float)
+        frame["whipsaw_rate"] = sign_flip.rolling(window=12, min_periods=6).mean().fillna(0.0)
         return frame
 
     # ------------------------------------------------------------------
@@ -341,7 +470,8 @@ class FeatureEngineer:
         frame["garch_vol_rank"] = ind.rolling_percentile_rank(
             forecast.ffill().fillna(0.0), self._config.rank_window
         )
-        realized: pd.Series = frame["realized_vol_12"].replace(0.0, np.nan)
+        # Floored, not NaN-ed, for the same reason as `vol_of_vol` above.
+        realized: pd.Series = frame["realized_vol_12"].clip(lower=_MIN_REALIZED_VOL)
         frame["garch_vol_ratio"] = forecast / realized
         return frame
 
@@ -380,6 +510,11 @@ class FeatureEngineer:
         scaled: np.ndarray = values * _GARCH_SCALE
         is_garch_11: bool = config.garch_p == 1 and config.garch_q == 1
 
+        # Precomputed per-row causal fallback, used for any bar the GARCH
+        # recursion cannot cover (see the `not fitted` branch below).  EWMA is
+        # itself strictly trailing, so substituting it introduces no look-ahead.
+        ewma_fallback: np.ndarray = self._ewma_volatility(log_returns).to_numpy(dtype=np.float64)
+
         omega: float = 0.0
         alpha: float = 0.0
         beta: float = 0.0
@@ -405,6 +540,16 @@ class FeatureEngineer:
                     fitted = True
 
             if not fitted:
+                # Not yet a single usable fit.  `_fit_garch` rejects any
+                # parameter set with `alpha + beta >= 1`, which is the *normal*
+                # outcome for GARCH(1,1) on high-frequency crypto returns
+                # (near-IGARCH behaviour), so this branch can persist for tens
+                # of thousands of bars.  Leaving NaN here used to cost the whole
+                # row downstream; the series-wide EWMA fallback below only fires
+                # when *every* row is NaN, so a partial failure produced a long
+                # hole rather than a fallback.  Emit the causal EWMA estimate
+                # for this row instead and keep looking for a fit.
+                output[index] = ewma_fallback[index]
                 continue
 
             if is_garch_11:
@@ -635,7 +780,7 @@ class FeatureEngineer:
         standardised: np.ndarray = (sample - mean) / std
 
         try:
-            with warnings.catch_warnings():
+            with warnings.catch_warnings(), _muted_logger("hmmlearn.base"):
                 warnings.simplefilter("ignore")
                 model = gaussian_hmm(
                     n_components=config.hmm_states,
@@ -786,28 +931,35 @@ class FeatureEngineer:
         futures: pd.DataFrame | None,
         order_book: pd.DataFrame | None,
     ) -> pd.DataFrame:
-        """Join order-book and futures snapshots backward-asof onto the candles.
+        """Join futures snapshots backward-asof onto the candles.
 
         ``direction="backward"`` is what enforces causality here: a candle can
         only be matched with a snapshot whose timestamp is ``<=`` its own open
-        time.  Missing feeds degrade to neutral constants (zero imbalance, zero
-        funding), never to forward-filled future values.
+        time.  Missing feeds degrade to neutral constants (zero funding, etc.),
+        never to forward-filled future values.
+
+        ``order_book`` carries the 5m-bucketed micro-structure aggregates built
+        by :meth:`module_a_data.pipeline.PipelineOrchestrator.
+        backfill_market_microstructure` from Binance's ``bookTicker`` and
+        ``liquidationSnapshot`` daily archives.  Because those buckets sit on
+        the candles' own 5-minute grid, they are joined on the **exact** bucket
+        key rather than as-of: an as-of match would silently carry a book
+        reading from hours (or days) earlier into a bar that had none, which is
+        precisely the "no data looks like a market state" failure that got the
+        previous incarnation of these columns deleted.
+
+        Missing buckets are therefore left as ``NaN`` and flagged by
+        ``microstructure_is_missing`` rather than zero-filled.  ``NaN`` is a
+        value LightGBM splits on natively, so "we could not see the book" stays
+        distinguishable from "the book was balanced" all the way into the model.
         """
         config: FeatureSettings = self._config
         frame = frame.copy()
         frame["timestamp"] = frame["timestamp"].astype("int64")
 
-        merged: pd.DataFrame = self._asof_join(frame, order_book, "book")
-        merged = self._asof_join(merged, futures, "futures")
-
-        imbalance: pd.Series = merged.get("imbalance", pd.Series(0.0, index=merged.index))
-        spread_bps: pd.Series = merged.get("spread_bps", pd.Series(0.0, index=merged.index))
-        merged["ob_imbalance"] = imbalance.astype(float).fillna(0.0).clip(-1.0, 1.0)
-        merged["ob_imbalance_delta"] = merged["ob_imbalance"].diff(3).fillna(0.0)
-        merged["ob_spread_bps"] = spread_bps.astype(float).fillna(0.0).clip(lower=0.0)
-        merged["ob_spread_rank"] = ind.rolling_percentile_rank(
-            merged["ob_spread_bps"], config.rank_window
-        ).fillna(0.5)
+        merged: pd.DataFrame = self._asof_join(frame, futures, "futures")
+        merged = self._exact_bucket_join(merged, order_book, "microstructure")
+        merged = self._add_order_book_features(merged, config)
 
         funding: pd.Series = (
             merged.get("funding_rate", pd.Series(0.0, index=merged.index)).astype(float).fillna(0.0)
@@ -841,21 +993,89 @@ class FeatureEngineer:
         )
         merged["taker_buy_sell_ratio"] = np.log(taker.clip(lower=0.01))
 
-        liq_buy: pd.Series = (
-            merged.get("liquidation_buy_volume", pd.Series(0.0, index=merged.index))
-            .astype(float)
-            .fillna(0.0)
-        )
-        liq_sell: pd.Series = (
-            merged.get("liquidation_sell_volume", pd.Series(0.0, index=merged.index))
-            .astype(float)
-            .fillna(0.0)
-        )
-        liq_total: pd.Series = (liq_buy + liq_sell).replace(0.0, np.nan)
-        merged["liquidation_imbalance"] = ((liq_buy - liq_sell) / liq_total).fillna(0.0)
-
         merged.index = frame.index
         return merged
+
+    @staticmethod
+    def _add_order_book_features(
+        frame: pd.DataFrame,
+        config: FeatureSettings,
+    ) -> pd.DataFrame:
+        """Derive the order-book and liquidation columns from joined buckets.
+
+        Every column here is deliberately ``NaN``-preserving.  ``bid_qty``,
+        ``ask_qty``, ``spread_bps`` and the two liquidation volumes arrive as
+        ``NaN`` for any 5m bucket the archive did not cover; each derived
+        feature inherits that, and ``microstructure_is_missing`` records it as a
+        first-class signal.
+        """
+        index: pd.Index = frame.index
+        missing_column: pd.Series = pd.Series(np.nan, index=index, dtype="float64")
+
+        bid_qty: pd.Series = frame.get("bid_qty", missing_column).astype(float)
+        ask_qty: pd.Series = frame.get("ask_qty", missing_column).astype(float)
+        depth: pd.Series = bid_qty + ask_qty
+        # A bucket whose top-of-book was observed but empty on both sides is
+        # genuinely undefined, not balanced - keep it NaN rather than 0.
+        frame["ob_imbalance"] = ((bid_qty - ask_qty) / depth.where(depth > 0.0)).clip(-1.0, 1.0)
+        frame["ob_imbalance_delta"] = frame["ob_imbalance"].diff(3)
+
+        spread: pd.Series = frame.get("spread_bps", missing_column).astype(float)
+        frame["ob_spread_bps"] = spread.clip(lower=0.0)
+        # `Rolling.rank` skips NaN within the window, so a sparse stretch yields
+        # a rank over whatever was actually observed instead of a fabricated 0.5.
+        frame["ob_spread_rank"] = ind.rolling_percentile_rank(
+            frame["ob_spread_bps"], config.rank_window
+        )
+
+        liquidation_buy: pd.Series = frame.get("liquidation_buy_volume", missing_column).astype(float)
+        liquidation_sell: pd.Series = frame.get("liquidation_sell_volume", missing_column).astype(float)
+        liquidation_total: pd.Series = liquidation_buy + liquidation_sell
+        # A covered bucket with no liquidations reads 0/0.  That is a real,
+        # informative state ("nobody got liquidated"), so it maps to 0.0 - but
+        # only when the bucket was covered at all, which the loader guarantees
+        # by writing an explicit zero row for every bucket of every covered day.
+        frame["liquidation_imbalance"] = np.where(
+            liquidation_total.to_numpy() > 0.0,
+            (liquidation_buy - liquidation_sell) / liquidation_total.where(liquidation_total > 0.0),
+            np.where(liquidation_total.notna().to_numpy(), 0.0, np.nan),
+        )
+
+        frame["microstructure_is_missing"] = (
+            frame["ob_imbalance"].isna() & frame["ob_spread_bps"].isna()
+        ).astype(float)
+        return frame
+
+    @staticmethod
+    def _exact_bucket_join(
+        frame: pd.DataFrame,
+        other: pd.DataFrame | None,
+        label: str,
+    ) -> pd.DataFrame:
+        """Join pre-bucketed 5m aggregates on the exact ``timestamp`` key.
+
+        Unlike :meth:`_asof_join` this never carries a stale reading forward: a
+        bucket the archive did not cover simply stays ``NaN``.  Causality is
+        preserved because the bucket key *is* the candle's own open time and the
+        loader only ever emits buckets that have fully closed.
+        """
+        if other is None or other.empty or "timestamp" not in other.columns:
+            _LOGGER.debug("No %s data supplied; those columns stay NaN", label)
+            return frame
+
+        right: pd.DataFrame = other.copy()
+        right["timestamp"] = right["timestamp"].astype("int64")
+        right = right.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+
+        overlapping: list[str] = [
+            column for column in right.columns if column != "timestamp" and column in frame.columns
+        ]
+        right = right.drop(columns=overlapping)
+
+        original_index: pd.Index = frame.index
+        joined: pd.DataFrame = frame.merge(right, on="timestamp", how="left")
+        joined.index = original_index
+        return joined
 
     @staticmethod
     def _asof_join(

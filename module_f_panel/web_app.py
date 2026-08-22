@@ -12,10 +12,14 @@ interface, an SSH tunnel or a firewall allow-list before exposing it.
 
 from __future__ import annotations
 
+import io
+import zipfile
+from pathlib import Path
 from typing import Any, Protocol, Sequence, runtime_checkable
 
+import pandas as pd
 from fastapi import Body, FastAPI, HTTPException, Query, Request, status
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from jinja2 import DictLoader, Environment, select_autoescape
 
 from config.settings import Settings
@@ -81,6 +85,12 @@ class SystemController(Protocol):
 
     async def reset_risk_guard(self, operator: str) -> dict[str, Any]:
         """Clear a RED latch after manual review."""
+
+    async def ml_diagnostics(self) -> dict[str, Any]:
+        """The full ML diagnostic report for the most recent training run."""
+
+    async def ml_diagnostics_markdown(self) -> str:
+        """The same report, rendered as human-readable Markdown."""
 
 
 def build_app(controller: SystemController) -> FastAPI:
@@ -166,6 +176,12 @@ def build_app(controller: SystemController) -> FastAPI:
         """Closed and open trades with fees, funding and realised PnL."""
         return render("trades_content.html", "trades_scripts.html")
 
+    @app.get("/ml-report", response_class=HTMLResponse, summary="ML diagnostic report")
+    async def ml_report_page() -> HTMLResponse:
+        """Full training diagnostics: dataset health, per-head metrics, data
+        quality, features, labels, backtest and the AI-ready summary."""
+        return render("ml_report_content.html", "ml_report_scripts.html")
+
     # ------------------------------------------------------------------
     # Read-only API
     # ------------------------------------------------------------------
@@ -212,6 +228,125 @@ def build_app(controller: SystemController) -> FastAPI:
     async def api_logs(limit: int = Query(default=200, ge=1, le=800)) -> JSONResponse:
         """Tail of the in-memory ring buffer - no filesystem access required."""
         return JSONResponse({"rows": LOG_BUFFER.snapshot(limit)})
+
+    @app.get("/api/logs/download", summary="Download the on-disk log file(s)")
+    async def api_logs_download() -> Any:
+        """Serve ``core.logger.configure_logging``'s rotating log file(s).
+
+        Unlike ``/api/logs`` (the in-memory ring buffer, capped at the most
+        recent 800 formatted lines), this serves the actual on-disk
+        ``quant_system.log`` written by the ``RotatingFileHandler`` - the
+        full history up to its rotation caps. When rotation has produced
+        backups (``quant_system.log.1``, ``.2``, ...) they are all zipped
+        together in memory (``io.BytesIO`` / ``zipfile`` - no temp files);
+        a single current file is returned as a plain-text attachment.
+        """
+        log_dir: Path = settings.log_dir
+        log_files: list[Path] = sorted(
+            (path for path in log_dir.glob("quant_system.log*") if path.is_file()),
+            key=lambda path: path.name,
+        )
+        if not log_files:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no log file found in {log_dir} - is settings.log_dir configured?",
+            )
+
+        if len(log_files) == 1:
+            return PlainTextResponse(
+                log_files[0].read_text(encoding="utf-8", errors="replace"),
+                media_type="text/plain",
+                headers={"Content-Disposition": f'attachment; filename="{log_files[0].name}"'},
+            )
+
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for path in log_files:
+                archive.write(path, arcname=path.name)
+        buffer.seek(0)
+        return Response(
+            content=buffer.getvalue(),
+            media_type="application/zip",
+            headers={"Content-Disposition": 'attachment; filename="quant_system_logs.zip"'},
+        )
+
+    # ------------------------------------------------------------------
+    # ML diagnostic report API
+    # ------------------------------------------------------------------
+    @app.get("/api/ml/diagnostics", summary="Full ML diagnostic report (JSON)")
+    async def api_ml_diagnostics() -> JSONResponse:
+        """The structured report for the most recent training run.
+
+        Every section is either real, measured data or the literal string
+        ``"NOT_AVAILABLE"`` - never a fabricated value. See ``/ml-report`` for
+        the human-readable dashboard built on top of the same data.
+        """
+        try:
+            return JSONResponse(await controller.ml_diagnostics())
+        except Exception as error:  # pragma: no cover - the panel must not 500
+            _LOGGER.error("ML diagnostics unavailable: %s", error, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"diagnostics unavailable: {error}") from error
+
+    @app.get("/api/ml/diagnostics/export.json", summary="Download the full report as JSON")
+    async def api_ml_diagnostics_export_json() -> JSONResponse:
+        """Same content as ``/api/ml/diagnostics``, offered as a download."""
+        report: dict[str, Any] = await controller.ml_diagnostics()
+        run_id: str = str(report.get("run", {}).get("run_id", "latest"))
+        return JSONResponse(
+            report,
+            headers={"Content-Disposition": f'attachment; filename="ml_diagnostic_{run_id}.json"'},
+        )
+
+    @app.get("/api/ml/diagnostics/export.md", summary="Download the human-readable report")
+    async def api_ml_diagnostics_export_markdown() -> Any:
+        """Markdown rendering of the same report, offered as a download."""
+        markdown: str = await controller.ml_diagnostics_markdown()
+        report: dict[str, Any] = await controller.ml_diagnostics()
+        run_id: str = str(report.get("run", {}).get("run_id", "latest"))
+        return PlainTextResponse(
+            markdown,
+            media_type="text/markdown",
+            headers={"Content-Disposition": f'attachment; filename="ml_diagnostic_{run_id}.md"'},
+        )
+
+    @app.get("/api/backtest/trades.csv", summary="Download the diagnostic backtest's trades as CSV")
+    async def api_backtest_trades_csv(
+        variant: str = Query(
+            default="strict",
+            pattern="^(strict|relaxed)$",
+            description="'strict' (live-configured thresholds) or 'relaxed' (diagnostic-only, "
+            "loosened thresholds - see backtest_diagnostic_relaxed in /api/ml/diagnostics).",
+        ),
+    ) -> Any:
+        """Every trade from the most recent diagnostic backtest run, as a CSV.
+
+        Pulls from the same ``report["backtest"]`` / ``report["backtest_diagnostic_relaxed"]``
+        trades list already embedded in the full JSON export (``/api/ml/diagnostics/export.json``)
+        - this just offers it as a directly-downloadable, spreadsheet-friendly file instead of
+        requiring the operator to extract it from the larger report by hand.
+        """
+        report: dict[str, Any] = await controller.ml_diagnostics()
+        section_key: str = "backtest" if variant == "strict" else "backtest_diagnostic_relaxed"
+        section: dict[str, Any] = report.get(section_key, {})
+        trades: list[dict[str, Any]] = section.get("trades", []) if isinstance(section, dict) else []
+
+        if not trades:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no {variant} backtest trades available yet - run training first",
+            )
+
+        run_id: str = str(report.get("run", {}).get("run_id", "latest"))
+        csv_text: str = pd.DataFrame(trades).to_csv(index=False)
+        return PlainTextResponse(
+            csv_text,
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="backtest_trades_{variant}_{run_id}.csv"'
+                )
+            },
+        )
 
     # ------------------------------------------------------------------
     # Universe API

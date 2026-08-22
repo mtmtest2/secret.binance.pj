@@ -16,10 +16,13 @@ Design notes
 
 from __future__ import annotations
 
+import asyncio
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from types import TracebackType
 from typing import Any, Final, Sequence
 
+import numpy as np
 import pandas as pd
 from sqlalchemy import Select, delete, desc, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -35,11 +38,13 @@ from sqlalchemy.ext.asyncio import (
 from config.settings import Settings
 from core.exceptions import DatabaseError
 from core.logger import get_logger
+from core.utils import chunked
 from module_a_data.db_models import (
     AuditLogRow,
     Base,
     EquityRow,
     FuturesMetricsRow,
+    MicrostructureRow,
     OHLCVRow,
     OrderBookRow,
     SystemStateRow,
@@ -58,6 +63,58 @@ _OHLCV_COLUMNS: Final[tuple[str, ...]] = (
     "volume",
 )
 
+#: Columns bound per row in the :meth:`DatabaseHandler.upsert_candles` payload
+#: (symbol, timeframe, timestamp, open, high, low, close, volume).
+_OHLCV_UPSERT_COLUMNS: Final[int] = 8
+
+#: The historical (pre-SQLite-3.32) default variable-count ceiling.  Used only
+#: as a fallback if the real limit cannot be queried from this process's
+#: linked-in SQLite library - see :func:`_detect_upsert_batch_rows`.
+_FALLBACK_SQLITE_VARIABLE_LIMIT: Final[int] = 999
+
+
+def _detect_upsert_batch_rows(columns_per_row: int) -> int:
+    """Compute a per-statement row count that is safe under *this process's*
+    actual compiled SQLite variable-count ceiling.
+
+    A single ``INSERT ... VALUES (...), (...), ...`` statement binds one SQL
+    variable per column per row - unlike ``executemany``, ``.values(list)``
+    builds one literal multi-row statement and is *not* auto-chunked by
+    SQLAlchemy's "insertmanyvalues" machinery.  SQLite's compiled
+    ``SQLITE_MAX_VARIABLE_NUMBER`` has shipped as low as 999 (pre-3.32, still
+    the default on some distro-packaged builds) and as high as 32766+ on
+    modern ones, so guessing a fixed number risks either failing outright on
+    an older build or leaving needless round-trips on the table for a modern
+    one.  ``sqlite3.Connection.getlimit`` (Python 3.11+) reports the value
+    actually linked into this process, so it is queried once at import time
+    instead of assumed.
+    """
+    limit: int = 0
+    try:
+        probe = sqlite3.connect(":memory:")
+        try:
+            getlimit = getattr(probe, "getlimit", None)
+            if getlimit is not None:
+                limit = int(getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER))
+        finally:
+            probe.close()
+    except Exception:  # pragma: no cover - defensive: never let detection fail startup
+        limit = 0
+    if limit <= 0:
+        limit = _FALLBACK_SQLITE_VARIABLE_LIMIT
+
+    # Half the real ceiling, so this remains safe even if a future column is
+    # added to the payload without updating `columns_per_row`.
+    safe_params: int = max(columns_per_row, limit // 2)
+    rows: int = safe_params // columns_per_row
+    # A ceiling on top of that so one batch (and the write lock it holds,
+    # see `DatabaseHandler._write_lock`) never dominates a transaction.
+    return max(1, min(rows, 500))
+
+
+#: Rows per multi-row upsert statement - see :func:`_detect_upsert_batch_rows`.
+_UPSERT_BATCH_ROWS: Final[int] = _detect_upsert_batch_rows(_OHLCV_UPSERT_COLUMNS)
+
 
 class DatabaseHandler:
     """Owns the async engine and exposes every persistence operation."""
@@ -66,6 +123,16 @@ class DatabaseHandler:
         self._settings: Settings = settings
         self._engine: AsyncEngine | None = None
         self._session_factory: async_sessionmaker[AsyncSession] | None = None
+        #: SQLite allows exactly one writer at a time; without this, concurrent
+        #: writers (e.g. up to `max_concurrent_requests` symbols bootstrapping
+        #: in parallel, each holding a transaction open across many batched
+        #: upsert statements) contend for that single lock and can exceed
+        #: `busy_timeout_ms`, failing with "database is locked".  Serialising
+        #: writes at the application level turns that race into a queue that
+        #: always eventually succeeds instead of a race that sometimes times
+        #: out.  Reads are unaffected: WAL journalling lets them proceed
+        #: concurrently with a writer.
+        self._write_lock: asyncio.Lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -138,6 +205,12 @@ class DatabaseHandler:
     async def upsert_candles(self, candles: Sequence[OHLCVCandle]) -> int:
         """Bulk-upsert validated candles.
 
+        Batched into ``_UPSERT_BATCH_ROWS``-row statements within a single
+        transaction: a full-history bootstrap can easily exceed 100,000 rows,
+        and SQLite's bound-parameter ceiling makes one giant multi-row
+        ``INSERT`` for the whole block fail outright (see
+        :data:`_UPSERT_BATCH_ROWS`).
+
         Returns:
             The number of rows submitted (SQLite does not report affected rows
             reliably for multi-row upserts).
@@ -159,24 +232,30 @@ class DatabaseHandler:
             for candle in candles
         ]
 
-        statement = sqlite_insert(OHLCVRow).values(payload)
-        statement = statement.on_conflict_do_update(
-            index_elements=[OHLCVRow.symbol, OHLCVRow.timeframe, OHLCVRow.timestamp],
-            set_={
-                "open": statement.excluded.open,
-                "high": statement.excluded.high,
-                "low": statement.excluded.low,
-                "close": statement.excluded.close,
-                "volume": statement.excluded.volume,
-            },
-        )
-
         try:
-            async with self._factory()() as session:
+            async with self._write_lock, self._factory()() as session:
                 async with session.begin():
-                    await session.execute(statement)
+                    for batch in chunked(payload, _UPSERT_BATCH_ROWS):
+                        statement = sqlite_insert(OHLCVRow).values(batch)
+                        statement = statement.on_conflict_do_update(
+                            index_elements=[
+                                OHLCVRow.symbol,
+                                OHLCVRow.timeframe,
+                                OHLCVRow.timestamp,
+                            ],
+                            set_={
+                                "open": statement.excluded.open,
+                                "high": statement.excluded.high,
+                                "low": statement.excluded.low,
+                                "close": statement.excluded.close,
+                                "volume": statement.excluded.volume,
+                            },
+                        )
+                        await session.execute(statement)
         except SQLAlchemyError as error:
-            raise DatabaseError("candle upsert failed", rows=len(payload)) from error
+            raise DatabaseError(
+                "candle upsert failed", rows=len(payload), reason=str(error)
+            ) from error
         return len(payload)
 
     async def upsert_order_book(self, snapshot: OrderBookSnapshot) -> None:
@@ -200,11 +279,13 @@ class DatabaseHandler:
             set_={key: statement.excluded[key] for key in values if key not in ("symbol", "timestamp")},
         )
         try:
-            async with self._factory()() as session:
+            async with self._write_lock, self._factory()() as session:
                 async with session.begin():
                     await session.execute(statement)
         except SQLAlchemyError as error:
-            raise DatabaseError("order book upsert failed", symbol=snapshot.symbol) from error
+            raise DatabaseError(
+                "order book upsert failed", symbol=snapshot.symbol, reason=str(error)
+            ) from error
 
     async def upsert_futures_metrics(self, metrics: FuturesMetrics) -> None:
         """Persist funding / OI / positioning / liquidation metrics."""
@@ -233,11 +314,90 @@ class DatabaseHandler:
             },
         )
         try:
-            async with self._factory()() as session:
+            async with self._write_lock, self._factory()() as session:
                 async with session.begin():
                     await session.execute(statement)
         except SQLAlchemyError as error:
-            raise DatabaseError("futures metrics upsert failed", symbol=metrics.symbol) from error
+            raise DatabaseError(
+                "futures metrics upsert failed", symbol=metrics.symbol, reason=str(error)
+            ) from error
+
+    async def upsert_futures_metrics_batch(self, metrics: Sequence[FuturesMetrics]) -> int:
+        """Bulk-upsert historical futures metrics (funding/OI/positioning backfill).
+
+        Mirrors :meth:`upsert_candles`'s batching: a multi-month backfill across
+        29 symbols can easily produce tens of thousands of rows, well past
+        SQLite's bound-parameter ceiling for a single statement.
+        """
+        if not metrics:
+            return 0
+
+        payload: list[dict[str, Any]] = [
+            {
+                "symbol": item.symbol,
+                "timestamp": item.timestamp,
+                "funding_rate": item.funding_rate,
+                "next_funding_time": item.next_funding_time,
+                "open_interest": item.open_interest,
+                "open_interest_value": item.open_interest_value,
+                "long_short_ratio": item.long_short_ratio,
+                "top_trader_long_short_ratio": item.top_trader_long_short_ratio,
+                "taker_buy_sell_ratio": item.taker_buy_sell_ratio,
+                "liquidation_buy_volume": item.liquidation_buy_volume,
+                "liquidation_sell_volume": item.liquidation_sell_volume,
+                "mark_price": item.mark_price,
+                "index_price": item.index_price,
+            }
+            for item in metrics
+        ]
+        batch_rows: int = _detect_upsert_batch_rows(len(payload[0]))
+
+        try:
+            async with self._write_lock, self._factory()() as session:
+                async with session.begin():
+                    for batch in chunked(payload, batch_rows):
+                        statement = sqlite_insert(FuturesMetricsRow).values(batch)
+                        statement = statement.on_conflict_do_update(
+                            index_elements=[FuturesMetricsRow.symbol, FuturesMetricsRow.timestamp],
+                            set_={
+                                key: statement.excluded[key]
+                                for key in batch[0]
+                                if key not in ("symbol", "timestamp")
+                            },
+                        )
+                        await session.execute(statement)
+        except SQLAlchemyError as error:
+            raise DatabaseError(
+                "futures metrics batch upsert failed", rows=len(payload), reason=str(error)
+            ) from error
+        return len(payload)
+
+    async def latest_futures_metrics_timestamp(self, symbol: str) -> int | None:
+        """Return the newest stored futures-metrics timestamp for ``symbol``."""
+        query: Select[Any] = select(func.max(FuturesMetricsRow.timestamp)).where(
+            FuturesMetricsRow.symbol == symbol
+        )
+        async with self._factory()() as session:
+            result: Result[Any] = await session.execute(query)
+            value: Any = result.scalar_one_or_none()
+        return int(value) if value is not None else None
+
+    async def earliest_futures_metrics_timestamp(self, symbol: str) -> int | None:
+        """Return the oldest stored futures-metrics timestamp for ``symbol``.
+
+        The backfill resumes from this end, not from
+        :meth:`latest_futures_metrics_timestamp`: the live 5-minute cycle writes
+        a "now" snapshot every pass, so the newest row is always the present
+        moment and a newest-first resume rule would leave the historical window
+        permanently unfilled.
+        """
+        query: Select[Any] = select(func.min(FuturesMetricsRow.timestamp)).where(
+            FuturesMetricsRow.symbol == symbol
+        )
+        async with self._factory()() as session:
+            result: Result[Any] = await session.execute(query)
+            value: Any = result.scalar_one_or_none()
+        return int(value) if value is not None else None
 
     # ------------------------------------------------------------------
     # Market-data reads
@@ -367,6 +527,114 @@ class DatabaseHandler:
             "microprice": float(row.microprice),
         }
 
+    async def upsert_microstructure_batch(
+        self,
+        symbol: str,
+        buckets: pd.DataFrame,
+        source: str = "archive",
+    ) -> int:
+        """Bulk-upsert 5m micro-structure buckets for one symbol.
+
+        ``buckets`` must carry a ``timestamp`` column on the 5-minute grid; any
+        of ``bid_qty``/``ask_qty``/``spread_bps``/``liquidation_buy_volume``/
+        ``liquidation_sell_volume`` may be absent or NaN, and NaN is persisted
+        as SQL ``NULL`` rather than 0.0 so "unobserved" survives the round trip.
+        """
+        if buckets.empty or "timestamp" not in buckets.columns:
+            return 0
+
+        value_columns: list[str] = [
+            "bid_qty",
+            "ask_qty",
+            "spread_bps",
+            "liquidation_buy_volume",
+            "liquidation_sell_volume",
+        ]
+        frame: pd.DataFrame = buckets.copy()
+        for column in value_columns:
+            if column not in frame.columns:
+                frame[column] = np.nan
+
+        payload: list[dict[str, Any]] = []
+        for row in frame.itertuples(index=False):
+            record: dict[str, Any] = {
+                "symbol": symbol,
+                "timestamp": int(getattr(row, "timestamp")),
+                "source": source,
+            }
+            for column in value_columns:
+                value = getattr(row, column, None)
+                record[column] = (
+                    None if value is None or pd.isna(value) else float(value)
+                )
+            payload.append(record)
+
+        if not payload:
+            return 0
+        batch_rows: int = _detect_upsert_batch_rows(len(payload[0]))
+
+        try:
+            async with self._write_lock, self._factory()() as session:
+                async with session.begin():
+                    for batch in chunked(payload, batch_rows):
+                        statement = sqlite_insert(MicrostructureRow).values(batch)
+                        statement = statement.on_conflict_do_update(
+                            index_elements=[MicrostructureRow.symbol, MicrostructureRow.timestamp],
+                            set_={
+                                key: statement.excluded[key]
+                                for key in batch[0]
+                                if key not in ("symbol", "timestamp")
+                            },
+                        )
+                        await session.execute(statement)
+        except SQLAlchemyError as error:
+            raise DatabaseError(
+                "failed to upsert micro-structure buckets", symbol=symbol, cause=str(error)
+            ) from error
+        return len(payload)
+
+    async def load_microstructure_frame(self, symbol: str, limit: int = 1_000) -> pd.DataFrame:
+        """Load recent 5m micro-structure buckets as a timestamp-keyed frame."""
+        query: Select[Any] = (
+            select(
+                MicrostructureRow.timestamp,
+                MicrostructureRow.bid_qty,
+                MicrostructureRow.ask_qty,
+                MicrostructureRow.spread_bps,
+                MicrostructureRow.liquidation_buy_volume,
+                MicrostructureRow.liquidation_sell_volume,
+            )
+            .where(MicrostructureRow.symbol == symbol)
+            .order_by(desc(MicrostructureRow.timestamp))
+            .limit(limit)
+        )
+        async with self._factory()() as session:
+            result: Result[Any] = await session.execute(query)
+            rows: list[Any] = result.all()
+
+        columns: list[str] = [
+            "timestamp",
+            "bid_qty",
+            "ask_qty",
+            "spread_bps",
+            "liquidation_buy_volume",
+            "liquidation_sell_volume",
+        ]
+        if not rows:
+            return pd.DataFrame(columns=columns)
+        frame: pd.DataFrame = pd.DataFrame(rows, columns=columns)
+        return frame.sort_values("timestamp").reset_index(drop=True)
+
+    async def earliest_microstructure_timestamp(self, symbol: str) -> int | None:
+        """Oldest stored bucket for ``symbol``, or ``None`` when there is none."""
+        query: Select[Any] = select(func.min(MicrostructureRow.timestamp)).where(
+            MicrostructureRow.symbol == symbol
+        )
+        async with self._factory()() as session:
+            result: Result[Any] = await session.execute(query)
+            value: Any = result.scalar_one_or_none()
+        return int(value) if value is not None else None
+
     async def load_futures_metrics_frame(self, symbol: str, limit: int = 1_000) -> pd.DataFrame:
         """Load recent futures metrics as a timestamp-indexed frame."""
         query: Select[Any] = (
@@ -407,22 +675,24 @@ class DatabaseHandler:
     async def insert_audit_log(self, record: dict[str, Any]) -> None:
         """Insert one audit record (already flattened by the Audit Engine)."""
         try:
-            async with self._factory()() as session:
+            async with self._write_lock, self._factory()() as session:
                 async with session.begin():
                     session.add(AuditLogRow(**record))
         except SQLAlchemyError as error:
-            raise DatabaseError("audit log insert failed") from error
+            raise DatabaseError("audit log insert failed", reason=str(error)) from error
 
     async def insert_audit_logs(self, records: Sequence[dict[str, Any]]) -> int:
         """Bulk-insert audit records in a single transaction."""
         if not records:
             return 0
         try:
-            async with self._factory()() as session:
+            async with self._write_lock, self._factory()() as session:
                 async with session.begin():
                     session.add_all([AuditLogRow(**record) for record in records])
         except SQLAlchemyError as error:
-            raise DatabaseError("audit log bulk insert failed", rows=len(records)) from error
+            raise DatabaseError(
+                "audit log bulk insert failed", rows=len(records), reason=str(error)
+            ) from error
         return len(records)
 
     async def fetch_audit_logs(
@@ -483,11 +753,14 @@ class DatabaseHandler:
     async def purge_audit_logs(self, older_than_days: int) -> int:
         """Delete audit rows older than ``older_than_days``; returns rows removed."""
         cutoff: datetime = datetime.now(tz=timezone.utc) - timedelta(days=older_than_days)
-        async with self._factory()() as session:
-            async with session.begin():
-                result: Result[Any] = await session.execute(
-                    delete(AuditLogRow).where(AuditLogRow.created_at < cutoff)
-                )
+        try:
+            async with self._write_lock, self._factory()() as session:
+                async with session.begin():
+                    result: Result[Any] = await session.execute(
+                        delete(AuditLogRow).where(AuditLogRow.created_at < cutoff)
+                    )
+        except SQLAlchemyError as error:
+            raise DatabaseError("audit log purge failed", reason=str(error)) from error
         return int(result.rowcount or 0)
 
     # ------------------------------------------------------------------
@@ -496,19 +769,21 @@ class DatabaseHandler:
     async def insert_trade(self, record: dict[str, Any]) -> int:
         """Insert a newly opened trade; returns its primary key."""
         try:
-            async with self._factory()() as session:
+            async with self._write_lock, self._factory()() as session:
                 async with session.begin():
                     row: TradeRow = TradeRow(**record)
                     session.add(row)
                 await session.refresh(row)
                 return int(row.id)
         except SQLAlchemyError as error:
-            raise DatabaseError("trade insert failed", decision_id=record.get("decision_id")) from error
+            raise DatabaseError(
+                "trade insert failed", decision_id=record.get("decision_id"), reason=str(error)
+            ) from error
 
     async def update_trade(self, decision_id: str, updates: dict[str, Any]) -> bool:
         """Patch an existing trade row identified by its ``decision_id``."""
         try:
-            async with self._factory()() as session:
+            async with self._write_lock, self._factory()() as session:
                 async with session.begin():
                     result: Result[Any] = await session.execute(
                         select(TradeRow).where(TradeRow.decision_id == decision_id)
@@ -520,7 +795,9 @@ class DatabaseHandler:
                         setattr(row, key, value)
             return True
         except SQLAlchemyError as error:
-            raise DatabaseError("trade update failed", decision_id=decision_id) from error
+            raise DatabaseError(
+                "trade update failed", decision_id=decision_id, reason=str(error)
+            ) from error
 
     async def fetch_trades(
         self,
@@ -571,11 +848,11 @@ class DatabaseHandler:
     async def insert_equity_point(self, record: dict[str, Any]) -> None:
         """Append a point to the equity curve."""
         try:
-            async with self._factory()() as session:
+            async with self._write_lock, self._factory()() as session:
                 async with session.begin():
                     session.add(EquityRow(**record))
         except SQLAlchemyError as error:
-            raise DatabaseError("equity insert failed") from error
+            raise DatabaseError("equity insert failed", reason=str(error)) from error
 
     async def fetch_equity_curve(self, mode: str, limit: int = 500) -> list[dict[str, Any]]:
         """Return the most recent equity-curve points in chronological order."""
@@ -613,11 +890,11 @@ class DatabaseHandler:
             set_={"value": statement.excluded.value, "updated_at": datetime.now(tz=timezone.utc)},
         )
         try:
-            async with self._factory()() as session:
+            async with self._write_lock, self._factory()() as session:
                 async with session.begin():
                     await session.execute(statement)
         except SQLAlchemyError as error:
-            raise DatabaseError("state upsert failed", key=key) from error
+            raise DatabaseError("state upsert failed", key=key, reason=str(error)) from error
 
     async def get_state(self, key: str) -> dict[str, Any] | None:
         """Read a durable state blob, or ``None`` when the key is absent."""

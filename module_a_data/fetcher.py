@@ -25,7 +25,7 @@ import ccxt.async_support as ccxt
 from config.settings import Settings
 from core.exceptions import DataFetchError
 from core.logger import get_logger
-from core.utils import async_retry, safe_float, utc_now_ms
+from core.utils import async_retry, backoff_delay, safe_float, utc_now_ms
 from module_a_data.models import FuturesMetrics, OHLCVCandle, OrderBookSnapshot
 
 _LOGGER = get_logger(__name__)
@@ -48,6 +48,16 @@ PERMANENT_ERRORS: Final[tuple[type[BaseException], ...]] = (
     ccxt.BadSymbol,
     ccxt.ArgumentsRequired,
 )
+
+
+def _safe_int(value: Any) -> int | None:
+    """Coerce ``value`` to ``int``, returning ``None`` (never a guessed 0) on failure."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class BinanceDataFetcher:
@@ -91,7 +101,29 @@ class BinanceDataFetcher:
         self._restrict_to_linear_markets(exchange)
         if self._settings.exchange.testnet:
             exchange.set_sandbox_mode(True)
+        self._apply_rate_scale(exchange)
         return exchange
+
+    def _apply_rate_scale(self, exchange: ccxt.binance) -> None:
+        """Slow ccxt's built-in request pacing to ``request_rate_scale`` of default.
+
+        ``enableRateLimit`` makes ccxt sleep ``exchange.rateLimit`` milliseconds
+        between weight-1 requests regardless of how many coroutines are waiting
+        on the semaphore, so this is the one lever that actually controls the
+        rate at which requests leave the process - inflating it is what caps
+        real throughput at a fraction of the exchange's default speed.
+        """
+        scale: float = self._settings.exchange.request_rate_scale
+        if scale >= 1.0:
+            return
+        original: float = float(exchange.rateLimit)
+        exchange.rateLimit = int(round(original / scale))
+        _LOGGER.info(
+            "API request rate capped at %.0f%% of default (ccxt rateLimit %d -> %d ms)",
+            scale * 100.0,
+            int(original),
+            exchange.rateLimit,
+        )
 
     @staticmethod
     def _restrict_to_linear_markets(exchange: ccxt.binance) -> None:
@@ -232,6 +264,31 @@ class BinanceDataFetcher:
             candle is dropped when ``data.drop_unclosed_candle`` is enabled, so
             every returned candle is guaranteed to be closed.
         """
+        _raw_count, _malformed, candles = await self._fetch_ohlcv_page(
+            symbol, limit=limit, since_ms=since_ms
+        )
+        return candles
+
+    async def _fetch_ohlcv_page(
+        self,
+        symbol: str,
+        limit: int | None = None,
+        since_ms: int | None = None,
+    ) -> tuple[int, int, list[OHLCVCandle]]:
+        """Fetch and validate one page, exposing row-count detail beyond the list.
+
+        Returns ``(raw_count, malformed_count, candles)``.  Three outcomes look
+        identical if you only inspect ``candles`` (it's simply empty), but they
+        mean very different things to :meth:`fetch_ohlcv_range`:
+
+        * ``raw_count == 0`` - the exchange truly has no more candles here.
+        * ``raw_count > 0``, ``malformed_count == raw_count`` - every row failed
+          structural validation; this is a genuine data problem worth retrying.
+        * ``raw_count > 0``, ``malformed_count == 0`` - every row parsed fine but
+          was filtered out as the still-forming candle (``drop_unclosed_candle``).
+          That is the live edge, not corruption - there is nothing more to fetch
+          by paging further, and it must never be mistaken for "malformed".
+        """
         await self.load_markets()
         page_limit: int = limit if limit is not None else self._settings.data.ohlcv_limit
 
@@ -247,6 +304,7 @@ class BinanceDataFetcher:
 
         cutoff_ms: int = utc_now_ms()
         candles: list[OHLCVCandle] = []
+        malformed: int = 0
         for row in raw:
             try:
                 candle: OHLCVCandle = OHLCVCandle.from_ccxt(row, symbol, self._timeframe)
@@ -254,6 +312,7 @@ class BinanceDataFetcher:
                 # A structurally broken row is dropped here; the QC validator will
                 # observe the resulting gap and trigger a targeted heal.
                 _LOGGER.warning("Dropping malformed candle for %s: %s", symbol, error)
+                malformed += 1
                 continue
             if self._settings.data.drop_unclosed_candle:
                 if candle.timestamp + self._timeframe_ms > cutoff_ms:
@@ -261,7 +320,7 @@ class BinanceDataFetcher:
             candles.append(candle)
 
         candles.sort(key=lambda item: item.timestamp)
-        return candles
+        return len(raw), malformed, candles
 
     async def fetch_ohlcv_range(
         self,
@@ -273,24 +332,82 @@ class BinanceDataFetcher:
         """Fetch every closed candle in ``[start_ms, end_ms]`` using pagination.
 
         Binance caps a single ``klines`` response at 1500 rows, so long ranges
-        are walked forward page by page.  The loop is defensive against an
-        exchange that returns an empty or non-advancing page (it breaks instead
-        of spinning forever).
+        are walked forward page by page.  The loop distinguishes four outcomes
+        per page:
+
+        * **Genuine end of history** (the exchange returned zero rows) - a clean
+          stop, nothing more to fetch.
+        * **The live edge** (every row parsed fine but was filtered out as the
+          still-forming candle) - also a clean stop: there is nothing more to
+          fetch by paging further, and this must never be mistaken for
+          malformed data just because the validated list happens to be empty.
+        * **A page of rows that all failed validation** - retried a bounded
+          number of times with backoff rather than silently accepted as "no more
+          data", so a burst of malformed rows cannot punch a silent hole at the
+          tail of the range.
+        * **The page-count safety guard tripping before ``end_ms`` is reached** -
+          raised as an error rather than returned as a quietly truncated result,
+          because a caller that only inspects the returned list has no way to
+          tell "complete" from "silently cut short".
         """
         await self.load_markets()
         limit: int = page_limit if page_limit is not None else self._settings.data.ohlcv_limit
         collected: dict[int, OHLCVCandle] = {}
         cursor: int = start_ms
         guard: int = 0
-        max_pages: int = max(1, (end_ms - start_ms) // (self._timeframe_ms * limit) + 4)
+        # Generous on purpose: a real gap in the exchange's history (a halt, a
+        # delisting window) makes the cursor jump *forward* faster than a naive
+        # per-page estimate assumes, but retried empty-validation pages consume
+        # guard budget without advancing the cursor at all.
+        max_pages: int = max(
+            10, 2 * ((end_ms - start_ms) // (self._timeframe_ms * limit) + 1) + 20
+        )
+        empty_validation_retries: int = 0
+        max_empty_validation_retries: int = 3
 
         while cursor <= end_ms and guard < max_pages:
             guard += 1
-            page: list[OHLCVCandle] = await self.fetch_ohlcv(
+            raw_count, malformed_count, page = await self._fetch_ohlcv_page(
                 symbol, limit=limit, since_ms=cursor
             )
-            if not page:
+
+            if raw_count == 0:
+                # The exchange itself reports nothing more from `cursor` onward.
                 break
+
+            if not page:
+                if malformed_count == 0:
+                    # Every row parsed fine but was filtered out as the
+                    # still-forming candle (the live edge) - not corruption,
+                    # and paging further will not produce anything either.
+                    break
+                empty_validation_retries += 1
+                if empty_validation_retries > max_empty_validation_retries:
+                    raise DataFetchError(
+                        f"fetch_ohlcv_range[{symbol}] received only malformed rows",
+                        window_start_ms=cursor,
+                        window_end_ms=end_ms,
+                    )
+                _LOGGER.warning(
+                    "%s: page at %d returned %d row(s), %d malformed, none valid "
+                    "- retry %d/%d",
+                    symbol,
+                    cursor,
+                    raw_count,
+                    malformed_count,
+                    empty_validation_retries,
+                    max_empty_validation_retries,
+                )
+                await asyncio.sleep(
+                    backoff_delay(
+                        empty_validation_retries - 1,
+                        base_seconds=self._settings.exchange.backoff_base_seconds,
+                        max_seconds=self._settings.exchange.backoff_max_seconds,
+                        jitter=self._settings.exchange.backoff_jitter,
+                    )
+                )
+                continue
+            empty_validation_retries = 0
 
             fresh: int = 0
             for candle in page:
@@ -303,6 +420,17 @@ class BinanceDataFetcher:
                 # The exchange is not advancing; stop rather than loop forever.
                 break
             cursor = next_cursor
+
+        if cursor <= end_ms and guard >= max_pages:
+            raise DataFetchError(
+                f"fetch_ohlcv_range[{symbol}] hit the {max_pages}-page safety guard "
+                "before covering the requested window - refusing to return a "
+                "silently truncated result",
+                window_start_ms=start_ms,
+                window_end_ms=end_ms,
+                reached_ms=cursor,
+                collected=len(collected),
+            )
 
         return [collected[key] for key in sorted(collected)]
 
@@ -505,6 +633,215 @@ class BinanceDataFetcher:
             else:
                 sell_volume += quote
         return (buy_volume, sell_volume)
+
+    # ------------------------------------------------------------------
+    # Historical futures-metrics backfill
+    # ------------------------------------------------------------------
+    # ``fetch_futures_metrics`` above only ever captures "now" - it is called
+    # once per live 5-minute cycle, so a freshly-bootstrapped deployment has
+    # essentially no real history for funding/OI/positioning under a long
+    # training window and every micro-structure feature derived from them
+    # sits at its neutral default for nearly every historical row. Order-book
+    # depth has no historical endpoint at all on Binance (a snapshot is only
+    # ever "now"), but funding rate, open interest and the positioning ratios
+    # *do* have dedicated history endpoints and can be backfilled - this
+    # section does that, loudly logging when a source cannot deliver data
+    # instead of silently leaving the caller with defaults.
+
+    async def fetch_funding_rate_history(
+        self, symbol: str, start_ms: int, end_ms: int
+    ) -> list[tuple[int, float]]:
+        """Backfill funding-rate history over ``[start_ms, end_ms]``.
+
+        Binance retains funding-rate history for the entire life of a
+        contract via ``/fapi/v1/fundingRate`` (unlike open interest and the
+        positioning ratios below, which are capped to a recent rolling
+        window) - this is the one micro-structure/derivatives source that can
+        genuinely be recovered across a multi-month training window.
+        """
+        await self.load_markets()
+        market_id: str = self._market_id(symbol)
+        collected: list[tuple[int, float]] = []
+        cursor: int = start_ms
+        limit: int = 1_000
+        guard: int = 0
+        max_pages: int = 500
+        while cursor <= end_ms and guard < max_pages:
+            guard += 1
+            params: dict[str, Any] = {
+                "symbol": market_id,
+                "startTime": cursor,
+                "endTime": end_ms,
+                "limit": limit,
+            }
+            try:
+                payload: Any = await self._call(
+                    f"fetch_funding_rate_history[{symbol}]",
+                    lambda: self._exchange.fapiPublicGetFundingRate(params),
+                )
+            except DataFetchError as error:
+                _LOGGER.error(
+                    "Funding-rate history backfill aborted for %s at cursor %d: %s",
+                    symbol,
+                    cursor,
+                    error,
+                )
+                break
+            if not isinstance(payload, list) or not payload:
+                break
+            for row in payload:
+                timestamp: int | None = _safe_int(row.get("fundingTime"))
+                if timestamp is None:
+                    continue
+                rate: float = safe_float(row.get("fundingRate"), 0.0)
+                if abs(rate) > 0.05:
+                    # Same implausibility guard as the live path - drop, don't poison.
+                    continue
+                collected.append((timestamp, rate))
+            last_timestamp: int | None = _safe_int(payload[-1].get("fundingTime"))
+            if last_timestamp is None or last_timestamp < cursor:
+                break
+            next_cursor: int = last_timestamp + 1
+            if next_cursor <= cursor:
+                break
+            cursor = next_cursor
+            if len(payload) < limit:
+                break
+        if not collected:
+            _LOGGER.warning(
+                "No funding-rate history recovered for %s in [%d, %d] - funding_rate "
+                "will stay at its neutral default for this window",
+                symbol,
+                start_ms,
+                end_ms,
+            )
+        return collected
+
+    async def fetch_open_interest_history(
+        self, symbol: str, start_ms: int, end_ms: int
+    ) -> list[tuple[int, float]]:
+        """Backfill open interest via ``futures/data/openInterestHist``.
+
+        Binance only retains ~30 days of history for this endpoint - a
+        request reaching further back simply returns fewer rows than the
+        window implies, which is logged, not swallowed.
+        """
+        return await self._fetch_futures_data_series(
+            symbol,
+            endpoint_name="fapiDataGetOpenInterestHist",
+            field="sumOpenInterest",
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
+
+    async def fetch_long_short_ratio_history(
+        self, symbol: str, start_ms: int, end_ms: int
+    ) -> list[tuple[int, float]]:
+        """Backfill the global long/short account ratio (~30-day retention)."""
+        return await self._fetch_futures_data_series(
+            symbol,
+            endpoint_name="fapiDataGetGlobalLongShortAccountRatio",
+            field="longShortRatio",
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
+
+    async def fetch_taker_ratio_history(
+        self, symbol: str, start_ms: int, end_ms: int
+    ) -> list[tuple[int, float]]:
+        """Backfill the taker buy/sell volume ratio (~30-day retention)."""
+        return await self._fetch_futures_data_series(
+            symbol,
+            endpoint_name="fapiDataGetTakerlongshortRatio",
+            field="buySellRatio",
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
+
+    async def _fetch_futures_data_series(
+        self,
+        symbol: str,
+        endpoint_name: str,
+        field: str,
+        start_ms: int,
+        end_ms: int,
+    ) -> list[tuple[int, float]]:
+        """Paginate one ``futures/data/*`` aggregated series over a time range.
+
+        These endpoints (open interest, long/short ratios, taker ratio) are
+        documented by Binance as retaining only the most recent ~30 days -
+        requesting further back is not a bug, it genuinely has nothing to
+        return, so an empty page ends pagination cleanly rather than raising.
+        A missing/unsupported endpoint (older ccxt build) *is* logged loudly,
+        since that would otherwise look identical to "no data in range".
+        """
+        await self.load_markets()
+        method: Any = getattr(self._exchange, endpoint_name, None)
+        if method is None:
+            _LOGGER.error(
+                "%s is not exposed by the installed ccxt build - cannot backfill "
+                "%s history for %s; it will stay at its neutral default",
+                endpoint_name,
+                field,
+                symbol,
+            )
+            return []
+
+        market_id: str = self._market_id(symbol)
+        collected: list[tuple[int, float]] = []
+        cursor: int = start_ms
+        limit: int = 500
+        guard: int = 0
+        max_pages: int = 500
+        while cursor <= end_ms and guard < max_pages:
+            guard += 1
+            params: dict[str, Any] = {
+                "symbol": market_id,
+                "period": self._timeframe,
+                "startTime": cursor,
+                "endTime": end_ms,
+                "limit": limit,
+            }
+            try:
+                payload: Any = await self._call(
+                    f"{endpoint_name}[{market_id}]", lambda: method(params)
+                )
+            except DataFetchError as error:
+                _LOGGER.warning(
+                    "%s backfill interrupted for %s at cursor %d: %s",
+                    endpoint_name,
+                    symbol,
+                    cursor,
+                    error,
+                )
+                break
+            if not isinstance(payload, list) or not payload:
+                break
+            for row in payload:
+                timestamp: int | None = _safe_int(row.get("timestamp"))
+                if timestamp is None:
+                    continue
+                value: float = safe_float(row.get(field), 0.0)
+                collected.append((timestamp, value))
+            last_timestamp: int | None = _safe_int(payload[-1].get("timestamp"))
+            if last_timestamp is None or last_timestamp < cursor:
+                break
+            next_cursor: int = last_timestamp + 1
+            if next_cursor <= cursor:
+                break
+            cursor = next_cursor
+            if len(payload) < limit:
+                break
+        if not collected:
+            _LOGGER.warning(
+                "%s returned no rows for %s in [%d, %d] - likely outside Binance's "
+                "retention window for this endpoint (~30 days)",
+                endpoint_name,
+                symbol,
+                start_ms,
+                end_ms,
+            )
+        return collected
 
     # ------------------------------------------------------------------
     # Misc

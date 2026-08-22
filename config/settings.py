@@ -25,6 +25,8 @@ from typing import Final, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from core.logger import get_logger
+
 PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
 
 TradingMode = Literal["backtest", "paper", "live"]
@@ -83,6 +85,15 @@ class ExchangeSettings(BaseModel):
 
     max_concurrent_requests: int = Field(default=8, ge=1, le=64)
 
+    #: Throttle every request to this fraction of ccxt's default pacing, so the
+    #: exchange's per-IP weight budget is never approached under normal load.
+    #: ccxt's built-in throttler paces *dispatch* of every call (independent of
+    #: ``max_concurrent_requests``, which only bounds in-flight I/O) by sleeping
+    #: ``exchange.rateLimit`` ms between weight-1 requests; dividing that budget
+    #: by this fraction is what actually slows the request rate to 80 % of the
+    #: exchange's default speed - 1.0 keeps ccxt's own default pacing.
+    request_rate_scale: float = Field(default=0.8, gt=0.0, le=1.0)
+
 
 class DataSettings(BaseModel):
     """Data-ingestion parameters for the 5-minute pipeline."""
@@ -94,8 +105,16 @@ class DataSettings(BaseModel):
     timeframe: Literal["5m"] = Field(default="5m")
     timeframe_ms: int = Field(default=5 * 60 * 1_000)
 
-    ohlcv_limit: int = Field(default=500, ge=50, le=1_500)
-    history_bootstrap_candles: int = Field(default=6_000, ge=500)
+    ohlcv_limit: int = Field(default=1_500, ge=50, le=1_500)
+    #: 2 full years of 5-minute bars (24 months * 30.4375 days * 288 bars/day
+    #: = 210_384), plus a buffer for feature warm-up (the slowest feature -
+    #: the rolling HMM/GARCH windows - needs ~1_010 bars before it produces a
+    #: value) and QC trimming/gaps. Sized to exactly cover
+    #: ``MLSettings.train_months + validation_months + test_months`` (default
+    #: 12 + 6 + 6 = 24) with room to spare, so the model's held-out test
+    #: split is a genuine, full-width final backtest rather than a window
+    #: truncated by how much history was actually fetched.
+    history_bootstrap_candles: int = Field(default=212_400, ge=500)
     orderbook_depth: int = Field(default=20, ge=5, le=100)
     orderbook_levels_for_imbalance: int = Field(default=10, ge=1, le=100)
 
@@ -106,6 +125,28 @@ class DataSettings(BaseModel):
     #: exactly :00 races the exchange's own candle close and regularly yields a
     #: missing last bar, so a small offset is the operationally correct default.
     cycle_second_offset: int = Field(default=10, ge=0, le=59)
+
+    # --- data.binance.vision bulk archive ---------------------------------
+    #: Where parsed 5m archive aggregates are cached.  The cache holds the
+    #: *reduced* 288-rows-per-day frames, not the raw ZIPs, so a full 27-symbol
+    #: two-year backfill costs tens of MB rather than tens of GB.  Deleting the
+    #: directory only forces a re-download.
+    archive_cache_dir: str = Field(default="data/archive_cache")
+    #: Master switch for archive-sourced micro-structure features.  With this
+    #: off, ob_*/liquidation_imbalance stay NaN and the models simply route
+    #: them down their missing-value branch - the system still trains and
+    #: trades, just without that block.
+    archive_enabled: bool = Field(default=True)
+    #: Concurrent daily-file downloads.  data.binance.vision is a plain CDN and
+    #: is not covered by the exchange's per-IP weight budget, but it does rate
+    #: limit; 4 is comfortably inside it.
+    archive_max_concurrent_downloads: int = Field(default=4, ge=1, le=16)
+    archive_timeout_seconds: float = Field(default=120.0, gt=0.0)
+    archive_max_retries: int = Field(default=3, ge=1, le=10)
+    #: How far back to pull micro-structure history.  Defaults to matching the
+    #: OHLCV window so the block covers the whole training set rather than
+    #: reintroducing the sparse-recent-data problem it exists to solve.
+    archive_backfill_days: int = Field(default=740, ge=1)
 
 
 class UniverseSettings(BaseModel):
@@ -125,7 +166,16 @@ class UniverseSettings(BaseModel):
     #: Bid/ask spread ceiling in basis points, measured at discovery time.
     max_spread_bps: float = Field(default=6.0, gt=0.0)
     #: Days since listing.  Below this there is not enough 5m history to train.
-    min_history_days: int = Field(default=90, ge=1)
+    #: Deliberately left at 365 rather than raised to 547 (1.5x, matching
+    #: ``DataSettings.history_bootstrap_candles``): several symbols already in
+    #: ``DEFAULT_SYMBOLS`` (e.g. APT, ARB, OP, SUI, SEI, TIA) listed well under
+    #: 1.5 years ago, so requiring 547 days would shrink the tradeable universe
+    #: for the sake of uniform series length. Per-symbol walk-forward splits
+    #: already tolerate ragged history lengths - a newer symbol simply
+    #: contributes a shorter, still-valid training/validation series rather
+    #: than being padded or excluded. Revisit if the universe should instead
+    #: favour fewer, longer-lived symbols.
+    min_history_days: int = Field(default=365, ge=1)
 
     #: Account size the small-capital screens are calibrated against.
     reference_equity: float = Field(default=1_000.0, gt=0.0)
@@ -150,6 +200,23 @@ class QCSettings(BaseModel):
 
     max_heal_attempts: int = Field(default=4, ge=1, le=10)
     heal_backoff_seconds: float = Field(default=2.0, gt=0.0)
+    #: Hard wall-clock ceiling on one symbol's total heal loop, regardless of how
+    #: many attempts remain in the budget.  Bounds worst-case latency so a symbol
+    #: stuck healing cannot indefinitely hold the shared request-rate budget and
+    #: starve every other symbol's cycle.
+    max_heal_duration_seconds: float = Field(default=90.0, gt=0.0)
+    #: Suspicious timestamps within this many bars of each other are healed as
+    #: one contiguous re-fetch window instead of two separate ones.
+    heal_merge_gap_bars: int = Field(default=3, ge=0)
+    #: When a heal attempt would otherwise need more distinct windows than this,
+    #: it falls back to batched windows spanning the damaged range - fragmenting
+    #: further would trade a handful of extra requests for no real precision.
+    max_heal_window_groups: int = Field(default=12, ge=1)
+    #: Hard cap, in bars, on the span of any single fallback batch window. Without
+    #: this, widespread damage across a long history could otherwise collapse
+    #: into one unbounded re-fetch of tens of thousands of candles; instead the
+    #: full damaged range is split into controlled, bounded-size batches.
+    max_heal_window_bars: int = Field(default=2_000, ge=50)
 
     #: A candle whose volume exceeds ``median * this`` is flagged as an anomaly.
     volume_spike_median_multiple: float = Field(default=50.0, gt=1.0)
@@ -215,6 +282,29 @@ class LabelSettings(BaseModel):
     discard_very_high_risk: bool = Field(default=True)
 
 
+class BoosterHyperparameters(BaseModel):
+    """One gradient-boosted-tree hyperparameter profile.
+
+    Factored out of :class:`MLSettings` so a model head whose target is
+    noisier or weaker-signal than the rest (see ``MLSettings.
+    direction_stage2_hyperparameters`` and ``MLSettings.risk_hyperparameters``)
+    can be tuned independently instead of sharing one generic profile with
+    every other head.
+    """
+
+    n_estimators: int = Field(default=400, ge=10)
+    learning_rate: float = Field(default=0.05, gt=0.0, le=1.0)
+    max_depth: int = Field(default=6, ge=1, le=32)
+    num_leaves: int = Field(default=63, ge=2)
+    subsample: float = Field(default=0.85, gt=0.0, le=1.0)
+    colsample_bytree: float = Field(default=0.85, gt=0.0, le=1.0)
+    min_child_samples: int = Field(default=40, ge=1)
+    reg_lambda: float = Field(default=1.0, ge=0.0)
+    #: L1 regularisation. ``0.0`` matches LightGBM/XGBoost's own default, so
+    #: leaving this unset changes nothing for any existing profile.
+    reg_alpha: float = Field(default=0.0, ge=0.0)
+
+
 class MLSettings(BaseModel):
     """Machine-learning subsystem configuration (Module C)."""
 
@@ -230,24 +320,132 @@ class MLSettings(BaseModel):
     colsample_bytree: float = Field(default=0.85, gt=0.0, le=1.0)
     min_child_samples: int = Field(default=40, ge=1)
     reg_lambda: float = Field(default=1.0, ge=0.0)
+    #: L1 regularisation for every head that does not have its own dedicated
+    #: profile below. ``0.0`` preserves the exact behaviour every head had
+    #: before this field existed.
+    reg_alpha: float = Field(default=0.0, ge=0.0)
 
-    #: Purged, time-ordered validation split (fraction held out at the tail).
-    validation_fraction: float = Field(default=0.2, gt=0.0, lt=0.9)
-    #: Bars removed between train and validation blocks to kill label leakage.
+    #: Dedicated hyperparameter profile for the Direction model's stage-2
+    #: (long-vs-short *given* a trade) classifier - see ``DirectionModel.
+    #: train``'s docstring for why the gate and direction questions lean on
+    #: different signal. Production diagnostics have repeatedly shown this
+    #: stage's precision sitting barely above the 50/50 base rate (e.g.
+    #: 0.53 at its own F1-optimal threshold) while leaning heavily on
+    #: weak/noisy features (time-of-day) in its importance ranking - both
+    #: symptoms of a model fit to noise rather than genuine signal. This
+    #: profile trades tree capacity for variance reduction relative to the
+    #: shared default above: more, shallower trees at a lower learning rate,
+    #: much larger leaves (``min_child_samples``) so splits need real
+    #: statistical support, heavier L1+L2 regularisation to discourage
+    #: latching onto marginally-useful features, and more aggressive column
+    #: subsampling so no single weak feature dominates every tree.
+    direction_stage2_hyperparameters: BoosterHyperparameters = Field(
+        default_factory=lambda: BoosterHyperparameters(
+            n_estimators=700,
+            learning_rate=0.03,
+            max_depth=5,
+            num_leaves=31,
+            min_child_samples=100,
+            subsample=0.8,
+            colsample_bytree=0.7,
+            reg_lambda=2.0,
+            reg_alpha=0.5,
+        )
+    )
+
+    #: Dedicated hyperparameter profile for the Risk (opportunity-score)
+    #: regressor - the ML diagnostic report's own weakest-scored component
+    #: (R^2 ~0.14 against identical hyperparameters to every other head,
+    #: despite RiskModel.train's own docstring already having removed the
+    #: single largest known confound - training on an out-of-distribution
+    #: NO_TRADE population). Given more capacity to close the remaining gap:
+    #: more trees at a lower learning rate, deeper/wider trees, and smaller
+    #: leaves so it can fit the finer-grained heat/path structure the target
+    #: actually has, offset by a modest regularisation bump so the extra
+    #: capacity does not just overfit the training window instead.
+    risk_hyperparameters: BoosterHyperparameters = Field(
+        default_factory=lambda: BoosterHyperparameters(
+            n_estimators=600,
+            learning_rate=0.04,
+            max_depth=7,
+            num_leaves=95,
+            min_child_samples=25,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            reg_lambda=1.5,
+            reg_alpha=0.1,
+        )
+    )
+
+    #: Strict, chronological 3-way split (never a random shuffle). ``test`` is
+    #: anchored to the most recent data and is the model's final backtest
+    #: window: it is never touched by training, early stopping, calibration,
+    #: threshold selection or model selection - only by the one-shot backtest
+    #: replay run after everything else is already frozen. ``validation`` is
+    #: the block immediately before it, used for every development decision;
+    #: ``train`` is everything older. Defaults sum to 24 months (2 full years)
+    #: - see ``DataSettings.history_bootstrap_candles``.
+    train_months: float = Field(default=12.0, gt=0.0)
+    validation_months: float = Field(default=6.0, gt=0.0)
+    test_months: float = Field(default=6.0, gt=0.0)
+    #: Embargo gap (bars) cut from the trailing edge of train and of
+    #: validation, converted to a *time* duration (``purge_bars *
+    #: DataSettings.timeframe_ms``) and applied uniformly regardless of how
+    #: many symbols share a timestamp in the pooled dataset. Should stay >=
+    #: ``LabelSettings.max_holding_bars`` (flagged, if not, by
+    #: ``Settings._warn_if_purge_too_short_for_label_horizon``) - a label
+    #: simulated from a row inside the embargo can look forward past the
+    #: split boundary into the next block, which is exactly the leakage this
+    #: gap exists to prevent.
     purge_bars: int = Field(default=60, ge=0)
     early_stopping_rounds: int = Field(default=50, ge=0)
 
+    #: Exponential time-decay half-life (days) for training sample weights: a
+    #: row this many days behind the most recent training row gets half the
+    #: weight, one that far again gets a quarter, and so on.  Crypto regimes
+    #: drift, so a year-old candle should not vote as loudly as yesterday's.
+    #: ``0`` disables recency weighting (every row weighted equally).
+    recency_half_life_days: float = Field(default=45.0, ge=0.0)
+
     inference_workers: int = Field(default=2, ge=1, le=16)
+
+    #: Experimental. Swaps the gate stage's (Direction model, stage 1) LightGBM
+    #: objective for a focal-loss custom objective that down-weights the easy,
+    #: confidently-correct majority region and up-weights the ambiguous
+    #: near-0.5 region - see ``module_c_ml.ml_models.focal_loss_binary`` for why
+    #: this is not yet validated against production log-loss. Off by default;
+    #: the direction (stage 2) estimator and every other head are unaffected
+    #: regardless of this flag.
+    use_focal_loss_for_gate: bool = Field(default=False)
+    focal_loss_gamma: float = Field(default=2.0, gt=0.0)
 
 
 class DecisionSettings(BaseModel):
     """Decision Engine thresholds (Module D)."""
 
-    min_direction_confidence: float = Field(default=0.70, gt=0.0, lt=1.0)
-    #: Directional edge required over the opposing side.
-    min_direction_margin: float = Field(default=0.15, ge=0.0, lt=1.0)
+    #: Removed: this field used to be RiskModel's own hard-veto/sizing floor,
+    #: read against the stale *joint* long/short/no_trade confidence
+    #: (`DirectionPrediction.confidence`). RiskModel.predict now receives the
+    #: same independent direction-given-trade conditional confidence the
+    #: Decision Engine's own R1B rule gates on (see MLSubsystem.infer_sync),
+    #: so it was repointed at `min_direction_given_trade_confidence` below
+    #: instead - a second, differently-scoped threshold for the same
+    #: quantity would just be a second place to forget to update. Nothing in
+    #: the repo reads `min_direction_confidence` any more (grepped clean).
     max_no_trade_probability: float = Field(default=0.35, gt=0.0, le=1.0)
     min_entry_probability: float = Field(default=0.55, gt=0.0, lt=1.0)
+
+    #: Stage-1: is this bar worth trading at all (gate's own probability,
+    #: not the multiplied joint one). Replaces gating on the product, which
+    #: silently discarded confident direction calls whenever the gate alone
+    #: was <0.5.
+    min_gate_confidence: float = Field(default=0.55, gt=0.0, lt=1.0)
+    #: Stage-2, conditional on the gate already saying "trade": how sure is
+    #: LONG vs SHORT. Also the threshold RiskModel.predict gates its own hard
+    #: veto and sizing curve against (see min_direction_confidence's removal
+    #: note above) - both consumers now read the identical, independent
+    #: conditional-confidence signal off the same threshold.
+    min_direction_given_trade_confidence: float = Field(default=0.60, gt=0.0, lt=1.0)
 
     min_leverage: int = Field(default=1, ge=0, le=10)
     max_leverage: int = Field(default=10, ge=1, le=10)
@@ -412,6 +610,33 @@ class Settings(BaseSettings):
         """Create the runtime directories eagerly so no I/O path can fail later."""
         for directory in (self.log_dir, self.ml.model_dir, self.db.path.parent):
             directory.mkdir(parents=True, exist_ok=True)
+        return self
+
+    @model_validator(mode="after")
+    def _warn_if_purge_too_short_for_label_horizon(self) -> "Settings":
+        """Flag (never raise on) a purge/embargo gap too short to cover the
+        label horizon.
+
+        A label simulated from a row at position ``t`` looks forward up to
+        ``labels.max_holding_bars`` candles to resolve. The purge/embargo gap
+        cut at every split boundary (``ml.purge_bars``) must therefore be at
+        least that wide, or a training/validation row just inside the gap
+        can have a label that peeks across the boundary into the next
+        block - reintroducing exactly the leakage the gap exists to
+        prevent. This only warns (rather than rejects the config) so small,
+        deliberately-scaled-down configurations in tests/experiments are not
+        blocked; production should never actually run with this warning
+        active.
+        """
+        if self.ml.purge_bars < self.labels.max_holding_bars:
+            get_logger(__name__).warning(
+                "ml.purge_bars=%d is smaller than labels.max_holding_bars=%d - the "
+                "train/validation/test embargo may not fully cover the label "
+                "horizon, risking leakage across split boundaries. Set "
+                "purge_bars >= max_holding_bars before training on real data.",
+                self.ml.purge_bars,
+                self.labels.max_holding_bars,
+            )
         return self
 
 

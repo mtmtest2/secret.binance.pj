@@ -42,6 +42,7 @@ import argparse
 import asyncio
 import signal
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Final, Sequence
@@ -50,10 +51,10 @@ import uvicorn
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from config.settings import Settings, get_settings
+from config.settings import DecisionSettings, Settings, get_settings
 from core.exceptions import KillSwitchEngaged, QuantSystemError
 from core.logger import configure_logging, get_logger
-from core.utils import utc_now, utc_now_ms
+from core.utils import ms_to_datetime, utc_now, utc_now_ms
 from module_a_data.db_handler import DatabaseHandler
 from module_a_data.fetcher import BinanceDataFetcher
 from module_a_data.models import MarketDataBundle
@@ -70,6 +71,7 @@ from module_e_execution.executor import LiveExecutor
 from module_e_execution.models import AccountState, ExecutionReport
 from module_e_execution.paper_trader import PaperTrader
 from module_e_execution.risk_guard import RiskGuard, SystemState
+from module_f_panel import diagnostics
 from module_f_panel.audit_engine import AuditEngine
 from module_f_panel.setup_state import SetupProgress, SystemPhase
 from module_f_panel.web_app import build_app
@@ -77,6 +79,76 @@ from module_f_panel.web_app import build_app
 _LOGGER = get_logger("main")
 
 _CYCLE_MINUTES: Final[str] = "0,5,10,15,20,25,30,35,40,45,50,55"
+
+#: Rolling history cap for persisted per-cycle timing telemetry.
+_MAX_STORED_CYCLE_TIMINGS: Final[int] = 500
+
+#: Decision-cascade thresholds for the *diagnostic-only* relaxed backtest run
+#: by ``TradingSystem._run_final_backtest`` - never used for real trading.
+#: The live ``DecisionSettings`` defaults (min_gate_confidence=0.55,
+#: min_direction_given_trade_confidence=0.60, min_entry_probability=0.55, ...)
+#: are intentionally strict and, combined with a single ~8-week out-of-sample
+#: window, routinely leave the strict backtest with a single-digit trade
+#: count - too small for win rate/profit factor/Sharpe to mean anything. This
+#: loosened copy replays the *same* window to check whether the strategy's
+#: edge is visible at all with a larger sample, without ever touching the
+#: thresholds that gate real orders.
+_RELAXED_DECISION_SETTINGS: Final[DecisionSettings] = DecisionSettings(
+    min_gate_confidence=0.50,
+    min_direction_given_trade_confidence=0.52,
+    max_no_trade_probability=0.50,
+    min_entry_probability=0.50,
+    min_reward_risk_ratio=1.0,
+)
+
+
+def _final_backtest_window(
+    *, test_start_ms: int, test_end_ms: int, timeframe_ms: int, warmup_padding: int
+) -> int:
+    """Per-symbol replay depth (in candles) covering exactly the held-out test split.
+
+    Pure and side-effect free (no DB/network) so it is directly unit
+    testable - see ``TradingSystem._run_final_backtest`` for the caller.
+    ``Backtester.run`` loads the *most recent* ``max_candles`` bars per
+    symbol from the database; since this replay always runs immediately
+    after training on the same dataset, "most recent N candles" and "the
+    test split's own date range" are the same window, so a plain bar count
+    is sufficient - no per-symbol date-range query is needed.
+    """
+    test_bars: int = max(0, -(-(test_end_ms - test_start_ms) // timeframe_ms) + 1)  # ceil, inclusive
+    return test_bars + warmup_padding
+
+
+def _headline_metrics(report: dict[str, Any]) -> dict[str, Any]:
+    """Small, fixed-size summary of a training report for frequent polling.
+
+    ``report`` (from ``MLSubsystem.train_all``) now carries full per-head
+    metrics - confusion matrices, threshold sweeps, feature importance - which
+    is exactly what the ML diagnostic report needs but is far too large to
+    push through the ``/api/setup/status`` endpoint on every poll. The full
+    report is always available via the diagnostic report export instead.
+    """
+    headline: dict[str, Any] = {}
+    for head, metrics in report.items():
+        if "error" in metrics:
+            headline[head] = {"error": metrics["error"]}
+            continue
+        keys = {
+            "direction": ("accuracy", "balanced_accuracy", "log_loss"),
+            "entry": ("precision", "recall", "roc_auc"),
+            "risk": ("mae", "r2"),
+        }.get(head)
+        if keys is not None:
+            headline[head] = {key: metrics[key] for key in keys if key in metrics}
+        elif head == "exit":
+            headline[head] = {
+                target: {"mae": target_metrics.get("mae")}
+                for target, target_metrics in metrics.items()
+                if isinstance(target_metrics, dict)
+            }
+        else:  # pragma: no cover - defensive default
+            headline[head] = {}
+    return headline
 
 #: Either concrete engine satisfies the same interface; the loop never branches.
 ExecutionEngine = PaperTrader | LiveExecutor
@@ -134,6 +206,17 @@ class TradingSystem:
         self.last_cycle_executed: int = 0
         self.last_cycle_error: str = ""
         self.cycles_completed: int = 0
+        #: Per-stage wall-clock timings (seconds) for the most recently
+        #: completed cycle - ingestion, features, prediction, decision,
+        #: execution and database/audit, plus the overall total. Surfaced on
+        #: the ML diagnostic report's Pipeline Timing section.
+        self.last_cycle_timings: dict[str, float] = {}
+        #: Cycles skipped because the previous one was still running when the
+        #: next 5m slot fired - direct evidence for whether cycles are
+        #: overrunning their scheduling interval.
+        self.cycles_skipped_overlap: int = 0
+        #: Run ID of the most recently generated ML diagnostic report, if any.
+        self.latest_ml_report_id: str | None = None
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -254,7 +337,7 @@ class TradingSystem:
                 )
 
     async def _setup_collect(self, symbols: list[str]) -> None:
-        """Stage 1 - backfill historical candles for the selected universe."""
+        """Stage 1 - backfill historical candles and derivatives/positioning history."""
         self.phase = SystemPhase.COLLECTING_DATA
         self.progress.begin(
             SystemPhase.COLLECTING_DATA,
@@ -290,6 +373,134 @@ class TradingSystem:
             len(usable),
         )
 
+        # Backfill funding-rate/open-interest/positioning history so the
+        # derivatives features are not stuck at their neutral default for the
+        # whole training window - see `DataPipeline.backfill_futures_metrics`
+        # for why this is a separate pass from the candle backfill above.
+        self.progress.advance(0, len(usable), "backfilling derivatives/positioning history")
+        futures_written: dict[str, int] = await self.pipeline.backfill_futures_metrics(
+            usable, progress=report
+        )
+        _LOGGER.info(
+            "Futures-metrics backfill complete: %d row(s) across %d symbol(s)",
+            sum(futures_written.values()),
+            len(futures_written),
+        )
+
+        # Order-book and liquidation history, from Binance's bulk archive
+        # rather than the REST API - the REST API has no historical endpoint
+        # for either, which is why these five features were previously deleted
+        # as unobtainable. This is the slowest step of the whole setup (one ZIP
+        # per symbol-day), so it is fully cached on disk and resumable.
+        self.progress.advance(0, len(usable), "backfilling order-book/liquidation archive")
+        microstructure: dict[str, Any] = await self.pipeline.backfill_market_microstructure(
+            usable, progress=report
+        )
+        _LOGGER.info(
+            "Micro-structure archive backfill: %s%% coverage across %s symbol-days",
+            round(float(microstructure.get("overall_coverage_pct", 0.0)) * 100.0, 1),
+            microstructure.get("days_requested", 0),
+        )
+
+    async def _run_final_backtest(
+        self, dataset: ProcessedDataset
+    ) -> tuple[BacktestReport | None, BacktestReport | None]:
+        """Replay the held-out test split - and *only* the held-out test split -
+        through the full pipeline.
+
+        This is the model's one genuine final backtest. The test window
+        (``MLSettings.test_months``, 6 months by default) is the newest
+        slice of the dataset's own timestamp range, carved out by
+        ``ProcessedDataset.split_boundaries``/``chronological_split`` - the
+        exact same boundaries every head's ``train()`` used to keep this
+        window out of fitting, early stopping, calibration and threshold
+        selection. Nothing here re-derives a different window: the replay
+        depth is read straight off the test split's own start/end
+        timestamps, so it is always 100% out-of-sample by construction
+        (unlike the previous "diagnostic backtest", which replayed a
+        fixed bar count that could overlap training data - see git history
+        for that design).
+
+        Returns ``(strict, relaxed)``: ``strict`` replays with the live
+        ``DecisionSettings`` and is the number that matters operationally. A
+        highly selective cascade (min direction confidence, entry
+        probability, reward/risk floor, ...) can still leave it with a
+        single-digit trade count, which is too small for its own
+        win-rate/profit-factor/Sharpe to mean anything (see
+        ``module_f_panel.diagnostics._backtest_reliability``). ``relaxed``
+        re-runs the *same* window with those thresholds loosened (never the
+        live config) purely to see whether the strategy's edge is
+        directionally visible at all with a larger trade count - it is a
+        diagnostic reference only, never a performance estimate to trade on.
+
+        Never raises: a backtest failure must not block training or the
+        diagnostic report it enriches.
+        """
+        if not dataset.symbols:
+            return None, None
+        try:
+            boundaries = dataset.split_boundaries(
+                train_months=self.settings.ml.train_months,
+                validation_months=self.settings.ml.validation_months,
+                test_months=self.settings.ml.test_months,
+                purge_bars=self.settings.ml.purge_bars,
+                timeframe_ms=self.settings.data.timeframe_ms,
+            )
+            split = dataset.chronological_split(boundaries)
+            if len(split.test_index) == 0 or split.test_start_ms is None or split.test_end_ms is None:
+                return None, None
+
+            symbols: list[str] = list(dataset.symbols)
+            warmup_padding: int = self.features.engineer.minimum_rows()
+            max_candles: int = _final_backtest_window(
+                test_start_ms=split.test_start_ms,
+                test_end_ms=split.test_end_ms,
+                timeframe_ms=self.settings.data.timeframe_ms,
+                warmup_padding=warmup_padding,
+            )
+            oos_disclosure: dict[str, Any] = {
+                "note": (
+                    "This replay is the model's held-out test split: it was never "
+                    "used for training, early stopping, calibration, threshold "
+                    "selection or model selection for any of the four heads - see "
+                    "ProcessedDataset.chronological_split. Always 100% "
+                    "out-of-sample by construction."
+                ),
+                "test_start": ms_to_datetime(split.test_start_ms).isoformat(),
+                "test_end": ms_to_datetime(split.test_end_ms).isoformat(),
+                "test_rows_in_training_dataset": int(len(split.test_index)),
+                "oos_fraction": 1.0,
+            }
+
+            backtester = Backtester(
+                self.settings, self.database, self.features, self.ml, self.decisions
+            )
+            strict: BacktestReport = await backtester.run(
+                symbols=symbols, max_candles=max_candles, warmup_bars=warmup_padding
+            )
+            strict.oos_disclosure = oos_disclosure
+
+            relaxed: BacktestReport | None = None
+            try:
+                relaxed_settings: Settings = self.settings.model_copy(
+                    update={"decision": _RELAXED_DECISION_SETTINGS}
+                )
+                relaxed_engine = DecisionEngine(relaxed_settings)
+                relaxed_backtester = Backtester(
+                    relaxed_settings, self.database, self.features, self.ml, relaxed_engine
+                )
+                relaxed = await relaxed_backtester.run(
+                    symbols=symbols, max_candles=max_candles, warmup_bars=warmup_padding
+                )
+                relaxed.oos_disclosure = oos_disclosure
+            except Exception as error:  # noqa: BLE001 - diagnostic-only pass, never fatal
+                _LOGGER.error("Relaxed diagnostic backtest failed: %s", error, exc_info=True)
+
+            return strict, relaxed
+        except Exception as error:  # noqa: BLE001 - a backtest failure must not block training
+            _LOGGER.error("Final backtest failed: %s", error, exc_info=True)
+            return None, None
+
     async def _setup_train(self, symbols: list[str], force_retrain: bool) -> None:
         """Stage 2 - build the dataset and fit the four heads."""
         if not self.settings.auto_train and not force_retrain:
@@ -312,7 +523,16 @@ class TradingSystem:
         )
         self.phase = SystemPhase.TRAINING
         self.progress.begin(SystemPhase.TRAINING, "building dataset", f"retraining ({reason})")
-        self.progress.advance(0, 2, "engineering features and labels")
+        self.progress.advance(0, 4, "engineering features and labels")
+
+        # Idempotent - only fetches the missing tail - but must run again here
+        # regardless of what `_setup_collect` already did upstream, so that any
+        # future call path that reaches `_setup_train` without first going
+        # through `_setup_collect` still gets funding_rate/open_interest/
+        # long_short_ratio/taker_buy_sell_ratio history before training reads it,
+        # and the same for the archive-sourced order-book/liquidation block.
+        await self.pipeline.backfill_futures_metrics(symbols)
+        await self.pipeline.backfill_market_microstructure(symbols)
 
         dataset: ProcessedDataset = await self.processor.build_training_dataset(symbols=symbols)
         if dataset.is_empty:
@@ -321,10 +541,11 @@ class TradingSystem:
                 "not enough clean history"
             )
 
-        self.progress.advance(1, 2, f"fitting 4 models on {len(dataset)} rows")
+        self.progress.set_step("fitting models")
+        self.progress.advance(1, 4, f"fitting 4 models on {len(dataset)} rows")
         _LOGGER.info("Training on %d rows | %s", len(dataset), dataset.class_distribution())
         report: dict[str, Any] = await self.ml.train_all(dataset)
-        self.progress.advance(2, 2, "training complete")
+        self.progress.advance(2, 4, "models fitted")
 
         failed: list[str] = [head for head, metrics in report.items() if "error" in metrics]
         if failed:
@@ -333,13 +554,42 @@ class TradingSystem:
         self.progress.training_summary = {
             "rows": len(dataset),
             "distribution": dataset.class_distribution(),
-            "metrics": report,
+            "metrics": _headline_metrics(report),
         }
         await self.database.set_state(
             "trained_universe",
             {"symbols": symbols, "trained_ms": utc_now_ms(), "rows": len(dataset)},
         )
-        _LOGGER.info("Training complete: %s", report)
+        _LOGGER.info("Training complete: %s", _headline_metrics(report))
+
+        run_id: str = str(uuid.uuid4())
+        self.progress.set_step("running final backtest", "replaying the held-out test split")
+        backtest_report: BacktestReport | None
+        relaxed_backtest_report: BacktestReport | None
+        backtest_report, relaxed_backtest_report = await self._run_final_backtest(dataset)
+        self.progress.advance(3, 4, "final backtest complete")
+        try:
+            self.progress.set_step(
+                "generating diagnostic report", "walk-forward validation and feature analytics"
+            )
+            diagnostic_report: dict[str, Any] = await diagnostics.build_report(
+                settings=self.settings,
+                database=self.database,
+                ml=self.ml,
+                dataset=dataset,
+                run_id=run_id,
+                backtest=backtest_report,
+                relaxed_backtest=relaxed_backtest_report,
+            )
+            self.latest_ml_report_id = run_id
+            self.progress.advance(4, 4, "diagnostic report ready")
+            _LOGGER.info(
+                "ML diagnostic report %s: status=%s",
+                run_id,
+                diagnostic_report["ai_summary"]["overall_status"],
+            )
+        except Exception as error:  # pragma: no cover - reporting must not break training
+            _LOGGER.error("Could not build the ML diagnostic report: %s", error, exc_info=True)
 
     async def _trained_universe(self) -> list[str]:
         """Universe the current artifacts were trained on (empty when unknown)."""
@@ -483,7 +733,11 @@ class TradingSystem:
         previous one.
         """
         if self._cycle_lock.locked():
-            _LOGGER.warning("Previous cycle is still running - skipping this slot")
+            self.cycles_skipped_overlap += 1
+            _LOGGER.warning(
+                "Previous cycle is still running - skipping this slot (%d skipped so far)",
+                self.cycles_skipped_overlap,
+            )
             return {"skipped": True}
 
         async with self._cycle_lock:
@@ -513,6 +767,8 @@ class TradingSystem:
             _LOGGER.info(
                 "--- cycle %s done in %.2fs ---", cycle_id[:8], self.last_cycle_duration_s
             )
+            if self.last_cycle_timings:
+                await self._persist_cycle_timings(cycle_id, self.last_cycle_timings)
             return summary
 
     async def _run_cycle(self, cycle_id: str) -> dict[str, Any]:
@@ -527,13 +783,27 @@ class TradingSystem:
             _LOGGER.debug("Cycle skipped: no universe selected")
             return {"skipped": "no universe"}
 
+        timings: dict[str, float] = {}
+        cycle_started: float = time.perf_counter()
+
+        def _mark(stage: str, since: float) -> float:
+            """Record ``stage``'s duration and return a fresh checkpoint."""
+            now: float = time.perf_counter()
+            timings[stage] = now - since
+            return now
+
+        checkpoint: float = cycle_started
+
         # --- A: ingestion + QC -------------------------------------------
         bundles: dict[str, MarketDataBundle] = await self.pipeline.run_cycle(self.active_symbols)
+        checkpoint = _mark("ingestion_and_qc", checkpoint)
         self.last_cycle_symbols_ok = len(bundles)
         if not bundles:
             await self.audit.log_system_event(
                 cycle_id, "NO_TRADE", "no symbol passed QC this cycle", rule="QC_ALL_FAILED"
             )
+            timings["total"] = time.perf_counter() - cycle_started
+            self.last_cycle_timings = timings
             return {"symbols": 0}
 
         if not self.phase.is_trading or not self.trading_enabled:
@@ -542,26 +812,33 @@ class TradingSystem:
                 len(bundles),
                 self.phase.value,
             )
+            timings["total"] = time.perf_counter() - cycle_started
+            self.last_cycle_timings = timings
             return {"symbols": len(bundles), "trading": False, "phase": self.phase.value}
 
         # --- Equity refresh + Risk Guard evaluation -----------------------
         account: AccountState = await self._account_state()
         state: SystemState = await self.risk_guard.update_equity(account.equity)
+        checkpoint = _mark("risk_guard", checkpoint)
 
         # --- B: features ---------------------------------------------------
         payloads: dict[str, InferencePayload] = await self.processor.build_inference_payloads(
             list(bundles)
         )
+        checkpoint = _mark("feature_generation", checkpoint)
         if not payloads:
             await self.audit.log_system_event(
                 cycle_id, "NO_TRADE", "no symbol produced a warm feature row", rule="FEATURES_COLD"
             )
+            timings["total"] = time.perf_counter() - cycle_started
+            self.last_cycle_timings = timings
             return {"symbols": len(bundles), "payloads": 0}
 
         # --- C: inference ---------------------------------------------------
         inferences: dict[str, ModelInferenceResult] = await self.ml.infer_many(
             list(payloads.values())
         )
+        checkpoint = _mark("prediction", checkpoint)
 
         # --- D: decisions ----------------------------------------------------
         context = DecisionContext(
@@ -577,6 +854,7 @@ class TradingSystem:
             list(inferences.values()), context
         )
         self.last_cycle_decisions = len(decisions)
+        checkpoint = _mark("decision", checkpoint)
 
         # --- E: execution -----------------------------------------------------
         executed: int = 0
@@ -594,17 +872,24 @@ class TradingSystem:
                 execution_detail=execution_detail,
             )
         self.last_cycle_executed = executed
+        checkpoint = _mark("execution_and_audit", checkpoint)
 
         # --- Post-cycle bookkeeping ---------------------------------------------
         await self._record_equity()
+        checkpoint = _mark("database", checkpoint)
+
+        timings["total"] = time.perf_counter() - cycle_started
+        self.last_cycle_timings = timings
 
         _LOGGER.info(
-            "Cycle summary: %d symbols | %d decisions | %d executed | guard=%s | equity=%.2f",
+            "Cycle summary: %d symbols | %d decisions | %d executed | guard=%s | equity=%.2f | "
+            "timings=%s",
             len(bundles),
             len(decisions),
             executed,
             state.value,
             account.equity,
+            {key: round(value, 3) for key, value in timings.items()},
         )
         return {
             "cycle_id": cycle_id,
@@ -613,6 +898,7 @@ class TradingSystem:
             "executed": executed,
             "risk_guard": state.value,
             "equity": account.equity,
+            "timings": timings,
         }
 
     async def _execute(self, decision: DecisionResult) -> dict[str, Any]:
@@ -667,6 +953,22 @@ class TradingSystem:
             )
         except Exception as error:  # pragma: no cover
             _LOGGER.error("Could not record the equity point: %s", error)
+
+    async def _persist_cycle_timings(self, cycle_id: str, timings: dict[str, float]) -> None:
+        """Append this cycle's per-stage timings to a bounded rolling history.
+
+        Feeds the ML diagnostic report's Pipeline Timing section with real,
+        measured durations across many cycles rather than just the latest one.
+        Best-effort: a persistence failure must not affect trading.
+        """
+        try:
+            stored: dict[str, Any] | None = await self.database.get_state("cycle_timings_history")
+            history: list[Any] = list((stored or {}).get("records", []))
+            history.append({"cycle_id": cycle_id, "at": utc_now_ms(), **timings})
+            history = history[-_MAX_STORED_CYCLE_TIMINGS:]
+            await self.database.set_state("cycle_timings_history", {"records": history})
+        except Exception as error:  # pragma: no cover - telemetry must not break the loop
+            _LOGGER.error("Could not persist cycle timings: %s", error)
 
     # ------------------------------------------------------------------
     # SystemController implementation (consumed by the web panel)
@@ -827,6 +1129,26 @@ class TradingSystem:
         """Proxy to the trades table."""
         return await self.database.fetch_trades(status=status_filter, limit=limit)
 
+    async def ml_diagnostics(self) -> dict[str, Any]:
+        """The full ML diagnostic report for the most recent training run.
+
+        Read back from the durable state pointer + JSON file written by
+        :func:`module_f_panel.diagnostics.build_report`, so this reflects the
+        real last-completed run even across a panel restart - never
+        recomputed or approximated here.
+        """
+        report: dict[str, Any] | None = await diagnostics.load_latest_report(self.database)
+        if report is None:
+            return {"status": "NOT_AVAILABLE", "reason": "no training run has completed yet"}
+        return report
+
+    async def ml_diagnostics_markdown(self) -> str:
+        """The same report, rendered as human-readable Markdown."""
+        report: dict[str, Any] = await self.ml_diagnostics()
+        if report.get("status") == "NOT_AVAILABLE":
+            return "# ML Diagnostic Report\n\nNo training run has completed yet."
+        return diagnostics.render_markdown(report)
+
     # ------------------------------------------------------------------
     # Runners
     # ------------------------------------------------------------------
@@ -961,6 +1283,13 @@ class TradingSystem:
         """Build the training dataset and fit all four heads."""
         await self.database.initialize()
         symbols: list[str] = await self._resolve_cli_universe()
+        # `train` is a standalone CLI path - it never runs `_setup_collect`, so
+        # without this the funding_rate/open_interest/long_short_ratio/
+        # taker_buy_sell_ratio history stays at its neutral default no matter
+        # how many times the model is retrained from this entry point - and the
+        # archive-sourced order-book/liquidation block stays empty likewise.
+        await self.pipeline.backfill_futures_metrics(symbols)
+        await self.pipeline.backfill_market_microstructure(symbols)
         dataset: ProcessedDataset = await self.processor.build_training_dataset(
             symbols=symbols, max_candles_per_symbol=max_candles
         )
@@ -971,8 +1300,30 @@ class TradingSystem:
 
         _LOGGER.info("Dataset: %d rows | %s", len(dataset), dataset.class_distribution())
         report: dict[str, Any] = await self.ml.train_all(dataset)
-        for head, metrics in report.items():
+        for head, metrics in _headline_metrics(report).items():
             _LOGGER.info("%-10s -> %s", head, metrics)
+
+        run_id: str = str(uuid.uuid4())
+        backtest_report: BacktestReport | None
+        relaxed_backtest_report: BacktestReport | None
+        backtest_report, relaxed_backtest_report = await self._run_final_backtest(dataset)
+        try:
+            diagnostic_report: dict[str, Any] = await diagnostics.build_report(
+                settings=self.settings,
+                database=self.database,
+                ml=self.ml,
+                dataset=dataset,
+                run_id=run_id,
+                backtest=backtest_report,
+                relaxed_backtest=relaxed_backtest_report,
+            )
+            self.latest_ml_report_id = run_id
+            reports_dir = self.settings.ml.model_dir.parent / diagnostics.REPORTS_DIR_NAME
+            print(f"\nML diagnostic report: {reports_dir / f'ml_diagnostic_{run_id}.json'}")
+            print(f"Overall status: {diagnostic_report['ai_summary']['overall_status']}")
+        except Exception as error:  # pragma: no cover - reporting must not break the CLI
+            _LOGGER.error("Could not build the ML diagnostic report: %s", error, exc_info=True)
+
         await self.features.shutdown()
         await self.database.close()
 

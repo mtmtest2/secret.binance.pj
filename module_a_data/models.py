@@ -273,6 +273,31 @@ class QCReport(BaseModel):
         return f"{self.symbol}: FAILED {', '.join(self.critical_codes)}"
 
 
+class HealAttempt(BaseModel):
+    """Telemetry for a single heal round, for diagnostics and reporting.
+
+    One instance is recorded per re-fetch round inside
+    :meth:`~module_a_data.qc_validator.QCValidator.validate_and_heal`, whether
+    or not the round succeeded, so a diagnostic report can show exactly what
+    the healer tried, not just its final verdict.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    symbol: str
+    attempt_number: int = Field(ge=1)
+    reason: tuple[str, ...] = Field(default=(), description="CRITICAL QC codes that triggered this round.")
+    window_count: int = Field(ge=0)
+    start_timestamp: int | None = Field(default=None)
+    end_timestamp: int | None = Field(default=None)
+    bars_requested: int = Field(ge=0)
+    bars_received: int = Field(ge=0)
+    bars_written: int = Field(ge=0, description="Rows merged into the working set this round.")
+    bars_invalid_after_heal: int = Field(ge=0, description="Suspicious timestamps still unresolved after this round.")
+    duration_seconds: float = Field(ge=0.0)
+    result: str = Field(description="'resolved', 'still_invalid', 'quarantined' or 'failed'.")
+
+
 class MarketDataBundle(BaseModel):
     """Everything Module A produces for a single symbol in one 5m cycle."""
 
