@@ -35,6 +35,11 @@ def _pooled(rows: int = 400, symbols: tuple[str, ...] = ("A/USDT:USDT", "B/USDT:
         frame = pd.DataFrame(
             {column: rng.normal(size=rows) for column in FEATURE_COLUMNS}
         )
+        # `realized_vol_12_is_zero` is a 0/1 indicator by construction (see
+        # FeatureEngineer), not a continuous column - Gaussian noise here would
+        # mark a sixth of the fixture as flat-market rows and have them dropped
+        # by the degeneracy filter, which is not what these tests are about.
+        frame["realized_vol_12_is_zero"] = 0.0
         frame["timestamp"] = np.arange(rows, dtype=np.int64) * 300_000 + offset
         frame["symbol"] = symbol
         frame["label"] = "NO_TRADE_OR_FAIL"
@@ -76,16 +81,37 @@ def test_rows_with_unusable_labels_are_still_dropped() -> None:
     assert dataset.dropped_missing_or_inf_rows == 10
 
 
-def test_infinities_become_nan_rather_than_dropping_the_row() -> None:
+def test_infinities_become_nan_in_optional_columns_without_dropping_the_row() -> None:
+    """An infinity is converted, never split on - and in the optional block it
+    costs nothing but its own information."""
     pooled = _pooled()
+    pooled.loc[0, "ob_imbalance"] = np.inf
+    pooled.loc[1, "liquidation_imbalance"] = -np.inf
+
+    dataset = _processor()._to_dataset(pooled, ("A/USDT:USDT", "B/USDT:USDT"))
+
+    assert len(dataset) == len(pooled)
+    assert np.isnan(dataset.features.loc[0, "ob_imbalance"])
+    assert np.isnan(dataset.features.loc[1, "liquidation_imbalance"])
+
+
+def test_infinities_in_required_columns_cost_the_row() -> None:
+    """Because inference would refuse to score that bar.
+
+    The conversion to NaN still happens - no split threshold can be meaningful
+    against an infinity - but a required feature that is not finite means the
+    bar is not warmed up, and `build_inference_payload` and the backtester both
+    drop it. Training keeping it is the train/serve mismatch, in the direction
+    opposite to the one NaN tolerance was introduced to fix.
+    """
+    pooled = _pooled()
+    assert "garch_vol_ratio" not in OPTIONAL_FEATURE_COLUMNS
     pooled.loc[0, "garch_vol_ratio"] = np.inf
     pooled.loc[1, "vol_of_vol"] = -np.inf
 
     dataset = _processor()._to_dataset(pooled, ("A/USDT:USDT", "B/USDT:USDT"))
 
-    assert len(dataset) == len(pooled)
-    assert np.isnan(dataset.features.loc[0, "garch_vol_ratio"])
-    assert np.isnan(dataset.features.loc[1, "vol_of_vol"])
+    assert len(dataset) == len(pooled) - 2
 
 
 def test_null_counts_are_reported_per_feature() -> None:
@@ -205,3 +231,67 @@ def test_microstructure_join_never_carries_a_stale_bucket_forward() -> None:
         "an uncovered bucket must not inherit the last observed book"
     )
     assert built["microstructure_is_missing"].iloc[-1] == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# The other half of the contract (audit P2, P23, P29): tolerance applies to the
+# OPTIONAL block, not to rows that are unusable or degenerate.
+# ---------------------------------------------------------------------------
+def test_rows_missing_a_required_feature_are_dropped() -> None:
+    """Training must gate on the same block inference gates on.
+
+    Keeping a row whose required features are incomplete fits the model on a
+    population `build_inference_payload` and the backtester would both refuse to
+    score - a train/serve mismatch in the opposite direction to the one the
+    NaN-tolerance change fixed.
+    """
+    pooled = _pooled()
+    assert "adx" not in OPTIONAL_FEATURE_COLUMNS
+    pooled.loc[:9, "adx"] = np.nan
+
+    dataset = _processor()._to_dataset(pooled, ("A/USDT:USDT", "B/USDT:USDT"))
+
+    assert len(dataset) == len(pooled) - 10
+
+
+def test_optional_features_stay_nan_tolerant() -> None:
+    """The microstructure block may be absent without costing the bar."""
+    pooled = _pooled()
+    for column in OPTIONAL_FEATURE_COLUMNS:
+        pooled[column] = np.nan
+
+    dataset = _processor()._to_dataset(pooled, ("A/USDT:USDT", "B/USDT:USDT"))
+
+    assert len(dataset) == len(pooled)
+    for column in OPTIONAL_FEATURE_COLUMNS:
+        assert dataset.features[column].isna().all()
+
+
+def test_zero_volatility_rows_are_dropped_and_counted() -> None:
+    """A flat book is an absence of an observation, not a quiet one.
+
+    These rows were the 72% of the audited training window whose indicators
+    degenerate - ADX pinned at its ceiling, wick_ratio and whipsaw_rate forced
+    to zero. They are removed for a stated reason and counted, so the training
+    window shrinks visibly rather than silently.
+    """
+    pooled = _pooled()
+    pooled.loc[:49, "realized_vol_12_is_zero"] = 1.0
+
+    dataset = _processor()._to_dataset(pooled, ("A/USDT:USDT", "B/USDT:USDT"))
+
+    assert len(dataset) == len(pooled) - 50
+    assert dataset.dropped_zero_volatility_rows == 50
+
+
+def test_duplicate_symbol_timestamp_rows_are_removed() -> None:
+    """Counted *and* dropped: identical rows across splits are leakage."""
+    pooled = _pooled(rows=100, symbols=("A/USDT:USDT",))
+    duplicated = pd.concat([pooled, pooled.iloc[:5]], ignore_index=True)
+
+    dataset = _processor()._to_dataset(duplicated, ("A/USDT:USDT",))
+
+    assert len(dataset) == 100
+    assert dataset.dropped_duplicate_rows == 5
+    timestamps = dataset.metadata["timestamp"]
+    assert timestamps.duplicated().sum() == 0

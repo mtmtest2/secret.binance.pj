@@ -227,6 +227,15 @@ class ProcessedDataset:
     rejected_invalid_label_rows: int = field(default=0)
     dropped_missing_or_inf_rows: int = field(default=0)
     duplicate_feature_rows: int = field(default=0)
+    #: Rows removed because they carried no price movement across the volatility
+    #: window - a flat book whose indicators degenerate rather than inform.
+    #: Named and counted rather than swept up by an incidental NaN filter, so the
+    #: exclusion is auditable and can be trended run over run.
+    dropped_zero_volatility_rows: int = field(default=0)
+    #: Duplicate (symbol, timestamp) rows removed.
+    dropped_duplicate_rows: int = field(default=0)
+    #: Feature columns that were NaN on every surviving row.
+    empty_feature_columns: tuple[str, ...] = field(default=())
     #: Per-feature null counts *after* cleaning.  Rows are no longer destroyed
     #: for a NaN in a single feature column (the boosters split on NaN
     #: natively), so this is the only remaining visibility into which features
@@ -466,6 +475,26 @@ class DatasetProcessor:
             _LOGGER.error("Unexpected failure building %s: %s", symbol, error, exc_info=True)
             return None
 
+    @staticmethod
+    def _degenerate_rows(frame: pd.DataFrame) -> pd.Series:
+        """Rows where the market did not move across the volatility window.
+
+        ``realized_vol_12_is_zero`` is 1.0 exactly when the last twelve closes
+        were identical.  Such a bar is not a quiet observation, it is an absence
+        of one: ATR collapses so the labeler's barriers degenerate, ADX pins at
+        its 100 ceiling (DX is scale-invariant, so one-sided movement gives
+        exactly 100 however small), and ``wick_ratio``/``whipsaw_rate`` are
+        forced to zero by their own NaN fills.
+
+        A previous NaN-any-column filter removed these rows as a side effect and
+        was rightly called out as unauditable sample-selection bias.  Removing
+        the same rows for a *stated* reason, with a counter, is a different
+        thing: the training window shrinks visibly rather than silently.
+        """
+        if "realized_vol_12_is_zero" in frame.columns:
+            return frame["realized_vol_12_is_zero"].fillna(0.0) >= 1.0
+        return pd.Series(False, index=frame.index)
+
     def _to_dataset(self, pooled: pd.DataFrame, symbols: tuple[str, ...]) -> ProcessedDataset:
         """Clean the pooled frame and split it into per-model targets."""
         total_candidate_rows: int = len(pooled)
@@ -485,17 +514,74 @@ class DatasetProcessor:
         # down a learned default branch, so a sparse feature costs only its own
         # information, not the entire observation.
         before: int = len(usable)
-        usable = usable.dropna(subset=["label", "target_risk_score"])
+        usable = usable.dropna(subset=["label", "target_risk_score", *REQUIRED_FEATURE_COLUMNS])
         dropped: int = before - len(usable)
         if dropped:
-            _LOGGER.info("Dropped %d rows with an unusable label/target", dropped)
+            _LOGGER.info("Dropped %d rows with an unusable label/target or un-warmed feature", dropped)
+
+        # ...but a row whose *required* block is incomplete is one inference and
+        # the backtester would both refuse to score, so keeping it in training
+        # fits the model on a population it is never asked about. The gate above
+        # is deliberately the same `REQUIRED_FEATURE_COLUMNS` set both of those
+        # paths use; the optional micro-structure block stays NaN-tolerant.
+        before = len(usable)
+        degenerate_mask: pd.Series = self._degenerate_rows(usable)
+        dropped_degenerate_rows: int = int(degenerate_mask.sum())
+        if dropped_degenerate_rows:
+            usable = usable[~degenerate_mask]
+            _LOGGER.warning(
+                "Dropped %d row(s) with no price movement over the volatility window "
+                "(%.1f%% of candidates) - a flat book teaches the model nothing and its "
+                "indicators degenerate: ADX pins at 100, wick_ratio and whipsaw_rate at 0",
+                dropped_degenerate_rows,
+                100.0 * dropped_degenerate_rows / max(1, before),
+            )
 
         if usable.empty:
             return self._empty_dataset()
 
         usable = usable.reset_index(drop=True)
+        # Counted *and* removed. A duplicate (symbol, timestamp) means one candle
+        # was stored twice; identical rows split across train and test are
+        # exact-match leakage, and a split holding more rows than its own time
+        # span has slots is the symptom that made it visible.
         duplicate_feature_rows: int = int(usable.duplicated(subset=feature_columns).sum())
+        if "timestamp" in usable.columns and "symbol" in usable.columns:
+            before = len(usable)
+            usable = usable.drop_duplicates(subset=["symbol", "timestamp"], keep="last").reset_index(
+                drop=True
+            )
+            dropped_duplicate_rows: int = before - len(usable)
+            if dropped_duplicate_rows:
+                _LOGGER.warning(
+                    "Dropped %d duplicate (symbol, timestamp) row(s) from the training set",
+                    dropped_duplicate_rows,
+                )
+        else:  # pragma: no cover - metadata-less frames only appear in unit fixtures
+            dropped_duplicate_rows = 0
         null_counts, null_rates = self._null_diagnostics(usable, feature_columns)
+
+        # A column that is NaN on every row is not a feature: it occupies the
+        # feature contract, forces a retrain whenever it changes, and contributes
+        # nothing to any split. Naming them here means the condition is visible
+        # before the diagnostic report is generated, and before a model is
+        # trained on a contract that is partly fiction. They are reported rather
+        # than silently removed - which of them *should* carry data is a question
+        # about the backfill, not about this function.
+        empty_feature_columns: list[str] = [
+            column
+            for column in feature_columns
+            if len(usable) and null_counts.get(column, 0) >= len(usable)
+        ]
+        if empty_feature_columns:
+            _LOGGER.error(
+                "%d feature column(s) are empty on every one of %d rows: %s - the backfill "
+                "that should populate them is not working, and any importance or metric "
+                "involving them is meaningless",
+                len(empty_feature_columns),
+                len(usable),
+                ", ".join(empty_feature_columns),
+            )
 
         metadata_columns: list[str] = [
             column for column in ("symbol", *_META_COLUMNS) if column in usable.columns
@@ -515,6 +601,9 @@ class DatasetProcessor:
             total_candidate_rows=total_candidate_rows,
             rejected_invalid_label_rows=rejected_invalid_label_rows,
             dropped_missing_or_inf_rows=dropped,
+            dropped_zero_volatility_rows=dropped_degenerate_rows,
+            dropped_duplicate_rows=dropped_duplicate_rows,
+            empty_feature_columns=tuple(empty_feature_columns),
             duplicate_feature_rows=duplicate_feature_rows,
             null_counts_by_feature=null_counts,
             null_rate_by_symbol_month=null_rates,

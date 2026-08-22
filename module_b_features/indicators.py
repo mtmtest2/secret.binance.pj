@@ -13,6 +13,8 @@ first principles.  Two properties are non-negotiable throughout this module:
 
 from __future__ import annotations
 
+from typing import Final
+
 import numpy as np
 import pandas as pd
 
@@ -177,6 +179,11 @@ def fractal_dimension_index(close: pd.Series, window: int = 30) -> pd.Series:
     return pd.Series(output, index=close.index, name="fdi")
 
 
+#: Below this a directional index carries no usable movement; DX computed
+#: against it is a ratio of noise to noise.
+_MIN_DIRECTIONAL_INDEX: Final[float] = 1e-9
+
+
 def adx(
     high: pd.Series,
     low: pd.Series,
@@ -202,9 +209,21 @@ def adx(
 
     di_sum: pd.Series = (plus_di + minus_di).replace(0.0, np.nan)
     directional_index: pd.Series = 100.0 * (plus_di - minus_di).abs() / di_sum
-    adx_values: pd.Series = wilder_smooth(directional_index.fillna(0.0), window)
 
-    return adx_values, plus_di.fillna(0.0), minus_di.fillna(0.0)
+    # DX is scale-invariant: 100*|a-b|/(a+b) is exactly 100 whenever one DI is
+    # zero, however small the other. On a flat stretch punctuated by a single
+    # directional tick that is precisely the situation - one DM is one tick, the
+    # other is 0 - so DX pins at its ceiling without any division by zero, and
+    # the guards on `safe_atr`/`di_sum` never fire. Requiring both sides to carry
+    # movement is what keeps the reading meaningful; where they do not, the value
+    # is undefined and NaN says so. Filling it with 0.0 (as this did) injects a
+    # value into the Wilder smoother that then propagates across the window, and
+    # 0 is an ordinary ADX reading rather than a marker for "no information".
+    both_present: pd.Series = (plus_di > _MIN_DIRECTIONAL_INDEX) & (minus_di > _MIN_DIRECTIONAL_INDEX)
+    directional_index = directional_index.where(both_present)
+    adx_values: pd.Series = wilder_smooth(directional_index, window)
+
+    return adx_values, plus_di, minus_di
 
 
 def bollinger(

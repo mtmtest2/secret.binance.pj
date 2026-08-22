@@ -147,6 +147,12 @@ class DataSettings(BaseModel):
     #: OHLCV window so the block covers the whole training set rather than
     #: reintroducing the sparse-recent-data problem it exists to solve.
     archive_backfill_days: int = Field(default=740, ge=1)
+    #: bookTicker is event-level top-of-book and runs to tens/hundreds of MB per
+    #: symbol-day; liquidationSnapshot is kilobytes. Requesting 740 days of the
+    #: former across the universe is ~20k downloads on the order of a terabyte,
+    #: which is why it never completed. The reduced 5m aggregates are cached, so
+    #: coverage can be extended incrementally by raising this across runs.
+    archive_book_ticker_days: int = Field(default=90, ge=1)
 
 
 class UniverseSettings(BaseModel):

@@ -49,7 +49,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Final, Iterable, Iterator, Sequence
+from typing import Any, Final, Iterable, Iterator, Sequence, IO
 
 import aiohttp
 import numpy as np
@@ -173,7 +173,19 @@ class BinanceArchiveLoader:
 
     async def _client(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=self._settings.data.archive_timeout_seconds)
+            # `total` bounds the entire request *including the body*, which is
+            # generous for a kilobyte-scale liquidationSnapshot day and a
+            # guaranteed abort for a bookTicker day of tens to hundreds of MB -
+            # especially with several downloads sharing bandwidth. That asymmetry
+            # is why liquidation coverage reached 52.8% while bookTicker reached
+            # exactly zero on every symbol, for every day, over 25 months.
+            # Bounding stalls instead of size is what this setting was for.
+            timeout = aiohttp.ClientTimeout(
+                total=None,
+                connect=30.0,
+                sock_connect=30.0,
+                sock_read=self._settings.data.archive_timeout_seconds,
+            )
             self._session = aiohttp.ClientSession(timeout=timeout)
         return self._session
 
@@ -325,13 +337,17 @@ class BinanceArchiveLoader:
             names: list[str] = [name for name in archive.namelist() if name.lower().endswith(".csv")]
             if not names:
                 raise ValueError("archive contains no CSV member")
+            # Streamed from the ZIP member, not read into one bytes object first.
+            # The docstring promised chunked reading, but `chunksize` was being
+            # applied to a BytesIO over a fully decompressed buffer, so peak
+            # memory was the whole uncompressed file - gigabytes for a bookTicker
+            # day, which is an OOM rather than a slow path. Aggregation consumes
+            # the chunks lazily, so this must stay inside the `with` block.
             with archive.open(names[0]) as handle:
-                raw: bytes = handle.read()
-
-        frames: Iterable[pd.DataFrame] = _read_csv_chunks(raw, _HEADERS[dataset])
-        if dataset == DATASET_BOOK_TICKER:
-            return aggregate_book_ticker(frames)
-        return aggregate_liquidations(frames)
+                frames: Iterable[pd.DataFrame] = _read_csv_chunks(handle, _HEADERS[dataset])
+                if dataset == DATASET_BOOK_TICKER:
+                    return aggregate_book_ticker(frames)
+                return aggregate_liquidations(frames)
 
     def _cache_path(self, archive_symbol: str, dataset: str, day: date) -> Path:
         return self._cache_dir / dataset / archive_symbol / f"{day.isoformat()}.parquet"
@@ -340,7 +356,9 @@ class BinanceArchiveLoader:
 # ---------------------------------------------------------------------------
 # CSV reading
 # ---------------------------------------------------------------------------
-def _read_csv_chunks(raw: bytes, expected_columns: tuple[str, ...]) -> Iterator[pd.DataFrame]:
+def _read_csv_chunks(
+    source: bytes | IO[bytes], expected_columns: tuple[str, ...]
+) -> Iterator[pd.DataFrame]:
     """Yield chunks of a Binance archive CSV, header row present or not.
 
     Binance changed these files mid-life: older days are headerless, newer ones
@@ -351,14 +369,28 @@ def _read_csv_chunks(raw: bytes, expected_columns: tuple[str, ...]) -> Iterator[
     inverts every downstream imbalance while leaving all shapes and ranges
     perfectly healthy.
     """
-    first_line: bytes = raw.split(b"\n", 1)[0]
+    # Accepts either a bytes blob (small files, tests) or any readable binary
+    # stream. The streaming form is what keeps peak memory at one chunk rather
+    # than the whole uncompressed day.
+    if isinstance(source, (bytes, bytearray)):
+        stream: IO[bytes] = io.BytesIO(source)
+    else:
+        stream = source
+
+    # Peek the first line for a header, then rewind. A non-seekable stream is
+    # buffered once so detection stays possible either way.
+    if not stream.seekable():
+        stream = io.BytesIO(stream.read())
+    first_line: bytes = stream.readline()
+    stream.seek(0)
+
     has_header: bool = any(
         token.strip().decode("utf-8", "ignore").lower() in {c.lower() for c in expected_columns}
         for token in first_line.split(b",")
     )
 
     reader = pd.read_csv(
-        io.BytesIO(raw),
+        stream,
         header=0 if has_header else None,
         names=None if has_header else list(expected_columns),
         chunksize=_CHUNK_ROWS,

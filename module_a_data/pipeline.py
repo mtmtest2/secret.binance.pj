@@ -46,6 +46,10 @@ _MAX_STORED_EXCLUSIONS: Final[int] = 500
 
 #: Durable state keys (see ``DatabaseHandler.set_state``/``get_state``).
 HEAL_TELEMETRY_STATE_KEY: Final[str] = "qc_heal_telemetry"
+
+#: Share of requested archive symbol-days that may fail before the affected
+#: features should be treated as unusable rather than merely sparse.
+_ARCHIVE_FAILURE_RATE_LIMIT: float = 0.2
 SYMBOL_EXCLUSION_STATE_KEY: Final[str] = "qc_symbol_exclusions"
 
 #: ``(symbol, completed, total) -> None`` progress reporter for long backfills.
@@ -328,6 +332,12 @@ class DataPipeline:
         window_days: int = days or settings.archive_backfill_days
         end_ms: int = last_closed_candle_open_ms(settings.timeframe_ms)
         start_ms: int = end_ms - window_days * 86_400_000
+        # bookTicker gets its own, shallower window: it is event-level data
+        # orders of magnitude larger per symbol-day than liquidationSnapshot, and
+        # requesting the same depth for both is what made the book half of this
+        # backfill unable to finish at all.
+        book_days: int = days or min(window_days, settings.archive_book_ticker_days)
+        book_start_ms: int = end_ms - book_days * 86_400_000
 
         completed: int = 0
         total: int = len(universe)
@@ -352,7 +362,7 @@ class DataPipeline:
                             symbol_start = oldest
 
                         book, book_coverage = await loader.load_5m_buckets(
-                            symbol, DATASET_BOOK_TICKER, symbol_start, end_ms
+                            symbol, DATASET_BOOK_TICKER, max(symbol_start, book_start_ms), end_ms
                         )
                         liquidations, liquidation_coverage = await loader.load_5m_buckets(
                             symbol, DATASET_LIQUIDATION, symbol_start, end_ms
@@ -387,6 +397,35 @@ class DataPipeline:
             await asyncio.gather(*(_one(symbol) for symbol in universe))
 
         summary: dict[str, Any] = coverage_summary(reports)
+        # Per-dataset coverage, because one number cannot distinguish "the book
+        # feed returned nothing at all" from "liquidations are 53% covered" - and
+        # that distinction was invisible for an entire release.
+        by_dataset: dict[str, dict[str, int]] = {}
+        for coverage in reports:
+            block = by_dataset.setdefault(
+                coverage.dataset,
+                {"days_requested": 0, "days_downloaded": 0, "days_absent": 0, "days_failed": 0},
+            )
+            block["days_requested"] += coverage.days_requested
+            block["days_downloaded"] += coverage.days_downloaded
+            block["days_absent"] += coverage.days_absent
+            block["days_failed"] += coverage.days_failed
+        for dataset, block in by_dataset.items():
+            requested = max(1, block["days_requested"])
+            block["coverage_pct"] = round(block["days_downloaded"] / requested, 4)
+            block["failure_rate"] = round(block["days_failed"] / requested, 4)
+            if block["failure_rate"] > _ARCHIVE_FAILURE_RATE_LIMIT:
+                _LOGGER.error(
+                    "Archive dataset %s failed on %.0f%% of requested symbol-days "
+                    "(%d of %d) - the features it feeds will be empty; check the "
+                    "download transport before trusting any model that uses them",
+                    dataset,
+                    block["failure_rate"] * 100.0,
+                    block["days_failed"],
+                    block["days_requested"],
+                )
+        summary["by_dataset"] = by_dataset
+
         _LOGGER.info(
             "Micro-structure backfill complete: %.1f%% of %s requested symbol-days",
             float(summary.get("overall_coverage_pct", 0.0)) * 100.0,
