@@ -50,6 +50,7 @@ from typing import Any, Final, Sequence
 import numpy as np
 import uvicorn
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.events import EVENT_JOB_MAX_INSTANCES, EVENT_JOB_MISSED
 from apscheduler.triggers.cron import CronTrigger
 
 from config.settings import Settings, get_settings
@@ -80,6 +81,19 @@ from module_f_panel.web_app import build_app
 _LOGGER = get_logger("main")
 
 _CYCLE_MINUTES: Final[str] = "0,5,10,15,20,25,30,35,40,45,50,55"
+
+#: Lifecycle phases during which a single cycle legitimately runs for tens of
+#: minutes (two-year backfill, gap healing, training). Firings skipped inside
+#: one of these are expected; the identical skip in any other phase means live
+#: candles are being missed and is logged as a warning instead.
+_SETUP_PHASES: Final[frozenset[str]] = frozenset(
+    {
+        SystemPhase.STARTING.value,
+        SystemPhase.AWAITING_UNIVERSE.value,
+        SystemPhase.COLLECTING_DATA.value,
+        SystemPhase.TRAINING.value,
+    }
+)
 
 #: Rolling history cap for persisted per-cycle timing telemetry.
 _MAX_STORED_CYCLE_TIMINGS: Final[int] = 500
@@ -795,10 +809,22 @@ class TradingSystem:
         """
         if self._cycle_lock.locked():
             self.cycles_skipped_overlap += 1
-            _LOGGER.warning(
-                "Previous cycle is still running - skipping this slot (%d skipped so far)",
-                self.cycles_skipped_overlap,
-            )
+            # Expected while a two-year backfill/heal is in flight; a genuine
+            # problem once the system is live, because it means candles are
+            # being missed. Same event, very different severity.
+            if self._setup_in_progress():
+                _LOGGER.info(
+                    "Previous cycle is still running - skipping this slot (%d skipped so far); "
+                    "expected during %s",
+                    self.cycles_skipped_overlap,
+                    self._phase_name(),
+                )
+            else:
+                _LOGGER.warning(
+                    "Previous cycle is still running - skipping this slot (%d skipped so far) - "
+                    "live candles are being missed; check ingestion latency",
+                    self.cycles_skipped_overlap,
+                )
             return {"skipped": True}
 
         async with self._cycle_lock:
@@ -1213,6 +1239,37 @@ class TradingSystem:
     # ------------------------------------------------------------------
     # Runners
     # ------------------------------------------------------------------
+    def _on_job_missed(self, event: Any) -> None:
+        """Record a skipped 5-minute firing with the reason it was skipped.
+
+        During bootstrap a single ingestion cycle legitimately runs for tens of
+        minutes (a two-year backfill plus healing), so every firing inside it is
+        skipped. That is expected and is logged as such; the same skip once the
+        system is live means candles are being missed and is a real problem.
+        """
+        # APScheduler reports this as an anonymous warning with no context. The
+        # in-cycle lock path already counts the skip, so this only adds the
+        # scheduler's own view for firings that never reached the coroutine.
+        if self._setup_in_progress():
+            _LOGGER.info(
+                "Scheduler skipped a 5m firing during %s - expected while a long "
+                "backfill/heal holds the cycle",
+                self._phase_name(),
+            )
+        else:
+            _LOGGER.warning(
+                "Scheduler skipped a 5m firing (phase=%s) - live candles are being missed",
+                self._phase_name(),
+            )
+
+    def _phase_name(self) -> str:
+        phase = getattr(getattr(self, "progress", None), "phase", None)
+        return getattr(phase, "value", str(phase)) if phase is not None else "UNKNOWN"
+
+    def _setup_in_progress(self) -> bool:
+        """True while a long one-off task (backfill, heal, training) owns the cycle."""
+        return self._phase_name() in _SETUP_PHASES
+
     def _schedule(self) -> None:
         """Register the 5-minute cron job."""
         self.scheduler.add_job(
@@ -1224,11 +1281,17 @@ class TradingSystem:
             ),
             id="trading_cycle",
             name="5m trading cycle",
+            # Deliberately 1: two ingestion cycles running at once would race
+            # each other's writes. A cycle that overruns therefore *skips* the
+            # next firing rather than stacking, which is correct - but APScheduler
+            # reports it as an anonymous warning, so it is counted here instead
+            # and explained with the phase that caused it.
             max_instances=1,
             coalesce=True,
             misfire_grace_time=90,
             replace_existing=True,
         )
+        self.scheduler.add_listener(self._on_job_missed, EVENT_JOB_MAX_INSTANCES | EVENT_JOB_MISSED)
         self.scheduler.start()
         _LOGGER.info(
             "Scheduler armed: every 5 minutes at second %d (UTC)",
