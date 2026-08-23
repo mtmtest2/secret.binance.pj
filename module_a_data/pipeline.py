@@ -12,7 +12,8 @@ interpolated data.  Trading on invented candles is worse than not trading.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Callable, Final
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Final, Sequence
 
 import pandas as pd
 
@@ -33,6 +34,9 @@ from module_a_data.models import (
 )
 from module_a_data.qc_validator import QCValidator
 
+if TYPE_CHECKING:  # pragma: no cover - import cycle/heavy dependency at runtime
+    from module_a_data.archive_loader import ArchiveCoverage
+
 _LOGGER = get_logger(__name__)
 
 #: Extra candles fetched beyond the strict minimum, so rolling windows warm up.
@@ -50,7 +54,79 @@ HEAL_TELEMETRY_STATE_KEY: Final[str] = "qc_heal_telemetry"
 #: Share of requested archive symbol-days that may fail before the affected
 #: features should be treated as unusable rather than merely sparse.
 _ARCHIVE_FAILURE_RATE_LIMIT: float = 0.2
+#: Below this coverage, a dataset is not "sparse" - something is wrong with the
+#: transport or the cache. Binance publishes these files for the whole life of
+#: each contract.
+_ARCHIVE_MIN_COVERAGE: float = 0.05
+#: Only judge coverage once enough days were requested for the ratio to mean
+#: something.
+_ARCHIVE_MIN_DAYS_FOR_COVERAGE_CHECK: int = 30
+_ARCHIVE_BASE_URL: str = "https://data.binance.vision/data/futures/um/daily"
 SYMBOL_EXCLUSION_STATE_KEY: Final[str] = "qc_symbol_exclusions"
+
+
+def summarise_archive_coverage_by_dataset(
+    reports: Sequence[ArchiveCoverage],
+) -> dict[str, dict[str, float]]:
+    """Aggregate per-symbol archive coverage per dataset, escalating what is wrong.
+
+    Two distinct pathologies hide behind a single overall percentage and are
+    reported separately here:
+
+    * a high *failure* rate - downloads that errored, so the features are sparse
+      for a transport reason that will likely clear on the next run;
+    * a near-zero *coverage* with no failures at all - every day came back
+      "absent". Binance publishes these files for the whole life of a contract,
+      so an entire universe reporting nothing over years is not the archive
+      being empty: it is an unreachable CDN or a cache poisoned by an older run
+      that could not tell a 404 from a timeout. That case used to look like
+      perfect health - zero failures - while every feature it fed stayed empty.
+    """
+    by_dataset: dict[str, dict[str, float]] = {}
+    for coverage in reports:
+        block = by_dataset.setdefault(
+            coverage.dataset,
+            {"days_requested": 0, "days_downloaded": 0, "days_absent": 0, "days_failed": 0},
+        )
+        block["days_requested"] += coverage.days_requested
+        block["days_downloaded"] += coverage.days_downloaded
+        block["days_absent"] += coverage.days_absent
+        block["days_failed"] += coverage.days_failed
+    for dataset, block in by_dataset.items():
+        requested = max(1, block["days_requested"])
+        block["coverage_pct"] = round(block["days_downloaded"] / requested, 4)
+        block["failure_rate"] = round(block["days_failed"] / requested, 4)
+        if block["failure_rate"] > _ARCHIVE_FAILURE_RATE_LIMIT:
+            _LOGGER.error(
+                "Archive dataset %s failed on %.0f%% of requested symbol-days "
+                "(%d of %d) - the features it feeds will be empty; check the "
+                "download transport before trusting any model that uses them",
+                dataset,
+                block["failure_rate"] * 100.0,
+                block["days_failed"],
+                block["days_requested"],
+            )
+        elif (
+            block["days_requested"] >= _ARCHIVE_MIN_DAYS_FOR_COVERAGE_CHECK
+            and block["coverage_pct"] < _ARCHIVE_MIN_COVERAGE
+        ):
+            _LOGGER.error(
+                "Archive dataset %s returned data for %.1f%% of %d requested symbol-days "
+                "(%d absent, %d failed). Binance publishes these files for the life of each "
+                "contract, so near-zero coverage means the archive is unreachable from this "
+                "host or the local cache is stale - not that the data does not exist. Verify "
+                "with: curl -sI %s/%s/BTCUSDT/BTCUSDT-%s-<YYYY-MM-DD>.zip",
+                dataset,
+                block["coverage_pct"] * 100.0,
+                block["days_requested"],
+                block["days_absent"],
+                block["days_failed"],
+                _ARCHIVE_BASE_URL,
+                dataset,
+                dataset,
+            )
+    return by_dataset
+
 
 #: ``(symbol, completed, total) -> None`` progress reporter for long backfills.
 ProgressCallback = Callable[[str, int, int], None]
@@ -137,7 +213,19 @@ class DataPipeline:
                         # cost the whole symbol its otherwise-clean history on
                         # every single bootstrap run.
                         healed, _, _ = await self._validator.validate_and_heal(
-                            symbol, candles, self._refetch, quarantine_unhealable=True
+                            symbol,
+                            candles,
+                            self._refetch,
+                            quarantine_unhealable=True,
+                            # A bootstrap heal spans the whole history: one attempt
+                            # legitimately re-fetches >100k bars and takes minutes.
+                            # The live per-cycle ceiling exists to stop a stuck
+                            # symbol starving the 5-minute budget and is far too
+                            # tight here - it failed three symbols that had already
+                            # rewritten ~120k bars each.
+                            budget_seconds=(
+                                self._settings.qc.max_bootstrap_heal_duration_seconds
+                            ),
                         )
                         candles = healed
 
@@ -317,10 +405,10 @@ class DataPipeline:
         from module_a_data.archive_loader import (
             DATASET_BOOK_TICKER,
             DATASET_LIQUIDATION,
-            ArchiveCoverage,
             BinanceArchiveLoader,
             coverage_summary,
             merge_microstructure,
+            purge_legacy_absent_markers,
         )
 
         settings = self._settings.data
@@ -338,6 +426,20 @@ class DataPipeline:
         # backfill unable to finish at all.
         book_days: int = days or min(window_days, settings.archive_book_ticker_days)
         book_start_ms: int = end_ms - book_days * 86_400_000
+
+        # A run that failed to download - a short timeout, a slow link - used to
+        # write the same permanent "not published" marker a genuine 404 writes,
+        # so the day was never retried and coverage stayed at zero for good.
+        # Those markers cannot be told apart after the fact, so they are dropped
+        # once and the days re-attempted.
+        purged: int = purge_legacy_absent_markers(Path(settings.archive_cache_dir))
+        if purged:
+            _LOGGER.warning(
+                "Discarded %d stale archive 'absent' marker(s) written before download "
+                "failures were distinguished from genuinely unpublished days - those "
+                "symbol-days will be retried",
+                purged,
+            )
 
         completed: int = 0
         total: int = len(universe)
@@ -400,31 +502,7 @@ class DataPipeline:
         # Per-dataset coverage, because one number cannot distinguish "the book
         # feed returned nothing at all" from "liquidations are 53% covered" - and
         # that distinction was invisible for an entire release.
-        by_dataset: dict[str, dict[str, int]] = {}
-        for coverage in reports:
-            block = by_dataset.setdefault(
-                coverage.dataset,
-                {"days_requested": 0, "days_downloaded": 0, "days_absent": 0, "days_failed": 0},
-            )
-            block["days_requested"] += coverage.days_requested
-            block["days_downloaded"] += coverage.days_downloaded
-            block["days_absent"] += coverage.days_absent
-            block["days_failed"] += coverage.days_failed
-        for dataset, block in by_dataset.items():
-            requested = max(1, block["days_requested"])
-            block["coverage_pct"] = round(block["days_downloaded"] / requested, 4)
-            block["failure_rate"] = round(block["days_failed"] / requested, 4)
-            if block["failure_rate"] > _ARCHIVE_FAILURE_RATE_LIMIT:
-                _LOGGER.error(
-                    "Archive dataset %s failed on %.0f%% of requested symbol-days "
-                    "(%d of %d) - the features it feeds will be empty; check the "
-                    "download transport before trusting any model that uses them",
-                    dataset,
-                    block["failure_rate"] * 100.0,
-                    block["days_failed"],
-                    block["days_requested"],
-                )
-        summary["by_dataset"] = by_dataset
+        summary["by_dataset"] = summarise_archive_coverage_by_dataset(reports)
 
         _LOGGER.info(
             "Micro-structure backfill complete: %.1f%% of %s requested symbol-days",

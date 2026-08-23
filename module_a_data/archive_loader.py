@@ -47,6 +47,7 @@ import asyncio
 import io
 import zipfile
 from dataclasses import dataclass
+from enum import Enum
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Final, Iterable, Iterator, Sequence, IO
@@ -98,6 +99,51 @@ _HEADERS: Final[dict[str, tuple[str, ...]]] = {
         "accumulated_fill_quantity",
     ),
 }
+
+
+#: Marker-format generation. `.absent` files written before download outcomes
+#: were distinguished from download failures cannot be trusted - a timeout wrote
+#: the same file a genuine 404 did - so a marker without this suffix is retried
+#: once and rewritten correctly.
+_ABSENT_MARKER_SUFFIX: Final[str] = ".absent2"
+_LEGACY_ABSENT_SUFFIX: Final[str] = ".absent"
+
+
+class DownloadOutcome(str, Enum):
+    """Why a daily archive download produced no payload.
+
+    ``ABSENT`` and ``FAILED`` are opposite facts and must never be conflated:
+    the first is permanent and worth caching, the second is transient and must
+    be retried. Collapsing both into ``None`` is what let a single bad run mark
+    every symbol-day as permanently missing.
+    """
+
+    OK = "OK"
+    ABSENT = "ABSENT"
+    FAILED = "FAILED"
+
+
+def _absent_marker_is_trustworthy(marker: Path) -> bool:
+    """Only markers written by the outcome-aware path may be believed."""
+    return marker.suffix == _ABSENT_MARKER_SUFFIX
+
+
+def purge_legacy_absent_markers(cache_dir: Path) -> int:
+    """Delete `.absent` markers from before outcome tracking existed.
+
+    Returns the number removed. Called once per backfill so an operator does not
+    have to know to `rm -rf` the cache to recover from a poisoned run.
+    """
+    if not cache_dir.exists():
+        return 0
+    removed = 0
+    for marker in cache_dir.rglob(f"*{_LEGACY_ABSENT_SUFFIX}"):
+        try:
+            marker.unlink()
+            removed += 1
+        except OSError:  # pragma: no cover - permissions/race
+            continue
+    return removed
 
 
 def to_archive_symbol(symbol: str) -> str:
@@ -260,7 +306,8 @@ class BinanceArchiveLoader:
         coverage: ArchiveCoverage,
     ) -> pd.DataFrame | None:
         cache_path: Path = self._cache_path(archive_symbol, dataset, day)
-        absent_marker: Path = cache_path.with_suffix(".absent")
+        absent_marker: Path = cache_path.with_suffix(_ABSENT_MARKER_SUFFIX)
+        legacy_marker: Path = cache_path.with_suffix(_LEGACY_ABSENT_SUFFIX)
 
         if cache_path.exists():
             coverage.days_downloaded += 1
@@ -269,18 +316,34 @@ class BinanceArchiveLoader:
             except Exception as error:  # pragma: no cover - corrupt cache entry
                 _LOGGER.warning("Discarding unreadable cache entry %s: %s", cache_path, error)
                 cache_path.unlink(missing_ok=True)
-        if absent_marker.exists():
+        # Markers written before the outcome of a download was distinguished from
+        # its absence are untrustworthy - a network failure produced exactly the
+        # same file a 404 did - so they are deleted and the day is retried once,
+        # which re-writes the marker in a format that can be believed. The legacy
+        # marker is checked *first*: a cache poisoned by such a run is the state
+        # this whole path exists to recover from, and it is the only state in
+        # which both files can be present at once.
+        if legacy_marker.exists() and not _absent_marker_is_trustworthy(legacy_marker):
+            _LOGGER.info("Retrying %s %s: absent marker predates outcome tracking", dataset, day)
+            legacy_marker.unlink(missing_ok=True)
+            absent_marker.unlink(missing_ok=True)
+        elif absent_marker.exists():
             # Binance does not publish this day for this symbol and never will;
             # re-checking on every run would waste an HTTP round trip per day
             # per symbol for the entire pre-listing history.
             coverage.days_absent += 1
             return None
 
-        payload: bytes | None = await self._download(archive_symbol, dataset, day)
-        if payload is None:
+        outcome, payload = await self._download(archive_symbol, dataset, day)
+        if outcome is DownloadOutcome.ABSENT:
             coverage.days_absent += 1
             absent_marker.parent.mkdir(parents=True, exist_ok=True)
             absent_marker.touch()
+            return None
+        if outcome is DownloadOutcome.FAILED or payload is None:
+            # Transient: counted as a failure so the coverage summary can escalate
+            # it, and deliberately *not* marked absent so the next run retries.
+            coverage.days_failed += 1
             return None
 
         try:
@@ -301,32 +364,50 @@ class BinanceArchiveLoader:
                 _LOGGER.warning("Could not cache %s: %s", cache_path, error)
         return aggregated
 
-    async def _download(self, archive_symbol: str, dataset: str, day: date) -> bytes | None:
-        """Fetch one daily ZIP, returning ``None`` when Binance has no such file."""
+    async def _download(
+        self, archive_symbol: str, dataset: str, day: date
+    ) -> tuple[DownloadOutcome, bytes | None]:
+        """Fetch one daily ZIP.
+
+        Returns the *reason* alongside the payload, because "Binance never
+        published this day" and "the download failed" are opposite facts that
+        used to be indistinguishable: both returned ``None``, and the caller
+        wrote a permanent `.absent` marker for either. One run behind a slow
+        link or a short timeout therefore poisoned the cache for every future
+        run - the day was never retried, and a dataset that had previously
+        reached 53% coverage silently dropped to 0% with no error anywhere.
+        """
         filename: str = f"{archive_symbol}-{dataset}-{day.isoformat()}.zip"
         url: str = f"{_ARCHIVE_BASE}/{dataset}/{archive_symbol}/{filename}"
 
         async with self._semaphore:
             session: aiohttp.ClientSession = await self._client()
+            last_error: str = ""
             for attempt in range(self._settings.data.archive_max_retries):
                 try:
                     async with session.get(url) as response:
                         if response.status == 404:
+                            # The only outcome that justifies a permanent marker:
+                            # a day Binance did not publish will never appear.
                             _LOGGER.debug("Archive has no %s", filename)
-                            return None
+                            return DownloadOutcome.ABSENT, None
                         if response.status == 429:
                             delay: float = 2.0 * (attempt + 1)
                             _LOGGER.warning("Archive rate-limited on %s; waiting %.1fs", filename, delay)
                             await asyncio.sleep(delay)
+                            last_error = "rate limited"
                             continue
                         response.raise_for_status()
-                        return await response.read()
-                except aiohttp.ClientError as error:
+                        return DownloadOutcome.OK, await response.read()
+                except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+                    last_error = f"{type(error).__name__}: {error}"
                     if attempt == self._settings.data.archive_max_retries - 1:
-                        _LOGGER.error("Giving up on %s: %s", filename, error)
-                        return None
+                        _LOGGER.error("Giving up on %s after %d attempt(s): %s",
+                                      filename, attempt + 1, last_error)
+                        return DownloadOutcome.FAILED, None
                     await asyncio.sleep(2.0**attempt)
-        return None
+        _LOGGER.error("Giving up on %s: %s", filename, last_error or "retries exhausted")
+        return DownloadOutcome.FAILED, None
 
     # ------------------------------------------------------------------
     # Parsing
