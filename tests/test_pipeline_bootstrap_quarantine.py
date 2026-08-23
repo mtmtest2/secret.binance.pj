@@ -46,13 +46,23 @@ class GappyFetcher:
 class RecordingDatabase:
     def __init__(self) -> None:
         self.written: dict[str, list[OHLCVCandle]] = {}
+        self.state: dict[str, object] = {}
 
     async def latest_candle_timestamp(self, symbol: str) -> int | None:
+        return None
+
+    async def earliest_candle_timestamp(self, symbol: str) -> int | None:
         return None
 
     async def upsert_candles(self, candles: list[OHLCVCandle]) -> int:
         self.written.setdefault(SYMBOL, []).extend(candles)
         return len(candles)
+
+    async def get_state(self, key: str):
+        return self.state.get(key)
+
+    async def set_state(self, key: str, value) -> None:
+        self.state[key] = value
 
 
 @pytest.mark.asyncio

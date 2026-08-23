@@ -63,6 +63,10 @@ _ARCHIVE_MIN_COVERAGE: float = 0.05
 _ARCHIVE_MIN_DAYS_FOR_COVERAGE_CHECK: int = 30
 _ARCHIVE_BASE_URL: str = "https://data.binance.vision/data/futures/um/daily"
 SYMBOL_EXCLUSION_STATE_KEY: Final[str] = "qc_symbol_exclusions"
+#: Per-symbol oldest candle a *full-window* bootstrap actually reached.
+#: Distinguishes "this symbol listed later" - a permanent fact - from "this
+#: symbol's history failed to download", which must be retried.
+BOOTSTRAP_FLOOR_STATE_KEY: Final[str] = "bootstrap_history_floors"
 
 
 def summarise_archive_coverage_by_dataset(
@@ -161,6 +165,30 @@ class DataPipeline:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+    async def _bootstrap_floors(self) -> dict[str, int]:
+        """Oldest candle each symbol's full-window bootstrap actually reached."""
+        try:
+            stored: dict[str, Any] | None = await self._db.get_state(BOOTSTRAP_FLOOR_STATE_KEY)
+        except DatabaseError as error:  # pragma: no cover - state table unavailable
+            _LOGGER.warning("Could not read bootstrap floors: %s", error)
+            return {}
+        if not stored:
+            return {}
+        floors: dict[str, int] = {}
+        for symbol, value in (stored.get("floors") or {}).items():
+            try:
+                floors[str(symbol)] = int(value)
+            except (TypeError, ValueError):  # pragma: no cover - corrupt entry
+                continue
+        return floors
+
+    async def _store_bootstrap_floors(self, floors: dict[str, int]) -> None:
+        try:
+            await self._db.set_state(BOOTSTRAP_FLOOR_STATE_KEY, {"floors": floors})
+        except DatabaseError as error:  # pragma: no cover - state table unavailable
+            # Losing this only costs one redundant full-window fetch next run.
+            _LOGGER.warning("Could not persist bootstrap floors: %s", error)
+
     async def bootstrap_history(
         self,
         symbols: list[str] | None = None,
@@ -186,17 +214,56 @@ class DataPipeline:
         target_bars: int = self._settings.data.history_bootstrap_candles
         timeframe_ms: int = self._settings.data.timeframe_ms
         end_ms: int = last_closed_candle_open_ms(timeframe_ms)
+        floors: dict[str, int] = await self._bootstrap_floors()
+        discovered: dict[str, int] = {}
 
         async def _bootstrap_one(symbol: str) -> tuple[str, int]:
             async with self._symbol_semaphore:
                 try:
-                    newest: int | None = await self._db.latest_candle_timestamp(symbol)
                     default_start: int = end_ms - target_bars * timeframe_ms
-                    start_ms: int = (
-                        max(default_start, newest + timeframe_ms)
-                        if newest is not None
-                        else default_start
+                    # Resume from the *oldest* stored candle, not the newest -
+                    # the same rule the futures-metrics backfill already uses,
+                    # and for the same reason. A symbol whose bootstrap failed
+                    # (heal budget, an unfetchable window) still accumulates
+                    # candles from the live 5-minute cycle afterwards, so its
+                    # newest timestamp is "now" while its history is missing. A
+                    # newest-first rule reads that as "already up to date" and
+                    # never fills the hole: ALGO, ATOM and PIXEL sat at 469 rows
+                    # each - 1.6 days - against ~120,000 for every other symbol,
+                    # and would have stayed there through any number of re-runs.
+                    #
+                    # "Oldest is later than the window start" alone cannot drive
+                    # the decision, though, because it is also true of every
+                    # symbol that simply listed after the window opened - most of
+                    # this universe. Re-requesting their pre-listing history on
+                    # every run would page through months of empty responses per
+                    # symbol, forever. So a full-window attempt records the floor
+                    # it actually reached, and a symbol at its known floor is
+                    # treated as complete.
+                    oldest: int | None = await self._db.earliest_candle_timestamp(symbol)
+                    floor: int | None = floors.get(symbol)
+                    reached_known_floor: bool = (
+                        oldest is not None
+                        and floor is not None
+                        and oldest <= floor + timeframe_ms
                     )
+                    start_ms: int = default_start
+                    if oldest is not None and (
+                        oldest <= default_start + timeframe_ms or reached_known_floor
+                    ):
+                        # History reaches as far back as this symbol goes, so only
+                        # the leading edge can still be missing.
+                        newest: int | None = await self._db.latest_candle_timestamp(symbol)
+                        if newest is not None:
+                            start_ms = max(default_start, newest + timeframe_ms)
+                    elif oldest is not None:
+                        _LOGGER.info(
+                            "%s: stored history starts %.1f day(s) after the requested window "
+                            "and no listing floor is recorded - refetching the full window once "
+                            "to close the gap",
+                            symbol,
+                            (oldest - default_start) / 86_400_000,
+                        )
                     if start_ms > end_ms:
                         return symbol, 0
 
@@ -230,6 +297,13 @@ class DataPipeline:
                         candles = healed
 
                     written: int = await self._db.upsert_candles(candles)
+                    if start_ms == default_start and candles:
+                        # A full-window attempt just established how far back this
+                        # symbol actually goes. Recording it is what stops the
+                        # next run from paging through its pre-listing history
+                        # again - and what keeps a genuine gap retryable, because
+                        # a symbol whose download failed never gets here.
+                        discovered[symbol] = candles[0].timestamp
                     return symbol, written
                 except (DataFetchError, DataIntegrityError, DatabaseError) as error:
                     # One bad symbol must not abort the backfill of the other 29.
@@ -248,6 +322,8 @@ class DataPipeline:
             *(_bootstrap_one(symbol) for symbol in universe)
         )
         written_by_symbol: dict[str, int] = dict(results)
+        if discovered:
+            await self._store_bootstrap_floors({**floors, **discovered})
         total_written: int = sum(written_by_symbol.values())
         _LOGGER.info(
             "Bootstrap complete: %d candles across %d symbols",

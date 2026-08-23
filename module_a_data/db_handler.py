@@ -488,6 +488,23 @@ class DatabaseHandler:
             value: Any = result.scalar_one_or_none()
         return int(value) if value is not None else None
 
+    async def earliest_candle_timestamp(self, symbol: str) -> int | None:
+        """Return the oldest stored candle open time for ``symbol``.
+
+        Bootstrap needs this, not just the newest: a symbol whose history fetch
+        failed still collects candles from the live 5-minute cycle, so its newest
+        timestamp is "now" while everything before the failure is missing.
+        Resuming from the newest would skip that hole forever.
+        """
+        query: Select[Any] = select(func.min(OHLCVRow.timestamp)).where(
+            OHLCVRow.symbol == symbol,
+            OHLCVRow.timeframe == self._settings.data.timeframe,
+        )
+        async with self._factory()() as session:
+            result: Result[Any] = await session.execute(query)
+            value: Any = result.scalar_one_or_none()
+        return int(value) if value is not None else None
+
     async def candle_count(self, symbol: str) -> int:
         """Return how many candles are stored for ``symbol``."""
         query: Select[Any] = select(func.count()).select_from(OHLCVRow).where(
