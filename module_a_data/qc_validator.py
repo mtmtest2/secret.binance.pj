@@ -194,6 +194,7 @@ class QCValidator:
         refetch: RefetchCallback,
         *,
         quarantine_unhealable: bool = False,
+        budget_seconds: float | None = None,
     ) -> tuple[list[OHLCVCandle], QCReport, list[HealAttempt]]:
         """Validate a block and recursively repair it until it is pristine.
 
@@ -265,7 +266,10 @@ class QCValidator:
             )
 
         attempt: int = 0
-        deadline: float = time.monotonic() + self._qc.max_heal_duration_seconds
+        budget: float = (
+            budget_seconds if budget_seconds is not None else self._qc.max_heal_duration_seconds
+        )
+        deadline: float = time.monotonic() + budget
         while not report.passed and attempt < self._qc.max_heal_attempts:
             if not report.healable:
                 quarantined = self._try_quarantine(symbol, working, report, quarantine_unhealable)
@@ -280,6 +284,14 @@ class QCValidator:
                     heal_attempts=[record.model_dump(mode="json") for record in heal_attempts],
                 )
             if time.monotonic() >= deadline:
+                # Before discarding the symbol, ask whether what is left is
+                # actually damage. A residue of a handful of bars in a two-year
+                # history is not a broken feed, and failing the symbol over it
+                # throws away everything that *did* heal - the boosters route
+                # those rows down their missing-value branch regardless.
+                accepted = self._accept_residual(symbol, working, report, heal_attempts, budget)
+                if accepted is not None:
+                    return accepted
                 # A stuck healer must not hold the shared request-rate budget
                 # indefinitely and starve every other symbol's cycle.
                 quarantined = self._try_quarantine(symbol, working, report, quarantine_unhealable)
@@ -291,7 +303,7 @@ class QCValidator:
                     "heal loop exceeded its wall-clock budget",
                     symbol=symbol,
                     attempts=attempt,
-                    budget_seconds=self._qc.max_heal_duration_seconds,
+                    budget_seconds=budget,
                     codes=report.critical_codes,
                     heal_attempts=[record.model_dump(mode="json") for record in heal_attempts],
                 )
@@ -404,6 +416,99 @@ class QCValidator:
         if attempt:
             _LOGGER.info("Healed %s after %d attempt(s): %d rows", symbol, attempt, len(working))
         return working, report, heal_attempts
+
+    def _accept_residual(
+        self,
+        symbol: str,
+        working: list[OHLCVCandle],
+        report: QCReport,
+        heal_attempts: list[HealAttempt],
+        budget: float,
+    ) -> tuple[list[OHLCVCandle], QCReport, list[HealAttempt]] | None:
+        """Accept a block whose remaining damage is negligible, or return ``None``.
+
+        The heal loop is all-or-nothing: any surviving CRITICAL issue fails the
+        whole symbol. That is right for a feed serving corrupt data and wrong for
+        a residue of one or two bars, which is what a two-year backfill routinely
+        leaves behind - an exchange-side halt, a single stale print. Three symbols
+        were discarded after successfully re-writing ~120,000 bars each because
+        one bar would not clear.
+
+        The tolerance is deliberately both relative and absolute: a share of the
+        history so it scales, and a hard cap so a genuinely broken feed still
+        fails however long its history is.
+        """
+        residual: int = self._critical_bar_count(report)
+        if residual <= 0:
+            return None
+        allowed: int = min(
+            self._qc.max_residual_invalid_bars,
+            int(len(working) * self._qc.max_residual_invalid_bar_ratio),
+        )
+        if residual > allowed:
+            return None
+
+        _LOGGER.warning(
+            "%s: accepting %d bar(s) still flagged after healing (%.4f%% of %d, tolerance %d) - "
+            "the block is kept rather than discarded, and those rows carry their QC verdict "
+            "downstream",
+            symbol,
+            residual,
+            100.0 * residual / max(1, len(working)),
+            len(working),
+            allowed,
+        )
+        heal_attempts.append(
+            HealAttempt(
+                symbol=symbol,
+                attempt_number=len(heal_attempts) + 1,
+                reason=list(report.critical_codes),
+                window_count=0,
+                start_timestamp=working[0].timestamp if working else None,
+                end_timestamp=working[-1].timestamp if working else None,
+                bars_requested=0,
+                bars_received=0,
+                bars_written=0,
+                bars_invalid_after_heal=residual,
+                duration_seconds=budget,
+                result="accepted_residual",
+            )
+        )
+        # `passed` is derived from the issue severities, so the acceptance has to
+        # be expressed where the verdict actually lives: the surviving CRITICAL
+        # issues are re-emitted as WARNINGs carrying the same code, message and
+        # timestamps. Overwriting `passed` directly would not have worked (it is
+        # a computed property, so a `model_copy` update of it is silently
+        # ignored) and would also have erased the evidence - this way the bars
+        # stay named in the report and travel downstream with their verdict
+        # intact, they simply no longer condemn the whole block.
+        accepted: QCReport = report.model_copy(
+            update={"issues": tuple(self._downgrade_criticals(report.issues, residual))}
+        )
+        return working, accepted, heal_attempts
+
+    @staticmethod
+    def _downgrade_criticals(
+        issues: Sequence[QCIssue], residual: int
+    ) -> list[QCIssue]:
+        """Re-emit CRITICAL issues as WARNINGs, annotated with why they were kept."""
+        downgraded: list[QCIssue] = []
+        for issue in issues:
+            if issue.severity is not QCSeverity.CRITICAL:
+                downgraded.append(issue)
+                continue
+            downgraded.append(
+                issue.model_copy(
+                    update={
+                        "severity": QCSeverity.WARNING,
+                        "message": (
+                            f"{issue.message} [accepted: {residual} bar(s) still flagged "
+                            "after healing, within the residual tolerance]"
+                        ),
+                    }
+                )
+            )
+        return downgraded
 
     def _try_quarantine(
         self,

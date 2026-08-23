@@ -295,7 +295,11 @@ class HealAttempt(BaseModel):
     bars_written: int = Field(ge=0, description="Rows merged into the working set this round.")
     bars_invalid_after_heal: int = Field(ge=0, description="Suspicious timestamps still unresolved after this round.")
     duration_seconds: float = Field(ge=0.0)
-    result: str = Field(description="'resolved', 'still_invalid', 'quarantined' or 'failed'.")
+    result: str = Field(
+        description=(
+            "'resolved', 'still_invalid', 'quarantined', 'accepted_residual' or 'failed'."
+        )
+    )
 
 
 class MarketDataBundle(BaseModel):
