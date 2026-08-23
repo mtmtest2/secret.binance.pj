@@ -207,3 +207,107 @@ async def test_validate_and_heal_passthrough_when_already_clean() -> None:
     assert report.passed
     assert len(healed) == 20
     assert heal_attempts == []
+
+
+# ---------------------------------------------------------------------------
+# Residual acceptance: a two-bar residue is not a broken feed
+# ---------------------------------------------------------------------------
+def _critical_report(symbol: str, candles: list[OHLCVCandle], bad_count: int) -> QCReport:
+    """A report condemning the first ``bad_count`` candles."""
+    return QCReport(
+        symbol=symbol,
+        checked_rows=len(candles),
+        issues=(
+            QCIssue(
+                symbol=symbol,
+                code=QCIssueCode.PRICE_LOGIC_VIOLATION,
+                severity=QCSeverity.CRITICAL,
+                message="high < close",
+                timestamps=tuple(candle.timestamp for candle in candles[:bad_count]),
+                healable=True,
+            ),
+        ),
+    )
+
+
+def test_accept_residual_keeps_a_symbol_whose_residue_is_negligible() -> None:
+    """The bootstrap failure: ~120k healed bars discarded over one that would not.
+
+    The heal loop is all-or-nothing, which is right for a feed serving corrupt
+    data and wrong for a single stale print in a two-year history.
+    """
+    validator, _ = build_validator(
+        max_residual_invalid_bars=50, max_residual_invalid_bar_ratio=0.0005
+    )
+    candles = make_series(20_000)
+    report = _critical_report("BTC/USDT:USDT", candles, bad_count=2)
+    attempts: list[object] = []
+
+    accepted = validator._accept_residual("BTC/USDT:USDT", candles, report, attempts, 900.0)
+
+    assert accepted is not None
+    kept, accepted_report, recorded = accepted
+    assert len(kept) == 20_000, "nothing is thrown away"
+    assert accepted_report.passed, "the block is no longer condemned"
+    assert recorded[-1].result == "accepted_residual"
+    assert recorded[-1].bars_invalid_after_heal == 2
+
+
+def test_accepted_residual_keeps_the_evidence_as_a_warning() -> None:
+    """Accepting must not erase which bars were suspect - only their veto."""
+    validator, _ = build_validator(max_residual_invalid_bars=50)
+    candles = make_series(20_000)
+    report = _critical_report("BTC/USDT:USDT", candles, bad_count=2)
+
+    accepted = validator._accept_residual("BTC/USDT:USDT", candles, report, [], 900.0)
+    assert accepted is not None
+    _, accepted_report, _ = accepted
+
+    assert accepted_report.critical_codes == ()
+    surviving = accepted_report.issues
+    assert len(surviving) == 1
+    assert surviving[0].severity is QCSeverity.WARNING
+    assert surviving[0].code is QCIssueCode.PRICE_LOGIC_VIOLATION
+    assert surviving[0].timestamps == tuple(candle.timestamp for candle in candles[:2])
+    assert "residual tolerance" in surviving[0].message
+
+
+def test_accept_residual_refuses_a_genuinely_broken_block() -> None:
+    """A long history does not buy an unlimited number of bad bars."""
+    validator, _ = build_validator(
+        max_residual_invalid_bars=50, max_residual_invalid_bar_ratio=0.0005
+    )
+    candles = make_series(20_000)
+    # 500 bad bars: 2.5% of the block, and ten times the absolute cap.
+    report = _critical_report("BTC/USDT:USDT", candles, bad_count=500)
+
+    assert validator._accept_residual("BTC/USDT:USDT", candles, report, [], 900.0) is None
+
+
+def test_absolute_cap_binds_on_a_very_long_history() -> None:
+    """The ratio alone would let a long history absorb hundreds of bad bars."""
+    validator, _ = build_validator(
+        max_residual_invalid_bars=50, max_residual_invalid_bar_ratio=0.0005
+    )
+    candles = make_series(20_000)
+    # 0.3% by ratio would allow 100 here; the absolute cap of 50 must win.
+    report = _critical_report("BTC/USDT:USDT", candles, bad_count=60)
+
+    assert validator._accept_residual("BTC/USDT:USDT", candles, report, [], 900.0) is None
+
+
+def test_accept_residual_declines_when_nothing_is_wrong() -> None:
+    validator, _ = build_validator()
+    candles = make_series(100)
+    clean = QCReport(symbol="BTC/USDT:USDT", checked_rows=len(candles))
+
+    assert validator._accept_residual("BTC/USDT:USDT", candles, clean, [], 900.0) is None
+
+
+def test_bootstrap_budget_is_far_larger_than_the_live_cycle_budget() -> None:
+    """A per-cycle ceiling applied to a two-year backfill is what failed 3 symbols."""
+    settings = Settings()
+    assert (
+        settings.qc.max_bootstrap_heal_duration_seconds
+        > settings.qc.max_heal_duration_seconds * 5
+    )
