@@ -99,8 +99,15 @@ class BinanceDataFetcher:
         }
         exchange: ccxt.binance = ccxt.binance(config)
         self._restrict_to_linear_markets(exchange)
-        if self._settings.exchange.testnet:
-            exchange.set_sandbox_mode(True)
+        # Deliberately never `set_sandbox_mode(True)`. This one client serves
+        # every read in the system - the candles training learns from, the
+        # funding and open-interest history behind the derivatives features, and
+        # the prices the backtest and paper trader replay. Binance's testnet
+        # publishes a different, largely synthetic book, and its `fapiData`
+        # endpoints do not exist there at all: a full run against it rejected
+        # 162 requests and left open_interest_change, long_short_ratio and
+        # taker_buy_sell_ratio constant for the entire history, with nothing in
+        # the pipeline treating that as a failure.
         self._apply_rate_scale(exchange)
         return exchange
 

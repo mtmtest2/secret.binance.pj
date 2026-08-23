@@ -74,7 +74,20 @@ class ExchangeSettings(BaseModel):
 
     api_key: str = Field(default="", description="Binance API key (futures enabled).")
     api_secret: str = Field(default="", description="Binance API secret.")
-    testnet: bool = Field(default=True, description="Route orders to the futures testnet.")
+    #: Deprecated and ignored. The system is mainnet-only by design: every
+    #: candle, funding rate, open-interest reading and order-book bucket that
+    #: feeds training, the backtest and paper trading must come from the real
+    #: market. Binance's testnet has a different (and largely synthetic) order
+    #: book, and its `fapiData` endpoints - open interest history, long/short
+    #: account ratio, taker buy/sell ratio - do not exist there at all, which
+    #: silently pinned three features to a constant for an entire run.
+    #:
+    #: Kept only so a stale `EXCHANGE__TESTNET=true` in an existing .env is
+    #: reported rather than silently ignored; see Settings._reject_testnet.
+    testnet: bool = Field(
+        default=False,
+        description="Deprecated and ignored - the system always uses mainnet market data.",
+    )
     default_type: str = Field(default="future", description="ccxt defaultType option.")
     request_timeout_ms: int = Field(default=20_000, ge=1_000, le=120_000)
     enable_rate_limit: bool = Field(default=True)
@@ -211,7 +224,22 @@ class QCSettings(BaseModel):
     #: many attempts remain in the budget.  Bounds worst-case latency so a symbol
     #: stuck healing cannot indefinitely hold the shared request-rate budget and
     #: starve every other symbol's cycle.
+    #: A bootstrap heal legitimately re-fetches tens of thousands of bars; a
+    #: live cycle heals a handful. 90s was sized for the second case and applied
+    #: to both, so three symbols that had already re-written ~120k bars each were
+    #: failed outright at 130-170s for a single remaining bad bar.
     max_heal_duration_seconds: float = Field(default=90.0, gt=0.0)
+    #: Ceiling used while backfilling history, where a single attempt can
+    #: legitimately span a two-year window.
+    max_bootstrap_heal_duration_seconds: float = Field(default=900.0, gt=0.0)
+    #: A symbol is accepted when the residue after healing is this small a share
+    #: of its history. One bad bar in 120,000 is not a broken feed, and failing
+    #: the whole symbol over it discards two years of good data - the boosters
+    #: route the affected rows down their missing-value branch either way.
+    max_residual_invalid_bar_ratio: float = Field(default=0.0005, ge=0.0, le=0.05)
+    #: ...but never accept more than this many bad bars outright, however long
+    #: the history is, so a genuinely broken feed still fails.
+    max_residual_invalid_bars: int = Field(default=50, ge=0)
     #: Suspicious timestamps within this many bars of each other are healed as
     #: one contiguous re-fetch window instead of two separate ones.
     heal_merge_gap_bars: int = Field(default=3, ge=0)
@@ -652,6 +680,20 @@ class Settings(BaseSettings):
                 "purge_bars >= max_holding_bars before training on real data.",
                 self.ml.purge_bars,
                 self.labels.max_holding_bars,
+            )
+
+        # Mainnet is not optional. Testnet's order book is largely synthetic and
+        # its fapiData endpoints (open interest history, long/short account
+        # ratio, taker buy/sell ratio) do not exist at all - a run against it
+        # pinned three features to a constant for its entire history without
+        # failing. Training, backtesting and paper trading all read the same
+        # feed, so a testnet feed poisons every one of them.
+        if self.exchange.testnet:
+            get_logger(__name__).error(
+                "EXCHANGE__TESTNET=true is set but is ignored: this system is mainnet-only. "
+                "Every candle, funding rate and order-book bucket that feeds training, the "
+                "backtest and paper trading comes from the real market. Remove the setting "
+                "from your .env to silence this."
             )
 
         # A half-life short relative to the training span quietly turns a long
