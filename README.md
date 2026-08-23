@@ -316,9 +316,13 @@ Hold out a period the models never touched before you believe anything.
 - **Security.** The panel is not hardened for the public internet. Set
   `WEB__API_TOKEN` to protect the control endpoints, and put the port behind a
   firewall allow-list or an SSH tunnel.
-- **Going live.** Requires `EXCHANGE__TESTNET=false`, real API keys with futures
-  permission, and trained artifacts for all four heads (heuristic fallbacks are
-  refused). Start on the futures testnet, then paper, then live with the
+- **Mainnet only.** All market data - training, backtest and paper trading
+  alike - comes from mainnet, and the exchange client never enters sandbox
+  mode. Reading it needs no API keys. `EXCHANGE__TESTNET` is deprecated and
+  ignored; setting it is reported as an error at startup.
+- **Going live.** Requires real API keys with futures permission and trained
+  artifacts for all four heads (heuristic fallbacks are refused). Go paper
+  first, on the same mainnet data the live system reads, then live with the
   smallest size that clears the exchange minimums.
 - **Nothing trades on its own.** Trading is armed only from the panel (or
   `POST /api/trading/start`). Set `AUTOSTART_PAPER_TRADING=true` if you

@@ -83,7 +83,8 @@ class ExchangeSettings(BaseModel):
     #: silently pinned three features to a constant for an entire run.
     #:
     #: Kept only so a stale `EXCHANGE__TESTNET=true` in an existing .env is
-    #: reported rather than silently ignored; see Settings._reject_testnet.
+    #: reported rather than silently ignored; see
+    #: Settings._report_ignored_testnet_flag.
     testnet: bool = Field(
         default=False,
         description="Deprecated and ignored - the system always uses mainnet market data.",
@@ -657,6 +658,31 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _report_ignored_testnet_flag(self) -> "Settings":
+        """Report - loudly, once - a stale testnet flag left in an .env.
+
+        Mainnet is not optional. Testnet's order book is largely synthetic and
+        its fapiData endpoints (open interest history, long/short account ratio,
+        taker buy/sell ratio) do not exist there at all: a full run against it
+        rejected 162 requests and left three features constant for their entire
+        history without anything failing. Training, backtesting and paper
+        trading all read the same feed, so a testnet feed poisons every one of
+        them.
+
+        The flag is ignored rather than honoured, but ignoring it *silently*
+        would be the same class of bug as honouring it - the operator keeps
+        believing the system runs where they configured it to.
+        """
+        if self.exchange.testnet:
+            get_logger(__name__).error(
+                "EXCHANGE__TESTNET=true is set but is ignored: this system is mainnet-only. "
+                "Every candle, funding rate and order-book bucket that feeds training, the "
+                "backtest and paper trading comes from the real market. Remove the setting "
+                "from your .env to silence this."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _warn_if_purge_too_short_for_label_horizon(self) -> "Settings":
         """Flag (never raise on) a purge/embargo gap too short to cover the
         label horizon.
@@ -680,20 +706,6 @@ class Settings(BaseSettings):
                 "purge_bars >= max_holding_bars before training on real data.",
                 self.ml.purge_bars,
                 self.labels.max_holding_bars,
-            )
-
-        # Mainnet is not optional. Testnet's order book is largely synthetic and
-        # its fapiData endpoints (open interest history, long/short account
-        # ratio, taker buy/sell ratio) do not exist at all - a run against it
-        # pinned three features to a constant for its entire history without
-        # failing. Training, backtesting and paper trading all read the same
-        # feed, so a testnet feed poisons every one of them.
-        if self.exchange.testnet:
-            get_logger(__name__).error(
-                "EXCHANGE__TESTNET=true is set but is ignored: this system is mainnet-only. "
-                "Every candle, funding rate and order-book bucket that feeds training, the "
-                "backtest and paper trading comes from the real market. Remove the setting "
-                "from your .env to silence this."
             )
 
         # A half-life short relative to the training span quietly turns a long
