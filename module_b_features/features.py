@@ -68,34 +68,20 @@ FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     # --- trend / direction --------------------------------------------------
     "kama_distance",
     "kama_slope",
-    "kama_slope_fast",
-    "ema_fast_slow_spread",
-    "close_ema_slow_ratio",
     "adx",
     "di_spread",
     # --- structure ----------------------------------------------------------
     "fdi",
     "fdi_trending",
-    "fdi_delta",
-    "bb_width",
-    "bb_position",
     # --- momentum -----------------------------------------------------------
     "rsi",
-    "rsi_delta",
     "log_return_1",
     "log_return_3",
     "log_return_12",
-    "log_return_48",
     "momentum_rank",
     # --- volatility ---------------------------------------------------------
     "atr_pct",
-    "atr_rank",
-    "realized_vol_12",
-    "realized_vol_48",
     "garch_volatility",
-    "garch_vol_rank",
-    "garch_vol_ratio",
-    "vol_of_vol",
     # --- regime -------------------------------------------------------------
     "hmm_regime",
     "hmm_prob_bull",
@@ -105,27 +91,7 @@ FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     "hmm_regime_age",
     # --- volume -------------------------------------------------------------
     "volume_zscore",
-    "volume_rank",
     "volume_trend",
-    "dollar_volume_rank",
-    # --- micro-structure ----------------------------------------------------
-    "ob_imbalance",
-    "ob_imbalance_delta",
-    "ob_spread_bps",
-    "ob_spread_rank",
-    "funding_rate",
-    "funding_rate_delta",
-    "funding_rate_rank",
-    "open_interest_change",
-    "open_interest_rank",
-    "long_short_ratio",
-    "taker_buy_sell_ratio",
-    "liquidation_imbalance",
-    # --- session ------------------------------------------------------------
-    "hour_sin",
-    "hour_cos",
-    "dow_sin",
-    "dow_cos",
 )
 
 
@@ -204,7 +170,6 @@ class FeatureEngineer:
             frame = self._add_garch_features(frame)
             frame = self._add_hmm_features(frame)
             frame = self._add_microstructure_features(frame, futures, order_book)
-            frame = self._add_session_features(frame)
         except (InsufficientDataError, FeatureEngineeringError):
             raise
         except Exception as error:  # pragma: no cover - defensive catch-all
@@ -223,7 +188,7 @@ class FeatureEngineer:
     # Price / trend / momentum
     # ------------------------------------------------------------------
     def _add_price_features(self, frame: pd.DataFrame) -> pd.DataFrame:
-        """KAMA, EMA spreads, ADX, FDI, Bollinger, RSI and log returns."""
+        """KAMA distance/slope, ADX, FDI, RSI and log returns."""
         close: pd.Series = frame["close"].astype(float)
         high: pd.Series = frame["high"].astype(float)
         low: pd.Series = frame["low"].astype(float)
@@ -233,7 +198,6 @@ class FeatureEngineer:
         frame["log_return_1"] = log_close.diff(1)
         frame["log_return_3"] = log_close.diff(3)
         frame["log_return_12"] = log_close.diff(12)
-        frame["log_return_48"] = log_close.diff(48)
         frame["momentum_rank"] = ind.rolling_percentile_rank(
             frame["log_return_12"].fillna(0.0), config.rank_window
         )
@@ -245,13 +209,6 @@ class FeatureEngineer:
         frame["kama"] = kama_values
         frame["kama_distance"] = (close - kama_values) / close.replace(0.0, np.nan)
         frame["kama_slope"] = ind.slope(kama_values, window=5)
-        frame["kama_slope_fast"] = ind.slope(kama_values, window=2)
-
-        # --- EMA structure -------------------------------------------------
-        ema_fast: pd.Series = close.ewm(span=12, adjust=False, min_periods=12).mean()
-        ema_slow: pd.Series = close.ewm(span=48, adjust=False, min_periods=48).mean()
-        frame["ema_fast_slow_spread"] = (ema_fast - ema_slow) / close.replace(0.0, np.nan)
-        frame["close_ema_slow_ratio"] = close / ema_slow.replace(0.0, np.nan) - 1.0
 
         # --- Directional movement -----------------------------------------
         adx_values, plus_di, minus_di = ind.adx(high, low, close, window=config.adx_window)
@@ -263,18 +220,9 @@ class FeatureEngineer:
         frame["fdi"] = fdi_values
         # 1 when the market is trending (FDI < 1.5), 0 when it is ranging.
         frame["fdi_trending"] = (fdi_values < 1.5).astype(float)
-        frame["fdi_delta"] = fdi_values.diff(3)
-
-        # --- Bands and oscillators -----------------------------------------
-        _, bb_width, bb_position = ind.bollinger(
-            close, window=config.bb_window, num_std=config.bb_std
-        )
-        frame["bb_width"] = bb_width
-        frame["bb_position"] = bb_position
 
         rsi_values: pd.Series = ind.rsi(close, window=config.rsi_window)
         frame["rsi"] = rsi_values / 100.0
-        frame["rsi_delta"] = rsi_values.diff(3) / 100.0
 
         return frame
 
@@ -282,7 +230,11 @@ class FeatureEngineer:
     # Volatility
     # ------------------------------------------------------------------
     def _add_volatility_features(self, frame: pd.DataFrame) -> pd.DataFrame:
-        """ATR (absolute and relative), realised volatility and vol-of-vol."""
+        """ATR (absolute and relative) plus its stationary rank.
+
+        ``atr_rank`` is not a model input, but the labeler uses it as the
+        fallback volatility percentile when building risk tiers, so it stays.
+        """
         close: pd.Series = frame["close"].astype(float)
         config: FeatureSettings = self._config
 
@@ -297,43 +249,31 @@ class FeatureEngineer:
         frame["atr_rank"] = ind.rolling_percentile_rank(
             frame["atr_pct"].fillna(0.0), config.rank_window
         )
-
-        log_returns: pd.Series = frame["log_return_1"].fillna(0.0)
-        frame["realized_vol_12"] = ind.realized_volatility(log_returns, 12)
-        frame["realized_vol_48"] = ind.realized_volatility(log_returns, 48)
-        frame["vol_of_vol"] = (
-            frame["realized_vol_12"]
-            .rolling(window=48, min_periods=12)
-            .std(ddof=0)
-            .div(frame["realized_vol_12"].replace(0.0, np.nan))
-        )
         return frame
 
     # ------------------------------------------------------------------
     # Volume
     # ------------------------------------------------------------------
     def _add_volume_features(self, frame: pd.DataFrame) -> pd.DataFrame:
-        """Trailing volume statistics, all expressed as stationary ranks."""
+        """Trailing volume statistics: a stationary z-score and a trend ratio."""
         volume: pd.Series = frame["volume"].astype(float)
         config: FeatureSettings = self._config
 
         frame["volume_zscore"] = ind.rolling_zscore(volume, config.rank_window)
-        frame["volume_rank"] = ind.rolling_percentile_rank(volume, config.rank_window)
         short_mean: pd.Series = volume.rolling(window=12, min_periods=6).mean()
         long_mean: pd.Series = volume.rolling(window=96, min_periods=24).mean()
         frame["volume_trend"] = short_mean / long_mean.replace(0.0, np.nan) - 1.0
-
-        dollar_volume: pd.Series = volume * frame["close"].astype(float)
-        frame["dollar_volume_rank"] = ind.rolling_percentile_rank(
-            dollar_volume, config.rank_window
-        )
         return frame
 
     # ------------------------------------------------------------------
     # GARCH
     # ------------------------------------------------------------------
     def _add_garch_features(self, frame: pd.DataFrame) -> pd.DataFrame:
-        """Attach the one-step-ahead GARCH volatility forecast and its rank."""
+        """Attach the one-step-ahead GARCH volatility forecast and its rank.
+
+        ``garch_vol_rank`` is not a model input, but the labeler, the model
+        fallbacks and the backtester read it, so it stays computed.
+        """
         log_returns: pd.Series = frame["log_return_1"].fillna(0.0)
         forecast: pd.Series = self._rolling_garch_forecast(log_returns)
 
@@ -341,8 +281,6 @@ class FeatureEngineer:
         frame["garch_vol_rank"] = ind.rolling_percentile_rank(
             forecast.ffill().fillna(0.0), self._config.rank_window
         )
-        realized: pd.Series = frame["realized_vol_12"].replace(0.0, np.nan)
-        frame["garch_vol_ratio"] = forecast / realized
         return frame
 
     def _rolling_garch_forecast(self, log_returns: pd.Series) -> pd.Series:
@@ -891,27 +829,6 @@ class FeatureEngineer:
         joined = joined.set_index(index_column)
         joined.index.name = original_index.name
         return joined
-
-    @staticmethod
-    def _add_session_features(frame: pd.DataFrame) -> pd.DataFrame:
-        """Cyclical encodings of the time of day and day of week.
-
-        Crypto trades 24/7 but liquidity is far from uniform; sine/cosine pairs
-        let a tree split on "the Asia session" without an artificial 23 -> 0
-        discontinuity.
-        """
-        index: pd.DatetimeIndex = pd.DatetimeIndex(frame.index)
-        hour_fraction: np.ndarray = (
-            index.hour.to_numpy(dtype=np.float64)
-            + index.minute.to_numpy(dtype=np.float64) / 60.0
-        ) / 24.0
-        day_fraction: np.ndarray = index.dayofweek.to_numpy(dtype=np.float64) / 7.0
-
-        frame["hour_sin"] = np.sin(2.0 * np.pi * hour_fraction)
-        frame["hour_cos"] = np.cos(2.0 * np.pi * hour_fraction)
-        frame["dow_sin"] = np.sin(2.0 * np.pi * day_fraction)
-        frame["dow_cos"] = np.cos(2.0 * np.pi * day_fraction)
-        return frame
 
 
 # ---------------------------------------------------------------------------

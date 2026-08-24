@@ -174,8 +174,22 @@ values bit-identical.
   smoothing at `t` would use data from `t+1…T`. Raw states are remapped onto a
   stable taxonomy (bull / bear / high-volatility / sideways) from the fitted
   emission means, so the feature keeps its meaning across refits.
-- **Micro-structure** — order-book imbalance, spread, funding deltas, OI change,
-  joined with `merge_asof(direction="backward")`.
+- **Micro-structure** — order-book imbalance, spread and funding are still
+  collected live (joined with `merge_asof(direction="backward")`) and shown in
+  the audit panel, but they are **not** part of the model feature set: Binance
+  exposes no deep historical order-book/liquidation feed, so these columns are
+  constant across any back-filled training set and would only add train/serve
+  skew.
+
+**Model feature set.** `FEATURE_COLUMNS` is a curated 21-feature contract —
+trend (KAMA distance/slope, ADX, DI spread), structure (FDI, FDI-trending),
+momentum (RSI, 1/3/12-bar log returns, momentum rank), volatility (ATR %, GARCH
+forecast), the six HMM regime features, and volume (z-score, trend). Weak,
+redundant or non-back-fillable columns (extra EMA/Bollinger/vol variants, the
+micro-structure/futures block, and the 24/7-uninformative session encodings)
+were dropped from the model input. A few non-feature columns (`atr_rank`,
+`garch_vol_rank`, `ob_imbalance`, `funding_rate`, …) are still computed because
+the risk labeler, the model fallbacks and the audit panel consume them.
 
 The **labeler** simulates a long *and* a short at every bar close with
 ATR-scaled triple barriers, and is deliberately pessimistic: when one candle
