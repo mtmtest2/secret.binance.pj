@@ -19,6 +19,7 @@ _BASE: Final[
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>{{ title }}</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%230b1020'/%3E%3Ccircle%20cx='8'%20cy='8'%20r='4'%20fill='%2334d399'/%3E%3C/svg%3E"/>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
     :root { color-scheme: dark; }
@@ -196,7 +197,7 @@ function killSwitch() {
 
 function startTrading(mode) {
   const warn = mode === 'live'
-    ? 'START LIVE TRADING WITH REAL FUNDS?\n\nAny open paper positions will be closed first.'
+    ? 'START LIVE TRADING WITH REAL FUNDS?\\n\\nAny open paper positions will be closed first.'
     : 'Start paper trading with the virtual balance?';
   if (confirm(warn)) { post('/api/trading/start', {mode: mode}); }
 }
@@ -514,7 +515,7 @@ function renderRows() {
         (r.reasons || []).join('; ').slice(0, 70) + '</span>';
     const chg = (r.price_change_pct_24h >= 0 ? 'pos' : 'neg');
     return '<tr>' +
-      '<td><input type="checkbox" ' + checked + ' onchange="toggle(\'' + r.symbol + '\', this.checked)"/></td>' +
+      '<td><input type="checkbox" ' + checked + ' onchange="toggle(\\'' + r.symbol + '\\', this.checked)"/></td>' +
       '<td><b>' + r.symbol + '</b></td>' +
       '<td>' + fmt(r.price, 6) + '</td>' +
       '<td>' + money(r.quote_volume_24h) + '</td>' +
@@ -554,7 +555,7 @@ async function saveUniverse() {
   if (SELECTED.size === 0) {
     el.textContent = 'Select at least one pair first.'; el.className = 'neg text-xs mt-2'; return;
   }
-  if (!confirm('Save ' + SELECTED.size + ' pair(s)?\n\nData collection and model training will start now. Any armed trading will be stopped first.')) return;
+  if (!confirm('Save ' + SELECTED.size + ' pair(s)?\\n\\nData collection and model training will start now. Any armed trading will be stopped first.')) return;
   el.textContent = 'saving...'; el.className = 'muted text-xs mt-2';
   const res = await fetch('/api/universe/select', {
     method: 'POST',
