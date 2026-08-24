@@ -12,6 +12,9 @@ interface, an SSH tunnel or a firewall allow-list before exposing it.
 
 from __future__ import annotations
 
+import math
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any, Protocol, Sequence, runtime_checkable
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request, status
@@ -23,6 +26,54 @@ from core.logger import LOG_BUFFER, get_logger
 from module_f_panel.templates import TEMPLATES
 
 _LOGGER = get_logger(__name__)
+
+
+def _json_safe(value: Any) -> Any:
+    """Recursively coerce a payload into something ``json.dumps`` accepts.
+
+    The dashboard polls ``/api/status`` every few seconds and renders ``-`` for
+    every field whenever that one response fails to parse.  A single non-finite
+    float (``NaN``/``Infinity`` - easily produced by an empty training metric or
+    a degraded-mode division) makes Starlette's ``JSONResponse`` raise at render
+    time (``allow_nan=False``), turning the whole dashboard blank.  Numpy scalars
+    and ``Decimal``/``datetime`` values coming out of the model summaries are the
+    same class of hazard.  Mapping all of them to JSON-native values keeps the
+    panel alive no matter what the snapshot carries.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, Decimal):
+        number: float = float(value)
+        return number if math.isfinite(number) else None
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    # Numpy scalars/arrays, without importing numpy into the panel process.
+    scalar = getattr(value, "item", None)
+    if callable(scalar):
+        try:
+            return _json_safe(value.item())
+        except Exception:  # pragma: no cover - defensive
+            pass
+    to_list = getattr(value, "tolist", None)
+    if callable(to_list):
+        try:
+            return _json_safe(value.tolist())
+        except Exception:  # pragma: no cover - defensive
+            pass
+    return value
+
+
+class SafeJSONResponse(JSONResponse):
+    """``JSONResponse`` that sanitises non-finite/exotic values before encoding."""
+
+    def render(self, content: Any) -> bytes:
+        return super().render(_json_safe(content))
 
 
 @runtime_checkable
@@ -97,6 +148,7 @@ def build_app(controller: SystemController) -> FastAPI:
         version="1.0.0",
         docs_url="/docs",
         redoc_url=None,
+        default_response_class=SafeJSONResponse,
     )
 
     # ------------------------------------------------------------------
@@ -172,13 +224,13 @@ def build_app(controller: SystemController) -> FastAPI:
     @app.get("/health", summary="Liveness probe")
     async def health() -> JSONResponse:
         """Cheap liveness check for process supervisors."""
-        return JSONResponse({"status": "ok"})
+        return SafeJSONResponse({"status": "ok"})
 
     @app.get("/api/status", summary="Full system status")
     async def api_status() -> JSONResponse:
         """Risk guard state, equity, positions, cycle timing and model health."""
         try:
-            return JSONResponse(await controller.status_snapshot())
+            return SafeJSONResponse(await controller.status_snapshot())
         except Exception as error:  # pragma: no cover - the panel must not 500
             _LOGGER.error("Status snapshot failed: %s", error, exc_info=True)
             raise HTTPException(status_code=500, detail=f"status unavailable: {error}") from error
@@ -191,7 +243,7 @@ def build_app(controller: SystemController) -> FastAPI:
     ) -> JSONResponse:
         """Newest audit rows, optionally filtered by symbol and verdict."""
         rows: list[dict[str, Any]] = await controller.recent_audit(limit, symbol, verdict)
-        return JSONResponse({"rows": rows, "count": len(rows)})
+        return SafeJSONResponse({"rows": rows, "count": len(rows)})
 
     @app.get("/api/trades", summary="Recent trades")
     async def api_trades(
@@ -200,18 +252,18 @@ def build_app(controller: SystemController) -> FastAPI:
     ) -> JSONResponse:
         """Newest trades, optionally filtered by status."""
         rows: list[dict[str, Any]] = await controller.recent_trades(limit, status_filter)
-        return JSONResponse({"rows": rows, "count": len(rows)})
+        return SafeJSONResponse({"rows": rows, "count": len(rows)})
 
     @app.get("/api/positions", summary="Active positions")
     async def api_positions() -> JSONResponse:
         """Just the open positions slice of the status snapshot."""
         snapshot: dict[str, Any] = await controller.status_snapshot()
-        return JSONResponse({"rows": snapshot.get("positions", [])})
+        return SafeJSONResponse({"rows": snapshot.get("positions", [])})
 
     @app.get("/api/logs", summary="Recent log lines")
     async def api_logs(limit: int = Query(default=200, ge=1, le=800)) -> JSONResponse:
         """Tail of the in-memory ring buffer - no filesystem access required."""
-        return JSONResponse({"rows": LOG_BUFFER.snapshot(limit)})
+        return SafeJSONResponse({"rows": LOG_BUFFER.snapshot(limit)})
 
     # ------------------------------------------------------------------
     # Universe API
@@ -222,7 +274,7 @@ def build_app(controller: SystemController) -> FastAPI:
     ) -> JSONResponse:
         """Every active USDT-M perpetual, annotated with the screening metrics."""
         try:
-            return JSONResponse(await controller.list_universe_candidates(refresh))
+            return SafeJSONResponse(await controller.list_universe_candidates(refresh))
         except Exception as error:
             _LOGGER.error("Universe discovery failed: %s", error)
             raise HTTPException(
@@ -235,7 +287,7 @@ def build_app(controller: SystemController) -> FastAPI:
     ) -> JSONResponse:
         """Top eligible symbols by screening score; never returns an ineligible one."""
         try:
-            return JSONResponse(await controller.suggest_universe(limit))
+            return SafeJSONResponse(await controller.suggest_universe(limit))
         except Exception as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
 
@@ -243,7 +295,7 @@ def build_app(controller: SystemController) -> FastAPI:
     async def api_universe_selected() -> JSONResponse:
         """The pairs the system is configured to trade."""
         snapshot: dict[str, Any] = await controller.status_snapshot()
-        return JSONResponse(snapshot.get("universe", {}))
+        return SafeJSONResponse(snapshot.get("universe", {}))
 
     @app.post("/api/universe/select", summary="Save the pair selection")
     async def api_universe_select(
@@ -268,7 +320,7 @@ def build_app(controller: SystemController) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(error)) from error
         except Exception as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
-        return JSONResponse(result)
+        return SafeJSONResponse(result)
 
     # ------------------------------------------------------------------
     # Setup API
@@ -276,7 +328,7 @@ def build_app(controller: SystemController) -> FastAPI:
     @app.get("/api/setup/status", summary="Data collection & training progress")
     async def api_setup_status() -> JSONResponse:
         """Phase, current step, percentage and any setup error."""
-        return JSONResponse(await controller.setup_status())
+        return SafeJSONResponse(await controller.setup_status())
 
     @app.post("/api/setup/start", summary="Re-run collection and training")
     async def api_setup_start(
@@ -287,7 +339,7 @@ def build_app(controller: SystemController) -> FastAPI:
         "models are already current" shortcut."""
         authorise(request, payload)
         force: bool = bool(payload.get("force_retrain", False))
-        return JSONResponse(await controller.start_setup(force))
+        return SafeJSONResponse(await controller.start_setup(force))
 
     # ------------------------------------------------------------------
     # Control API
@@ -305,7 +357,7 @@ def build_app(controller: SystemController) -> FastAPI:
         authorise(request, payload)
         mode: str = str(payload.get("mode", "paper")).lower()
         try:
-            return JSONResponse(await controller.start_trading(mode))
+            return SafeJSONResponse(await controller.start_trading(mode))
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
 
@@ -320,7 +372,7 @@ def build_app(controller: SystemController) -> FastAPI:
         ``{"flatten": true}`` is passed.
         """
         authorise(request, payload)
-        return JSONResponse(await controller.stop_trading(bool(payload.get("flatten", False))))
+        return SafeJSONResponse(await controller.stop_trading(bool(payload.get("flatten", False))))
 
 
     @app.post("/api/toggle_trading", summary="Pause/resume or switch execution mode")
@@ -356,7 +408,7 @@ def build_app(controller: SystemController) -> FastAPI:
 
         if not result:
             raise HTTPException(status_code=400, detail="supply an 'action' and/or a 'mode'")
-        return JSONResponse(result)
+        return SafeJSONResponse(result)
 
     @app.post("/api/kill_switch", summary="Panic button")
     async def api_kill_switch(
@@ -367,7 +419,7 @@ def build_app(controller: SystemController) -> FastAPI:
         authorise(request, payload)
         reason: str = str(payload.get("reason", "manual kill switch via web panel"))
         _LOGGER.critical("KILL SWITCH requested from the web panel: %s", reason)
-        return JSONResponse(await controller.engage_kill_switch(reason))
+        return SafeJSONResponse(await controller.engage_kill_switch(reason))
 
     @app.post("/api/reset_risk_guard", summary="Clear a RED latch")
     async def api_reset_risk_guard(
@@ -377,6 +429,6 @@ def build_app(controller: SystemController) -> FastAPI:
         """Clear the halt after a human has reviewed why it fired."""
         authorise(request, payload)
         operator: str = str(payload.get("operator", "web-panel"))
-        return JSONResponse(await controller.reset_risk_guard(operator))
+        return SafeJSONResponse(await controller.reset_risk_guard(operator))
 
     return app

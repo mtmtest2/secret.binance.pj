@@ -260,8 +260,16 @@ function row(cells) { return '<tr>' + cells.map(c => '<td>' + c + '</td>').join(
 
 async function refresh() {
   let s;
-  try { s = await (await fetch('/api/status')).json(); }
-  catch (err) { document.getElementById('guard-state').textContent = 'UNREACHABLE'; return; }
+  try {
+    const res = await fetch('/api/status');
+    s = await res.json();
+    if (!res.ok || s === null || typeof s !== 'object' || s.phase === undefined) {
+      const detail = (s && s.detail) ? s.detail : ('HTTP ' + (res && res.status));
+      document.getElementById('guard-state').textContent = 'STATUS ERROR';
+      document.getElementById('guard-reason').textContent = String(detail);
+      return;
+    }
+  } catch (err) { document.getElementById('guard-state').textContent = 'UNREACHABLE'; return; }
 
   renderSetup(s);
   const guard = s.risk_guard || {};
