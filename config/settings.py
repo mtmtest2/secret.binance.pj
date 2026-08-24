@@ -94,8 +94,11 @@ class DataSettings(BaseModel):
     timeframe: Literal["5m"] = Field(default="5m")
     timeframe_ms: int = Field(default=5 * 60 * 1_000)
 
-    ohlcv_limit: int = Field(default=500, ge=50, le=1_500)
-    history_bootstrap_candles: int = Field(default=6_000, ge=500)
+    ohlcv_limit: int = Field(default=1_500, ge=50, le=1_500)
+    #: Depth of the one-time history backfill, in 5m candles.  2 years ==
+    #: 2 * 365 * 288 == 210_240 bars; the fetcher paginates the range 1_500 at a
+    #: time.  Override with ``data__history_bootstrap_candles`` for a shorter run.
+    history_bootstrap_candles: int = Field(default=210_240, ge=500)
     orderbook_depth: int = Field(default=20, ge=5, le=100)
     orderbook_levels_for_imbalance: int = Field(default=10, ge=1, le=100)
 

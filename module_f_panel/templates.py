@@ -152,6 +152,20 @@ _DASHBOARD_CONTENT: Final[
 </section>
 
 <section class="card">
+  <div class="flex items-center justify-between flex-wrap gap-2">
+    <div class="font-bold mb-2">ML TRAINING REPORT</div>
+    <div id="ml-summary" class="muted text-xs"></div>
+  </div>
+  <div id="ml-report-empty" class="muted text-xs">
+    No training report yet &mdash; select pairs or press RETRAIN to train the models.
+  </div>
+  <div class="scroll"><table id="ml-report-table" style="display:none;">
+    <thead><tr><th>Model</th><th>Validation metrics</th></tr></thead>
+    <tbody id="ml-report"></tbody>
+  </table></div>
+</section>
+
+<section class="card">
   <div class="font-bold mb-2">LATEST DECISIONS</div>
   <div class="scroll"><table>
     <thead><tr><th>Time</th><th>Symbol</th><th>Verdict</th><th>Rule</th>
@@ -259,6 +273,49 @@ function renderSetup(s) {
 
 function row(cells) { return '<tr>' + cells.map(c => '<td>' + c + '</td>').join('') + '</tr>'; }
 
+const ML_METRIC_LABELS = {
+  accuracy: 'accuracy', balanced_accuracy: 'balanced acc', log_loss: 'log loss',
+  rmse: 'RMSE', mae: 'MAE', r2: 'R2', mape: 'MAPE'
+};
+
+function renderMlReport(setup) {
+  const summary = document.getElementById('ml-summary');
+  const empty = document.getElementById('ml-report-empty');
+  const table = document.getElementById('ml-report-table');
+  const body = document.getElementById('ml-report');
+  const ts = (setup && setup.training_summary) || {};
+  const metrics = ts.metrics || {};
+  const names = Object.keys(metrics);
+
+  if (names.length === 0) {
+    table.style.display = 'none';
+    empty.style.display = '';
+    empty.textContent = ts.skipped
+      ? ('Models already trained for this universe (' + ts.skipped + ').')
+      : 'No training report yet - select pairs or press RETRAIN to train the models.';
+    summary.textContent = '';
+    body.innerHTML = '';
+    return;
+  }
+
+  empty.style.display = 'none';
+  table.style.display = '';
+  const dist = ts.distribution
+    ? Object.keys(ts.distribution).map(k => k + ':' + ts.distribution[k]).join('  ') : '';
+  summary.textContent = (ts.rows ? Number(ts.rows).toLocaleString() + ' training rows' : '')
+    + (dist ? '  -  ' + dist : '');
+
+  body.innerHTML = names.map(name => {
+    const m = metrics[name] || {};
+    if (m.error) return row([name, '<span class="neg">ERROR: ' + m.error + '</span>']);
+    const parts = Object.keys(m)
+      .filter(k => typeof m[k] === 'number')
+      .map(k => (ML_METRIC_LABELS[k] || k) + ' '
+        + (isFinite(m[k]) ? Number(m[k]).toFixed(4) : '-'));
+    return row([name, parts.length ? parts.join('  |  ') : '<span class="muted">trained</span>']);
+  }).join('');
+}
+
 async function refresh() {
   let s;
   try {
@@ -317,6 +374,8 @@ async function refresh() {
     row([k, typeof health[k] === 'boolean'
       ? '<span class="' + (health[k] ? 'pos' : 'warn') + '">' + (health[k] ? 'READY' : 'FALLBACK') + '</span>'
       : health[k]])).join('');
+
+  renderMlReport(s.setup || {});
 
   try {
     const audit = await (await fetch('/api/audit?limit=25')).json();
