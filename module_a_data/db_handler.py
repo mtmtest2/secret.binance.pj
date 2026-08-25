@@ -328,6 +328,17 @@ class DatabaseHandler:
             value: Any = result.scalar_one_or_none()
         return int(value) if value is not None else None
 
+    async def earliest_candle_timestamp(self, symbol: str) -> int | None:
+        """Return the oldest stored candle open time for ``symbol``."""
+        query: Select[Any] = select(func.min(OHLCVRow.timestamp)).where(
+            OHLCVRow.symbol == symbol,
+            OHLCVRow.timeframe == self._settings.data.timeframe,
+        )
+        async with self._factory()() as session:
+            result: Result[Any] = await session.execute(query)
+            value: Any = result.scalar_one_or_none()
+        return int(value) if value is not None else None
+
     async def candle_count(self, symbol: str) -> int:
         """Return how many candles are stored for ``symbol``."""
         query: Select[Any] = select(func.count()).select_from(OHLCVRow).where(

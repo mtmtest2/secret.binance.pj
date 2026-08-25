@@ -92,30 +92,46 @@ class DataPipeline:
         async def _bootstrap_one(symbol: str) -> tuple[str, int]:
             async with self._symbol_semaphore:
                 try:
-                    newest: int | None = await self._db.latest_candle_timestamp(symbol)
                     default_start: int = end_ms - target_bars * timeframe_ms
-                    start_ms: int = (
-                        max(default_start, newest + timeframe_ms)
-                        if newest is not None
-                        else default_start
-                    )
-                    if start_ms > end_ms:
-                        return symbol, 0
+                    newest: int | None = await self._db.latest_candle_timestamp(symbol)
+                    oldest: int | None = await self._db.earliest_candle_timestamp(symbol)
 
-                    candles: list[OHLCVCandle] = await self._fetcher.fetch_ohlcv_range(
-                        symbol, start_ms=start_ms, end_ms=end_ms
-                    )
-                    if not candles:
-                        return symbol, 0
+                    # Cover the whole target window [default_start, end_ms].  Two
+                    # gaps can exist against what is already stored: OLDER history
+                    # below ``oldest`` (this is what makes raising the target
+                    # actually deepen an already-shallow table), and the forward
+                    # tail above ``newest``.  Fetching only the forward tail - the
+                    # old behaviour - left a shallow table shallow forever.
+                    segments: list[tuple[int, int]] = []
+                    if newest is None or oldest is None:
+                        segments.append((default_start, end_ms))
+                    else:
+                        if oldest - timeframe_ms >= default_start:
+                            segments.append((default_start, oldest - timeframe_ms))
+                        if newest + timeframe_ms <= end_ms:
+                            segments.append((newest + timeframe_ms, end_ms))
 
-                    report: QCReport = self._validator.validate_candles(symbol, candles)
-                    if not report.passed:
-                        healed, _ = await self._validator.validate_and_heal(
-                            symbol, candles, self._refetch
+                    # Validate and upsert each segment on its own: the segments are
+                    # disjoint (a filled middle sits between them), so validating a
+                    # concatenation would flag that middle as a false gap and heal
+                    # it needlessly.
+                    written: int = 0
+                    for segment_start, segment_end in segments:
+                        if segment_start > segment_end:
+                            continue
+                        candles: list[OHLCVCandle] = await self._fetcher.fetch_ohlcv_range(
+                            symbol, start_ms=segment_start, end_ms=segment_end
                         )
-                        candles = healed
+                        if not candles:
+                            continue
 
-                    written: int = await self._db.upsert_candles(candles)
+                        report: QCReport = self._validator.validate_candles(symbol, candles)
+                        if not report.passed:
+                            candles, _ = await self._validator.validate_and_heal(
+                                symbol, candles, self._refetch
+                            )
+
+                        written += await self._db.upsert_candles(candles)
                     return symbol, written
                 except (DataFetchError, DataIntegrityError, DatabaseError) as error:
                     # One bad symbol must not abort the backfill of the other 29.
