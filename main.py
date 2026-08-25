@@ -711,6 +711,31 @@ class TradingSystem:
             },
         }
 
+    async def ml_report(self) -> dict[str, Any]:
+        """Full, downloadable training report: metrics + feature importances.
+
+        Merges the per-head report (which survives restarts, since it is rebuilt
+        from the loaded artifacts) with the dataset summary from the last run and
+        the universe the artifacts were trained on.
+        """
+        stored: dict[str, Any] | None = await self.database.get_state("trained_universe")
+        summary: dict[str, Any] = dict(self.progress.training_summary or {})
+        report: dict[str, Any] = self.ml.training_report()
+        report.update(
+            {
+                "generated_at": utc_now().isoformat(timespec="seconds"),
+                "app": self.settings.app_name,
+                "trained_universe": stored.get("symbols", []) if stored else [],
+                "trained_at": stored.get("trained_ms") if stored else None,
+                "dataset": {
+                    "rows": summary.get("rows"),
+                    "distribution": summary.get("distribution"),
+                },
+                "history_bootstrap_candles": self.settings.data.history_bootstrap_candles,
+            }
+        )
+        return report
+
     # --- Universe -----------------------------------------------------
     async def list_universe_candidates(self, refresh: bool = False) -> dict[str, Any]:
         """Every USDT-M perpetual on Binance, screened and scored for the panel."""

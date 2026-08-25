@@ -125,6 +125,30 @@ class BaseModelHead(ABC):
         """Training metadata (row counts, metrics, timestamp)."""
         return dict(self._metadata)
 
+    def feature_importances(self, top: int | None = None) -> list[dict[str, float]]:
+        """Relative importances of the fitted booster, sorted high to low.
+
+        Returns an empty list for an unfitted head or a booster that does not
+        expose ``feature_importances_``.  Values are normalised to sum to 1 so
+        they read as a share of total importance regardless of the booster's
+        raw scale (split count vs. gain).
+        """
+        model: Any = self._model
+        raw: Any = getattr(model, "feature_importances_", None)
+        if model is None or raw is None:
+            return []
+        values: list[float] = [float(value) for value in raw]
+        names: list[str] = list(self._feature_columns)
+        if len(values) != len(names):
+            return []
+        total: float = sum(values) or 1.0
+        ranked: list[dict[str, float]] = sorted(
+            ({"feature": name, "importance": value / total} for name, value in zip(names, values)),
+            key=lambda item: item["importance"],
+            reverse=True,
+        )
+        return ranked[:top] if top else ranked
+
     @property
     def version(self) -> str:
         """Artifact version string used in the audit log."""
@@ -963,6 +987,32 @@ class MLSubsystem:
     def versions(self) -> dict[str, str]:
         """Artifact versions, recorded on every audit row."""
         return {name: head.version for name, head in self.heads.items()}
+
+    def training_report(self) -> dict[str, Any]:
+        """Full, machine-readable training report for every head.
+
+        Built from each head's in-memory metadata and fitted booster, so it is
+        available for download at any time - including after a restart, because
+        ``load`` restores the metadata and the booster (hence its importances)
+        from the joblib artifact.
+        """
+        models: dict[str, Any] = {}
+        for name, head in self.heads.items():
+            meta: dict[str, Any] = head.metadata
+            models[name] = {
+                "loaded": head.is_loaded,
+                "trained_at": meta.get("trained_at"),
+                "metrics": meta.get("metrics", {}),
+                "metadata": meta,
+                "feature_importances": head.feature_importances(),
+            }
+        return {
+            "booster": self._settings.ml.booster,
+            "feature_count": len(FEATURE_COLUMNS),
+            "features": list(FEATURE_COLUMNS),
+            "all_loaded": self.all_loaded,
+            "models": models,
+        }
 
     # ------------------------------------------------------------------
     # Persistence

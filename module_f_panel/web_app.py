@@ -90,6 +90,9 @@ class SystemController(Protocol):
     async def status_snapshot(self) -> dict[str, Any]:
         """Full system status for the dashboard."""
 
+    async def ml_report(self) -> dict[str, Any]:
+        """Detailed training report: metrics and feature importances per head."""
+
     async def recent_audit(
         self, limit: int, symbol: str | None, verdict: str | None
     ) -> list[dict[str, Any]]:
@@ -234,6 +237,15 @@ def build_app(controller: SystemController) -> FastAPI:
         except Exception as error:  # pragma: no cover - the panel must not 500
             _LOGGER.error("Status snapshot failed: %s", error, exc_info=True)
             raise HTTPException(status_code=500, detail=f"status unavailable: {error}") from error
+
+    @app.get("/api/ml/report", summary="Detailed ML training report")
+    async def api_ml_report() -> JSONResponse:
+        """Per-head metrics, metadata and feature importances; safe to download."""
+        try:
+            return SafeJSONResponse(await controller.ml_report())
+        except Exception as error:  # pragma: no cover - the panel must not 500
+            _LOGGER.error("ML report failed: %s", error, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"ml report unavailable: {error}") from error
 
     @app.get("/api/audit", summary="Recent audit records")
     async def api_audit(

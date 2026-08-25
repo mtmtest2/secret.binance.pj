@@ -154,15 +154,17 @@ _DASHBOARD_CONTENT: Final[
 <section class="card">
   <div class="flex items-center justify-between flex-wrap gap-2">
     <div class="font-bold mb-2">ML TRAINING REPORT</div>
-    <div id="ml-summary" class="muted text-xs"></div>
+    <div class="flex items-center gap-3 flex-wrap">
+      <span id="ml-summary" class="muted text-xs"></span>
+      <button id="ml-download" onclick="downloadMlReport()"
+              class="bg-slate-700 hover:bg-slate-600 rounded px-3 py-1 text-xs font-bold"
+              style="display:none;">DOWNLOAD JSON</button>
+    </div>
   </div>
   <div id="ml-report-empty" class="muted text-xs">
     No training report yet &mdash; select pairs or press RETRAIN to train the models.
   </div>
-  <div class="scroll"><table id="ml-report-table" style="display:none;">
-    <thead><tr><th>Model</th><th>Validation metrics</th></tr></thead>
-    <tbody id="ml-report"></tbody>
-  </table></div>
+  <div id="ml-report-detail" class="grid" style="grid-template-columns:repeat(auto-fit,minmax(320px,1fr));"></div>
 </section>
 
 <section class="card">
@@ -275,45 +277,91 @@ function row(cells) { return '<tr>' + cells.map(c => '<td>' + c + '</td>').join(
 
 const ML_METRIC_LABELS = {
   accuracy: 'accuracy', balanced_accuracy: 'balanced acc', log_loss: 'log loss',
-  rmse: 'RMSE', mae: 'MAE', r2: 'R2', mape: 'MAPE'
+  roc_auc: 'ROC AUC', rmse: 'RMSE', mae: 'MAE', r2: 'R2', mape: 'MAPE',
+  positive_rate: 'positive rate', rows: 'train rows', validation_rows: 'val rows'
 };
+let LAST_ML_REPORT = null;
 
-function renderMlReport(setup) {
-  const summary = document.getElementById('ml-summary');
+function fmtMetric(v) {
+  if (typeof v !== 'number') return String(v);
+  if (!isFinite(v)) return '-';
+  return Math.abs(v) >= 1000 ? Number(v).toLocaleString() : Number(v).toFixed(4);
+}
+
+async function loadMlReport() {
   const empty = document.getElementById('ml-report-empty');
-  const table = document.getElementById('ml-report-table');
-  const body = document.getElementById('ml-report');
-  const ts = (setup && setup.training_summary) || {};
-  const metrics = ts.metrics || {};
-  const names = Object.keys(metrics);
+  const detail = document.getElementById('ml-report-detail');
+  const summary = document.getElementById('ml-summary');
+  const dl = document.getElementById('ml-download');
+  let rep;
+  try { rep = await (await fetch('/api/ml/report')).json(); }
+  catch (err) { return; }
+  LAST_ML_REPORT = rep;
 
-  if (names.length === 0) {
-    table.style.display = 'none';
-    empty.style.display = '';
-    empty.textContent = ts.skipped
-      ? ('Models already trained for this universe (' + ts.skipped + ').')
-      : 'No training report yet - select pairs or press RETRAIN to train the models.';
-    summary.textContent = '';
-    body.innerHTML = '';
+  const models = rep.models || {};
+  const trained = Object.keys(models).filter(n => models[n] && models[n].loaded);
+  if (trained.length === 0) {
+    detail.innerHTML = ''; dl.style.display = 'none'; empty.style.display = '';
+    empty.textContent = 'No trained models yet - select pairs or press RETRAIN to train the models.';
+    summary.textContent = (rep.feature_count ? rep.feature_count + ' features' : '');
     return;
   }
 
   empty.style.display = 'none';
-  table.style.display = '';
-  const dist = ts.distribution
-    ? Object.keys(ts.distribution).map(k => k + ':' + ts.distribution[k]).join('  ') : '';
-  summary.textContent = (ts.rows ? Number(ts.rows).toLocaleString() + ' training rows' : '')
-    + (dist ? '  -  ' + dist : '');
+  dl.style.display = '';
+  const ds = rep.dataset || {};
+  const dist = ds.distribution
+    ? Object.keys(ds.distribution).map(k => k + ':' + ds.distribution[k]).join('  ') : '';
+  summary.textContent = [
+    rep.booster ? 'booster ' + rep.booster : '',
+    rep.feature_count ? rep.feature_count + ' features' : '',
+    ds.rows ? Number(ds.rows).toLocaleString() + ' rows' : '',
+    dist
+  ].filter(Boolean).join('  -  ');
 
-  body.innerHTML = names.map(name => {
-    const m = metrics[name] || {};
-    if (m.error) return row([name, '<span class="neg">ERROR: ' + m.error + '</span>']);
-    const parts = Object.keys(m)
-      .filter(k => typeof m[k] === 'number')
-      .map(k => (ML_METRIC_LABELS[k] || k) + ' '
-        + (isFinite(m[k]) ? Number(m[k]).toFixed(4) : '-'));
-    return row([name, parts.length ? parts.join('  |  ') : '<span class="muted">trained</span>']);
+  detail.innerHTML = Object.keys(models).map(name => {
+    const m = models[name] || {};
+    const meta = m.metadata || {};
+    const metrics = m.metrics || meta.metrics || {};
+    const err = meta.error || m.error;
+    const head = '<div class="font-bold text-sm">' + name
+      + (m.loaded ? '' : ' <span class="warn text-xs">(fallback)</span>') + '</div>'
+      + '<div class="muted text-[11px] mb-2">'
+      + (m.trained_at ? 'trained ' + m.trained_at : 'not trained') + '</div>';
+    if (err) return '<div class="card" style="background:#0e1526">' + head
+      + '<div class="neg text-xs">ERROR: ' + err + '</div></div>';
+
+    const metricRows = Object.keys(metrics).map(k =>
+      '<tr><td class="muted">' + (ML_METRIC_LABELS[k] || k) + '</td><td>' + fmtMetric(metrics[k]) + '</td></tr>'
+    ).join('');
+    const imp = (m.feature_importances || []).slice(0, 10);
+    const impMax = imp.length ? imp[0].importance || 1e-9 : 1;
+    const impRows = imp.map(f => {
+      const w = Math.max(2, Math.round(100 * (f.importance / impMax)));
+      return '<div class="flex items-center gap-2 text-[11px]">'
+        + '<span style="width:130px" class="truncate">' + f.feature + '</span>'
+        + '<span style="flex:1;background:#1e293b;border-radius:3px;overflow:hidden">'
+        + '<span style="display:block;height:8px;width:' + w + '%;background:#38bdf8"></span></span>'
+        + '<span class="muted" style="width:44px;text-align:right">' + (100 * f.importance).toFixed(1) + '%</span>'
+        + '</div>';
+    }).join('');
+
+    return '<div class="card" style="background:#0e1526">' + head
+      + '<table class="mb-2"><tbody>' + metricRows + '</tbody></table>'
+      + (impRows ? '<div class="muted text-[10px] uppercase mb-1">top features</div>' + impRows : '')
+      + '</div>';
   }).join('');
+}
+
+function downloadMlReport() {
+  if (!LAST_ML_REPORT) return;
+  const blob = new Blob([JSON.stringify(LAST_ML_REPORT, null, 2)], {type: 'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const stamp = (LAST_ML_REPORT.generated_at || new Date().toISOString()).replace(/[:]/g, '').slice(0, 15);
+  a.href = url; a.download = 'ml_report_' + stamp + '.json';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 async function refresh() {
@@ -375,7 +423,7 @@ async function refresh() {
       ? '<span class="' + (health[k] ? 'pos' : 'warn') + '">' + (health[k] ? 'READY' : 'FALLBACK') + '</span>'
       : health[k]])).join('');
 
-  renderMlReport(s.setup || {});
+  loadMlReport();
 
   try {
     const audit = await (await fetch('/api/audit?limit=25')).json();
