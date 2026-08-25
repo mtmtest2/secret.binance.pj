@@ -111,6 +111,20 @@ class DataPipeline:
                         if newest + timeframe_ms <= end_ms:
                             segments.append((newest + timeframe_ms, end_ms))
 
+                    planned: int = sum(
+                        max(0, (seg_end - seg_start) // timeframe_ms + 1)
+                        for seg_start, seg_end in segments
+                    )
+                    _LOGGER.info(
+                        "Backfill %s: target=%d bars, stored=%s, fetching ~%d bar(s) "
+                        "across %d segment(s)",
+                        symbol,
+                        target_bars,
+                        "empty" if newest is None else f"[{oldest}..{newest}]",
+                        planned,
+                        len(segments),
+                    )
+
                     # Validate and upsert each segment on its own: the segments are
                     # disjoint (a filled middle sits between them), so validating a
                     # concatenation would flag that middle as a false gap and heal

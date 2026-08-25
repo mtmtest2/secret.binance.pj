@@ -750,6 +750,11 @@ class TradingSystem:
                     "target_candles": data_summary.get(
                         "target_candles", self.settings.data.history_bootstrap_candles
                     ),
+                    # Marker for the windowed backfill (deep older-history fetch).
+                    # If a report shows this AND candles are still ~1000, the code
+                    # is deployed but the exchange served no deeper history; if it
+                    # is absent, the running build predates the backfill fix.
+                    "bootstrap_mode": "windowed-backfill",
                 },
                 "history_bootstrap_candles": self.settings.data.history_bootstrap_candles,
             }
