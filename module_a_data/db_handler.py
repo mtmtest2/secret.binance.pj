@@ -159,22 +159,32 @@ class DatabaseHandler:
             for candle in candles
         ]
 
-        statement = sqlite_insert(OHLCVRow).values(payload)
-        statement = statement.on_conflict_do_update(
-            index_elements=[OHLCVRow.symbol, OHLCVRow.timeframe, OHLCVRow.timestamp],
-            set_={
-                "open": statement.excluded.open,
-                "high": statement.excluded.high,
-                "low": statement.excluded.low,
-                "close": statement.excluded.close,
-                "volume": statement.excluded.volume,
-            },
-        )
-
+        # SQLite caps the number of bound parameters in one statement
+        # (SQLITE_MAX_VARIABLE_NUMBER).  A deep backfill hands us >100k candles at
+        # once; at 8 columns each that is >800k parameters and the insert fails
+        # outright.  Chunk the rows so every statement stays well under the limit.
+        chunk_rows: int = 1_000
         try:
             async with self._factory()() as session:
                 async with session.begin():
-                    await session.execute(statement)
+                    for start in range(0, len(payload), chunk_rows):
+                        chunk: list[dict[str, Any]] = payload[start : start + chunk_rows]
+                        statement = sqlite_insert(OHLCVRow).values(chunk)
+                        statement = statement.on_conflict_do_update(
+                            index_elements=[
+                                OHLCVRow.symbol,
+                                OHLCVRow.timeframe,
+                                OHLCVRow.timestamp,
+                            ],
+                            set_={
+                                "open": statement.excluded.open,
+                                "high": statement.excluded.high,
+                                "low": statement.excluded.low,
+                                "close": statement.excluded.close,
+                                "volume": statement.excluded.volume,
+                            },
+                        )
+                        await session.execute(statement)
         except SQLAlchemyError as error:
             raise DatabaseError("candle upsert failed", rows=len(payload)) from error
         return len(payload)
