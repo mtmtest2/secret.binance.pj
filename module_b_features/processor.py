@@ -45,6 +45,8 @@ class ProcessedDataset:
     metadata: pd.DataFrame
     symbols: tuple[str, ...] = field(default=())
     feature_columns: tuple[str, ...] = field(default=FEATURE_COLUMNS)
+    #: Usable training rows contributed by each symbol after cleaning.
+    per_symbol_rows: dict[str, int] = field(default_factory=dict)
 
     def __len__(self) -> int:
         return len(self.features)
@@ -159,10 +161,25 @@ class DatasetProcessor:
         pooled = pooled.sort_values(["timestamp", "symbol"]).reset_index(drop=True)
 
         dataset: ProcessedDataset = self._to_dataset(pooled, tuple(universe))
+        empty_symbols: list[str] = [
+            symbol for symbol in universe if dataset.per_symbol_rows.get(symbol, 0) == 0
+        ]
+        if empty_symbols:
+            _LOGGER.warning(
+                "%d of %d selected symbol(s) contributed no training rows "
+                "(no/too-little stored history?): %s",
+                len(empty_symbols),
+                len(universe),
+                ", ".join(empty_symbols),
+            )
         _LOGGER.info(
-            "Training dataset ready: %d rows, %d features, distribution=%s",
+            "Training dataset ready: %d rows from %d/%d symbol(s), %d features, "
+            "per-symbol rows=%s, distribution=%s",
             len(dataset),
+            len(universe) - len(empty_symbols),
+            len(universe),
             len(dataset.feature_columns),
+            dataset.per_symbol_rows,
             dataset.class_distribution(),
         )
         return dataset
@@ -209,6 +226,12 @@ class DatasetProcessor:
         exit_columns: list[str] = ["target_tp_pct", "target_sl_pct", "target_trailing_pct"]
         exit_targets: pd.DataFrame = usable[exit_columns].astype(float)
 
+        per_symbol_rows: dict[str, int] = (
+            {str(name): int(count) for name, count in usable["symbol"].value_counts().items()}
+            if "symbol" in usable.columns
+            else {}
+        )
+
         return ProcessedDataset(
             features=usable[feature_columns].astype(float),
             direction_target=usable["label"].astype(str),
@@ -218,6 +241,7 @@ class DatasetProcessor:
             metadata=usable[metadata_columns],
             symbols=symbols,
             feature_columns=tuple(feature_columns),
+            per_symbol_rows=per_symbol_rows,
         )
 
     @staticmethod

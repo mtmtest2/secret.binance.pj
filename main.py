@@ -268,12 +268,18 @@ class TradingSystem:
             self.progress.advance(done, total, f"{symbol} ({done}/{total})")
 
         written: dict[str, int] = await self.pipeline.bootstrap_history(symbols, progress=report)
-        self.progress.data_summary = written
 
         stored: dict[str, int] = {
             symbol: await self.database.candle_count(symbol) for symbol in symbols
         }
         usable: list[str] = [symbol for symbol, count in stored.items() if count >= 500]
+        self.progress.data_summary = {
+            "candles_per_symbol": stored,
+            "written_this_run": int(sum(written.values())),
+            "symbols_selected": len(symbols),
+            "symbols_with_history": len(usable),
+            "target_candles": self.settings.data.history_bootstrap_candles,
+        }
         if not usable:
             raise QuantSystemError(
                 "no symbol has enough stored history to train on - check exchange connectivity"
@@ -333,6 +339,9 @@ class TradingSystem:
         self.progress.training_summary = {
             "rows": len(dataset),
             "distribution": dataset.class_distribution(),
+            "per_symbol_rows": dataset.per_symbol_rows,
+            "symbols_used": sum(1 for count in dataset.per_symbol_rows.values() if count > 0),
+            "symbols_selected": len(symbols),
             "metrics": report,
         }
         await self.database.set_state(
@@ -720,6 +729,7 @@ class TradingSystem:
         """
         stored: dict[str, Any] | None = await self.database.get_state("trained_universe")
         summary: dict[str, Any] = dict(self.progress.training_summary or {})
+        data_summary: dict[str, Any] = dict(self.progress.data_summary or {})
         report: dict[str, Any] = self.ml.training_report()
         report.update(
             {
@@ -730,6 +740,16 @@ class TradingSystem:
                 "dataset": {
                     "rows": summary.get("rows"),
                     "distribution": summary.get("distribution"),
+                    "symbols_selected": summary.get("symbols_selected"),
+                    "symbols_used": summary.get("symbols_used"),
+                    "per_symbol_rows": summary.get("per_symbol_rows", {}),
+                },
+                "data": {
+                    "candles_per_symbol": data_summary.get("candles_per_symbol", {}),
+                    "symbols_with_history": data_summary.get("symbols_with_history"),
+                    "target_candles": data_summary.get(
+                        "target_candles", self.settings.data.history_bootstrap_candles
+                    ),
                 },
                 "history_bootstrap_candles": self.settings.data.history_bootstrap_candles,
             }

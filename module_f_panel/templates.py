@@ -165,6 +165,14 @@ _DASHBOARD_CONTENT: Final[
     No training report yet &mdash; select pairs or press RETRAIN to train the models.
   </div>
   <div id="ml-report-detail" class="grid" style="grid-template-columns:repeat(auto-fit,minmax(320px,1fr));"></div>
+  <div id="ml-coverage-wrap" style="display:none;">
+    <div class="muted text-[10px] uppercase mt-3 mb-1">data coverage per symbol</div>
+    <div id="ml-coverage-note" class="muted text-xs mb-1"></div>
+    <div class="scroll" style="max-height:220px;overflow-y:auto"><table>
+      <thead><tr><th>Symbol</th><th>Candles</th><th>Train rows</th><th>Status</th></tr></thead>
+      <tbody id="ml-coverage"></tbody>
+    </table></div>
+  </div>
 </section>
 
 <section class="card">
@@ -302,6 +310,7 @@ async function loadMlReport() {
   const trained = Object.keys(models).filter(n => models[n] && models[n].loaded);
   if (trained.length === 0) {
     detail.innerHTML = ''; dl.style.display = 'none'; empty.style.display = '';
+    document.getElementById('ml-coverage-wrap').style.display = 'none';
     empty.textContent = 'No trained models yet - select pairs or press RETRAIN to train the models.';
     summary.textContent = (rep.feature_count ? rep.feature_count + ' features' : '');
     return;
@@ -312,12 +321,17 @@ async function loadMlReport() {
   const ds = rep.dataset || {};
   const dist = ds.distribution
     ? Object.keys(ds.distribution).map(k => k + ':' + ds.distribution[k]).join('  ') : '';
+  const symbolsInfo = (ds.symbols_used != null && ds.symbols_selected != null)
+    ? ds.symbols_used + '/' + ds.symbols_selected + ' symbols' : '';
   summary.textContent = [
     rep.booster ? 'booster ' + rep.booster : '',
     rep.feature_count ? rep.feature_count + ' features' : '',
     ds.rows ? Number(ds.rows).toLocaleString() + ' rows' : '',
+    symbolsInfo,
     dist
   ].filter(Boolean).join('  -  ');
+
+  renderCoverage(rep);
 
   detail.innerHTML = Object.keys(models).map(name => {
     const m = models[name] || {};
@@ -350,6 +364,37 @@ async function loadMlReport() {
       + '<table class="mb-2"><tbody>' + metricRows + '</tbody></table>'
       + (impRows ? '<div class="muted text-[10px] uppercase mb-1">top features</div>' + impRows : '')
       + '</div>';
+  }).join('');
+}
+
+function renderCoverage(rep) {
+  const wrap = document.getElementById('ml-coverage-wrap');
+  const body = document.getElementById('ml-coverage');
+  const note = document.getElementById('ml-coverage-note');
+  const data = rep.data || {};
+  const ds = rep.dataset || {};
+  const candles = data.candles_per_symbol || {};
+  const rows = ds.per_symbol_rows || {};
+  const symbols = Array.from(new Set(Object.keys(candles).concat(Object.keys(rows))));
+  if (symbols.length === 0) { wrap.style.display = 'none'; return; }
+  wrap.style.display = '';
+
+  const target = data.target_candles || 0;
+  const empties = symbols.filter(s => (rows[s] || 0) === 0);
+  note.innerHTML = empties.length
+    ? '<span class="warn">' + empties.length + ' of ' + symbols.length
+      + ' symbol(s) contributed 0 rows &mdash; too little downloaded history. '
+      + 'Let data collection finish, then RETRAIN.</span>'
+    : 'All ' + symbols.length + ' symbols contributed training rows.';
+
+  symbols.sort((a, b) => (rows[b] || 0) - (rows[a] || 0));
+  body.innerHTML = symbols.map(s => {
+    const c = candles[s] || 0, r = rows[s] || 0;
+    const thin = target && c < target * 0.5;
+    const status = r === 0
+      ? '<span class="neg">no data</span>'
+      : (thin ? '<span class="warn">partial</span>' : '<span class="pos">ok</span>');
+    return row([s, Number(c).toLocaleString(), Number(r).toLocaleString(), status]);
   }).join('');
 }
 
