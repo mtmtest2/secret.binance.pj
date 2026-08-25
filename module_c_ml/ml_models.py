@@ -56,7 +56,10 @@ from module_c_ml.schemas import (
 
 _LOGGER = get_logger(__name__)
 
-_ARTIFACT_VERSION: Final[str] = "1.0.0"
+#: Bump on any breaking change to the feature set or label taxonomy so stale
+#: artifacts are rejected on load and setup retrains cleanly.  2.0.0 == the
+#: 26-feature contract with the 3-class (LONG/SHORT/NO_TRADE) direction target.
+_ARTIFACT_VERSION: Final[str] = "2.0.0"
 
 # Hard sanity rails applied to every exit geometry, trained or heuristic.
 _MIN_TP_PCT: Final[float] = 0.0020
@@ -95,6 +98,20 @@ def load_artifact(path: Path) -> dict[str, Any] | None:
 
     if not isinstance(payload, dict) or "model" not in payload:
         _LOGGER.error("Model artifact %s has an unexpected layout", path)
+        return None
+
+    version: str = str(payload.get("artifact_version", ""))
+    if version != _ARTIFACT_VERSION:
+        # A contract change (feature set or label taxonomy) makes an old booster
+        # unsafe to reuse: its columns and classes no longer mean what we think.
+        # Reject it so the head degrades to its heuristic and setup retrains.
+        _LOGGER.warning(
+            "Model artifact %s is version %r but this build needs %r - ignoring "
+            "it (a retrain is required)",
+            path,
+            version or "unknown",
+            _ARTIFACT_VERSION,
+        )
         return None
     return payload
 
@@ -502,11 +519,9 @@ class DirectionModel(BaseModelHead):
 
         return DirectionPrediction(
             probabilities={
-                LabelClass.LONG_SUCCESS_LOW_RISK.value: long_mass * 0.6,
-                LabelClass.LONG_SUCCESS_HIGH_RISK.value: long_mass * 0.4,
-                LabelClass.SHORT_SUCCESS_LOW_RISK.value: short_mass * 0.6,
-                LabelClass.SHORT_SUCCESS_HIGH_RISK.value: short_mass * 0.4,
-                LabelClass.NO_TRADE_OR_FAIL.value: max(1e-6, 1.0 - long_mass - short_mass),
+                LabelClass.LONG.value: long_mass,
+                LabelClass.SHORT.value: short_mass,
+                LabelClass.NO_TRADE.value: max(1e-6, 1.0 - long_mass - short_mass),
             },
             source=ModelSource.HEURISTIC,
         )

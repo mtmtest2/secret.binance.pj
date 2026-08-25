@@ -181,11 +181,13 @@ values bit-identical.
   constant across any back-filled training set and would only add train/serve
   skew.
 
-**Model feature set.** `FEATURE_COLUMNS` is a curated 21-feature contract —
+**Model feature set.** `FEATURE_COLUMNS` is a curated 26-feature contract —
 trend (KAMA distance/slope, ADX, DI spread), structure (FDI, FDI-trending),
-momentum (RSI, 1/3/12-bar log returns, momentum rank), volatility (ATR %, GARCH
-forecast), the six HMM regime features, and volume (z-score, trend). Weak,
-redundant or non-back-fillable columns (extra EMA/Bollinger/vol variants, the
+momentum (RSI, 1/3/12-bar log returns, momentum rank), **higher-timeframe
+context** (causal 1h/4h EMA slopes, distance from the 4h EMA, the 4h return and
+a 1h/4h trend-alignment sign), volatility (ATR %, GARCH forecast), the six HMM
+regime features, and volume (z-score, trend). Weak, redundant or
+non-back-fillable columns (extra EMA/Bollinger/vol variants, the
 micro-structure/futures block, and the 24/7-uninformative session encodings)
 were dropped from the model input. A few non-feature columns (`atr_rank`,
 `garch_vol_rank`, `ob_imbalance`, `funding_rate`, …) are still computed because
@@ -193,11 +195,12 @@ the risk labeler, the model fallbacks and the audit panel consume them.
 
 The **labeler** simulates a long *and* a short at every bar close with
 ATR-scaled triple barriers, and is deliberately pessimistic: when one candle
-touches both barriers the **stop is assumed to have been hit first**. Path heat
-(MAE as a fraction of the stop distance) plus the entry volatility percentile
-produce the risk tier, yielding the five classes
-`LONG_SUCCESS_{LOW,HIGH}_RISK`, `SHORT_SUCCESS_{LOW,HIGH}_RISK`,
-`NO_TRADE_OR_FAIL`.
+touches both barriers the **stop is assumed to have been hit first**. The
+**direction** target is three balanced classes — `LONG`, `SHORT`, `NO_TRADE`.
+Path-risk is kept out of the direction target and carried separately by the
+`risk_tier` column and the Risk model's `target_risk_score`; the earlier
+five-way split folded a noisy `*_HIGH_RISK` distinction into the direction head
+and made it markedly harder to learn.
 
 ### Modules C & D — models and the arbiter
 

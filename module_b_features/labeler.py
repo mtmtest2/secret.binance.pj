@@ -32,8 +32,14 @@ Risk tiering
 The tier combines path risk (MAE ratio) with the volatility regime at entry
 (rolling GARCH percentile).  Extreme volatility escalates the tier by one step
 and caps it at ``VERY_HIGH``, which - by configuration - is folded into
-``NO_TRADE_OR_FAIL``: a trade that only worked because the market was violent is
-not an edge worth learning.
+``NO_TRADE``: a trade that only worked because the market was violent is not an
+edge worth learning.
+
+The **direction** target is three classes only - ``LONG`` / ``SHORT`` /
+``NO_TRADE``.  Path-risk is deliberately kept out of it and carried by the
+separate ``risk_tier`` column and the Risk model's ``target_risk_score``; a
+three-way balanced target is far more learnable than the old five-way split
+whose ``*_HIGH_RISK`` buckets were tiny and mostly noise.
 """
 
 from __future__ import annotations
@@ -56,13 +62,18 @@ _CHUNK_ROWS: Final[int] = 20_000
 
 
 class LabelClass(str, Enum):
-    """The multi-class target consumed by the Market Direction model."""
+    """The direction target consumed by the Market Direction model.
 
-    LONG_SUCCESS_LOW_RISK = "LONG_SUCCESS_LOW_RISK"
-    LONG_SUCCESS_HIGH_RISK = "LONG_SUCCESS_HIGH_RISK"
-    SHORT_SUCCESS_LOW_RISK = "SHORT_SUCCESS_LOW_RISK"
-    SHORT_SUCCESS_HIGH_RISK = "SHORT_SUCCESS_HIGH_RISK"
-    NO_TRADE_OR_FAIL = "NO_TRADE_OR_FAIL"
+    Three classes only.  The path-risk of a winning trade is *not* folded into
+    this target - it is a separate, dedicated signal (``risk_tier`` plus the
+    Risk model's ``target_risk_score``).  Collapsing direction to three balanced
+    classes makes it materially more learnable than the old five-way split whose
+    ``*_HIGH_RISK`` buckets were tiny and mostly noise.
+    """
+
+    LONG = "LONG"
+    SHORT = "SHORT"
+    NO_TRADE = "NO_TRADE"
 
 
 class RiskTier(str, Enum):
@@ -86,22 +97,16 @@ class TradeOutcome(str, Enum):
 
 #: Stable class ordering shared by the labeler and the Direction model.
 LABEL_ORDER: Final[tuple[str, ...]] = (
-    LabelClass.LONG_SUCCESS_LOW_RISK.value,
-    LabelClass.LONG_SUCCESS_HIGH_RISK.value,
-    LabelClass.SHORT_SUCCESS_LOW_RISK.value,
-    LabelClass.SHORT_SUCCESS_HIGH_RISK.value,
-    LabelClass.NO_TRADE_OR_FAIL.value,
+    LabelClass.LONG.value,
+    LabelClass.SHORT.value,
+    LabelClass.NO_TRADE.value,
 )
 
 LABEL_TO_INDEX: Final[dict[str, int]] = {name: index for index, name in enumerate(LABEL_ORDER)}
 
 #: Which labels represent a tradeable long / short opportunity.
-LONG_LABELS: Final[frozenset[str]] = frozenset(
-    {LabelClass.LONG_SUCCESS_LOW_RISK.value, LabelClass.LONG_SUCCESS_HIGH_RISK.value}
-)
-SHORT_LABELS: Final[frozenset[str]] = frozenset(
-    {LabelClass.SHORT_SUCCESS_LOW_RISK.value, LabelClass.SHORT_SUCCESS_HIGH_RISK.value}
-)
+LONG_LABELS: Final[frozenset[str]] = frozenset({LabelClass.LONG.value})
+SHORT_LABELS: Final[frozenset[str]] = frozenset({LabelClass.SHORT.value})
 
 _TIER_ORDER: Final[tuple[str, ...]] = (
     RiskTier.LOW.value,
@@ -209,7 +214,7 @@ class TradeLabeler:
 
         result["label"] = labels
         result["label_index"] = [LABEL_TO_INDEX.get(name, LABEL_TO_INDEX[
-            LabelClass.NO_TRADE_OR_FAIL.value
+            LabelClass.NO_TRADE.value
         ]) for name in labels]
         result["risk_tier"] = tiers
         result["label_is_valid"] = long_side.outcome != TradeOutcome.UNRESOLVED.value
@@ -461,7 +466,7 @@ class TradeLabeler:
            lower MAE ratio, i.e. the less painful path.
         3. The winner's tier is derived from its MAE ratio, then escalated by the
            volatility regime.  A ``VERY_HIGH`` tier collapses to
-           ``NO_TRADE_OR_FAIL`` when ``discard_very_high_risk`` is set.
+           ``NO_TRADE`` when ``discard_very_high_risk`` is set.
         """
         rows: int = long_side.outcome.size
         labels: list[str] = []
@@ -474,7 +479,7 @@ class TradeLabeler:
 
         for index in range(rows):
             if unresolved[index]:
-                labels.append(LabelClass.NO_TRADE_OR_FAIL.value)
+                labels.append(LabelClass.NO_TRADE.value)
                 tiers.append(RiskTier.NONE.value)
                 continue
 
@@ -494,7 +499,7 @@ class TradeLabeler:
                     take_long = False
 
             if not take_long and not take_short:
-                labels.append(LabelClass.NO_TRADE_OR_FAIL.value)
+                labels.append(LabelClass.NO_TRADE.value)
                 tiers.append(RiskTier.NONE.value)
                 continue
 
@@ -503,25 +508,19 @@ class TradeLabeler:
                 float(side.mae_ratio[index]), float(volatility_percentile[index])
             )
 
+            # The path-risk tier still drives the Risk model; a VERY_HIGH path is
+            # dropped from the *direction* target so the head is not taught to
+            # chase trades that only paid off through violence.
             if tier == RiskTier.VERY_HIGH.value and self._config.discard_very_high_risk:
-                labels.append(LabelClass.NO_TRADE_OR_FAIL.value)
+                labels.append(LabelClass.NO_TRADE.value)
                 tiers.append(tier)
                 continue
 
-            is_low_risk: bool = tier in (RiskTier.LOW.value, RiskTier.MEDIUM.value)
             if take_long:
-                labels.append(
-                    LabelClass.LONG_SUCCESS_LOW_RISK.value
-                    if is_low_risk
-                    else LabelClass.LONG_SUCCESS_HIGH_RISK.value
-                )
+                labels.append(LabelClass.LONG.value)
                 chosen[index] = 1
             else:
-                labels.append(
-                    LabelClass.SHORT_SUCCESS_LOW_RISK.value
-                    if is_low_risk
-                    else LabelClass.SHORT_SUCCESS_HIGH_RISK.value
-                )
+                labels.append(LabelClass.SHORT.value)
                 chosen[index] = -1
             tiers.append(tier)
 

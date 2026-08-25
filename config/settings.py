@@ -214,7 +214,7 @@ class LabelSettings(BaseModel):
     extreme_volatility_percentile: float = Field(default=0.95, gt=0.0, lt=1.0)
     high_volatility_percentile: float = Field(default=0.80, gt=0.0, lt=1.0)
 
-    #: Trades whose tier resolves to VERY_HIGH are folded into NO_TRADE_OR_FAIL.
+    #: Trades whose tier resolves to VERY_HIGH are folded into NO_TRADE.
     discard_very_high_risk: bool = Field(default=True)
 
 

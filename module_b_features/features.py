@@ -79,6 +79,12 @@ FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     "log_return_3",
     "log_return_12",
     "momentum_rank",
+    # --- higher timeframe (causal 1h/4h context on the 5m bars) -------------
+    "htf_ema_slope_1h",
+    "htf_ema_slope_4h",
+    "htf_close_vs_ema_4h",
+    "htf_return_4h",
+    "htf_trend_align",
     # --- volatility ---------------------------------------------------------
     "atr_pct",
     "garch_volatility",
@@ -165,6 +171,7 @@ class FeatureEngineer:
 
         try:
             frame = self._add_price_features(frame)
+            frame = self._add_higher_timeframe_features(frame)
             frame = self._add_volatility_features(frame)
             frame = self._add_volume_features(frame)
             frame = self._add_garch_features(frame)
@@ -224,6 +231,38 @@ class FeatureEngineer:
         rsi_values: pd.Series = ind.rsi(close, window=config.rsi_window)
         frame["rsi"] = rsi_values / 100.0
 
+        return frame
+
+    # ------------------------------------------------------------------
+    # Higher timeframe context
+    # ------------------------------------------------------------------
+    def _add_higher_timeframe_features(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Causal 1h / 4h trend and momentum, derived from the 5m close.
+
+        Everything here is a *trailing-window* statistic on the 5m series (12
+        bars == 1h, 48 bars == 4h), so bar ``t`` only ever sees bars ``<= t`` -
+        no resampling, no look-ahead.  These give the direction head the wider
+        trend the purely-5m indicators cannot see, which is where most of a 5m
+        directional edge actually comes from.
+        """
+        close: pd.Series = frame["close"].astype(float)
+        denom: pd.Series = close.replace(0.0, np.nan)
+        log_close: pd.Series = np.log(close.clip(lower=_EPSILON))
+
+        ema_1h: pd.Series = close.ewm(span=12, adjust=False, min_periods=12).mean()
+        ema_4h: pd.Series = close.ewm(span=48, adjust=False, min_periods=48).mean()
+
+        # Normalised EMA slopes: price-relative drift of the 1h and 4h trend.
+        slope_1h: pd.Series = ind.slope(ema_1h, window=3).div(denom)
+        slope_4h: pd.Series = ind.slope(ema_4h, window=6).div(denom)
+        frame["htf_ema_slope_1h"] = slope_1h
+        frame["htf_ema_slope_4h"] = slope_4h
+        frame["htf_close_vs_ema_4h"] = (close - ema_4h).div(denom)
+        frame["htf_return_4h"] = log_close.diff(48)
+        # +1 both trends up, -1 both down, 0 when the timeframes disagree.
+        frame["htf_trend_align"] = (
+            np.sign(slope_1h.fillna(0.0)) * np.sign(slope_4h.fillna(0.0))
+        )
         return frame
 
     # ------------------------------------------------------------------
