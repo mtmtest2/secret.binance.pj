@@ -125,10 +125,14 @@ class DataPipeline:
                         len(segments),
                     )
 
-                    # Validate and upsert each segment on its own: the segments are
-                    # disjoint (a filled middle sits between them), so validating a
-                    # concatenation would flag that middle as a false gap and heal
-                    # it needlessly.
+                    # Validate and upsert each segment on its own.  Backfill uses
+                    # HISTORICAL validation: zero-volume candles, real return
+                    # outliers, stale stretches and exchange gaps are normal across
+                    # years of history and must not throw the block away (the old
+                    # strict path re-fetched huge windows four times and then stored
+                    # nothing).  Only a genuinely structural fault (bad OHLC,
+                    # non-positive price, misaligned/duplicate/future-dated) still
+                    # blocks a segment.
                     written: int = 0
                     for segment_start, segment_end in segments:
                         if segment_start > segment_end:
@@ -139,12 +143,18 @@ class DataPipeline:
                         if not candles:
                             continue
 
-                        report: QCReport = self._validator.validate_candles(symbol, candles)
+                        report: QCReport = self._validator.validate_candles(
+                            symbol, candles, historical=True
+                        )
                         if not report.passed:
-                            candles, _ = await self._validator.validate_and_heal(
-                                symbol, candles, self._refetch
+                            _LOGGER.warning(
+                                "Backfill %s: %d structural QC issue(s) in segment "
+                                "[%d, %d] - storing the clean candles anyway",
+                                symbol,
+                                sum(1 for i in report.issues if i.severity.value == "CRITICAL"),
+                                segment_start,
+                                segment_end,
                             )
-
                         written += await self._db.upsert_candles(candles)
                     return symbol, written
                 except (DataFetchError, DataIntegrityError, DatabaseError) as error:

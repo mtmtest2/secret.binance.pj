@@ -75,12 +75,35 @@ class QCValidator:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def validate_candles(self, symbol: str, candles: Sequence[OHLCVCandle]) -> QCReport:
+    #: Anomalies that are a genuine part of multi-year crypto history (illiquid
+    #: alt candles with no volume, real flash pumps/crashes, exchange gaps).  On
+    #: a deep historical backfill these must not throw away the whole block; they
+    #: are downgraded to WARNING so the real data is stored.  Live cycles keep the
+    #: strict behaviour, where a glitchy *recent* candle should block trading.
+    _HISTORICAL_SOFT_CODES: frozenset[QCIssueCode] = frozenset(
+        {
+            QCIssueCode.EXCESSIVE_ZERO_VOLUME,
+            QCIssueCode.RETURN_OUTLIER,
+            QCIssueCode.STALE_DATA,
+            QCIssueCode.MISSING_CANDLES,
+        }
+    )
+
+    def validate_candles(
+        self,
+        symbol: str,
+        candles: Sequence[OHLCVCandle],
+        historical: bool = False,
+    ) -> QCReport:
         """Run the full check battery over a candle block.
 
         Args:
             symbol: Symbol the block belongs to (used for reporting only).
             candles: Candles in any order; the validator sorts defensively.
+            historical: When ``True`` (a deep backfill), anomalies that are normal
+                across years of history - zero-volume candles, real return
+                outliers, stale stretches and exchange gaps - are downgraded from
+                CRITICAL to WARNING so the block is kept instead of discarded.
 
         Returns:
             A :class:`QCReport`.  ``report.passed`` is ``False`` when at least one
@@ -139,6 +162,15 @@ class QCValidator:
                     healable=False,
                 )
             )
+
+        if historical:
+            issues = [
+                issue.model_copy(update={"severity": QCSeverity.WARNING})
+                if issue.severity is QCSeverity.CRITICAL
+                and issue.code in self._HISTORICAL_SOFT_CODES
+                else issue
+                for issue in issues
+            ]
 
         return QCReport(
             symbol=symbol,
