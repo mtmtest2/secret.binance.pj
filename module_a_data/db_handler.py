@@ -16,12 +16,13 @@ Design notes
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from types import TracebackType
 from typing import Any, Final, Sequence
 
 import pandas as pd
-from sqlalchemy import Select, delete, desc, func, select
+from sqlalchemy import Select, delete, desc, event, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Result
 from sqlalchemy.exc import SQLAlchemyError
@@ -66,6 +67,12 @@ class DatabaseHandler:
         self._settings: Settings = settings
         self._engine: AsyncEngine | None = None
         self._session_factory: async_sessionmaker[AsyncSession] | None = None
+        # SQLite allows a single writer at a time.  The bootstrap fans out over
+        # symbols while the 5m cycle also writes, so without serialisation the
+        # concurrent transactions collide with "database is locked".  One
+        # in-process write lock makes every write transaction serial (SQLite
+        # writes are serial anyway) and removes that whole class of failure.
+        self._write_lock: asyncio.Lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -76,12 +83,29 @@ class DatabaseHandler:
             return
 
         self._settings.db.path.parent.mkdir(parents=True, exist_ok=True)
+        busy_timeout_ms: int = self._settings.db.busy_timeout_ms
         self._engine = create_async_engine(
             self._settings.db.url,
             echo=self._settings.db.echo,
             future=True,
             pool_pre_ping=True,
+            # The busy timeout is a *per-connection* setting; passing it here
+            # applies it to every pooled connection, not just the init one, so a
+            # writer waits for the lock instead of erroring out immediately.
+            connect_args={"timeout": busy_timeout_ms / 1000.0},
         )
+
+        # Re-assert the pragmas on every physical connection the pool opens.
+        @event.listens_for(self._engine.sync_engine, "connect")
+        def _apply_pragmas(dbapi_connection: Any, _record: Any) -> None:
+            cursor = dbapi_connection.cursor()
+            try:
+                cursor.execute(f"PRAGMA busy_timeout={busy_timeout_ms};")
+                cursor.execute("PRAGMA foreign_keys=ON;")
+                cursor.execute("PRAGMA synchronous=NORMAL;")
+            finally:
+                cursor.close()
+
         self._session_factory = async_sessionmaker(
             bind=self._engine,
             expire_on_commit=False,
@@ -165,7 +189,7 @@ class DatabaseHandler:
         # outright.  Chunk the rows so every statement stays well under the limit.
         chunk_rows: int = 1_000
         try:
-            async with self._factory()() as session:
+            async with self._write_lock, self._factory()() as session:
                 async with session.begin():
                     for start in range(0, len(payload), chunk_rows):
                         chunk: list[dict[str, Any]] = payload[start : start + chunk_rows]
@@ -210,7 +234,7 @@ class DatabaseHandler:
             set_={key: statement.excluded[key] for key in values if key not in ("symbol", "timestamp")},
         )
         try:
-            async with self._factory()() as session:
+            async with self._write_lock, self._factory()() as session:
                 async with session.begin():
                     await session.execute(statement)
         except SQLAlchemyError as error:
@@ -243,7 +267,7 @@ class DatabaseHandler:
             },
         )
         try:
-            async with self._factory()() as session:
+            async with self._write_lock, self._factory()() as session:
                 async with session.begin():
                     await session.execute(statement)
         except SQLAlchemyError as error:
