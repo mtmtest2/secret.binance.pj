@@ -1,0 +1,3341 @@
+<!doctype html>
+<html dir="rtl" lang="fa">
+<head>
+<meta charset="utf-8">
+<title>گزارش کامل عملکرد کد</title>
+<style>
+  @page { size: A4; margin: 18mm 15mm 18mm 15mm; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: "DejaVu Sans", sans-serif;
+    font-size: 11.5px; line-height: 1.95; color: #1a2233; margin: 0;
+    text-align: justify;
+  }
+  code, pre, .ltr { font-family: "DejaVu Sans Mono", monospace; direction: ltr; unicode-bidi: embed; }
+  code { background: #eef2f8; padding: 1px 4px; border-radius: 3px; font-size: 10px; color: #123; }
+  pre {
+    background: #0f172a; color: #e2e8f0; padding: 10px 12px; border-radius: 6px;
+    font-size: 9.5px; line-height: 1.75; overflow-wrap: break-word; white-space: pre-wrap;
+    text-align: left; border-right: 4px solid #38bdf8;
+    direction: ltr; unicode-bidi: plaintext;
+  }
+  h1 { font-size: 26px; color: #0f172a; margin: 0 0 6px; line-height: 1.5; }
+  h2 {
+    font-size: 19px; color: #ffffff; background: #1e3a5f; padding: 8px 12px;
+    border-radius: 6px; margin: 0 0 14px; line-height: 1.6;
+    page-break-after: avoid; break-after: avoid;
+  }
+  h3 { font-size: 14.5px; color: #1e3a5f; margin: 18px 0 6px;
+       border-right: 5px solid #38bdf8; padding-right: 8px; line-height: 1.6;
+       page-break-after: avoid; break-after: avoid; }
+  h4 { font-size: 12.5px; color: #0e7490; margin: 13px 0 4px; line-height: 1.6;
+       page-break-after: avoid; break-after: avoid; }
+  p { margin: 6px 0; }
+  ul, ol { margin: 6px 0; padding-right: 22px; }
+  li { margin: 3px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 9px 0; font-size: 10px; }
+  th, td { border: 1px solid #c7d2e0; padding: 5px 7px; text-align: right; vertical-align: top; line-height: 1.7; }
+  th { background: #dbeafe; color: #12324f; font-weight: bold; }
+  tr:nth-child(even) td { background: #f6f9fc; }
+  .box { border-radius: 6px; padding: 9px 12px; margin: 10px 0; border-right: 5px solid; }
+  .simple { background: #ecfdf5; border-color: #10b981; }
+  .simple::before { content: "🧒 به زبان بچه‌گانه: "; font-weight: bold; color: #047857; }
+  .warn { background: #fff7ed; border-color: #f97316; }
+  .warn::before { content: "⚠️ هشدار: "; font-weight: bold; color: #c2410c; }
+  .note { background: #eff6ff; border-color: #3b82f6; }
+  .note::before { content: "📌 نکته: "; font-weight: bold; color: #1d4ed8; }
+  .why { background: #fdf4ff; border-color: #a855f7; }
+  .why::before { content: "❓ چرا این‌طوری؟ "; font-weight: bold; color: #7e22ce; }
+  .sec { page-break-before: always; break-before: page; }
+  .cover { text-align: center; padding-top: 70px; }
+  .cover .sub { color: #475569; font-size: 14px; margin-top: 6px; line-height: 2; }
+  .cover .meta { margin-top: 34px; font-size: 11px; color: #64748b; line-height: 2.2; }
+  .badge { display: inline-block; background: #1e3a5f; color: #fff; padding: 3px 10px;
+           border-radius: 12px; font-size: 10px; margin: 2px; }
+  .toc a { color: #1e3a5f; text-decoration: none; }
+  .toc td { line-height: 2; }
+  .step { background: #f8fafc; border: 1px solid #d7e0ec; border-radius: 6px;
+          padding: 8px 12px; margin: 8px 0; }
+  .step .num { display: inline-block; background: #1e3a5f; color: #fff; width: 22px;
+               height: 22px; border-radius: 50%; text-align: center; line-height: 22px;
+               font-size: 11px; margin-left: 6px; }
+  .flow { background:#0f172a; color:#e2e8f0; border-radius:6px; padding:10px;
+          font-family:"DejaVu Sans Mono", monospace; font-size:9px; line-height:1.75;
+          direction:ltr; unicode-bidi:embed; text-align:left;
+          white-space:pre; overflow-wrap:break-word; }
+  .kv { font-size:10px; }
+  hr { border: none; border-top: 1px dashed #c7d2e0; margin: 14px 0; }
+  .small { font-size: 9.5px; color: #64748b; }
+</style>
+</head>
+<body>
+
+<div class="cover">
+  <h1>گزارش کامل و مرحله‌به‌مرحلهٔ عملکرد کد</h1>
+  <div class="sub">
+    سیستم معامله‌گر هوش مصنوعی<br>
+    قراردادهای آتی دائمی USDT-M صرافی بایننس — تایم‌فریم ۵ دقیقه
+  </div>
+  <div style="margin-top:26px;">
+    <span class="badge">۳۹ فایل</span>
+    <span class="badge">۱۴٬۳۲۶ خط کد پایتون</span>
+    <span class="badge">۶ ماژول (A تا F)</span>
+    <span class="badge">۴ مدل یادگیری ماشین</span>
+    <span class="badge">۱۰ قانون تصمیم‌گیری</span>
+  </div>
+  <div class="meta">
+    مخزن: <span class="ltr">mtmtest2/secret.binance.pj</span><br>
+    شاخه: <span class="ltr">claude/code-operation-detailed-report-zwztu2</span><br>
+    این گزارش طوری نوشته شده که بدون هیچ دانش قبلی هم کاملاً قابل فهم باشد.
+  </div>
+</div>
+
+<div class="sec">
+<h2>فهرست مطالب</h2>
+<table class="toc">
+<tr><td width="8%">۰</td><td>این پروژه اصلاً چیست؟ (با یک مثال ساده)</td></tr>
+<tr><td>۱</td><td>نقشهٔ کلی سیستم — شش کارخانه پشت سر هم</td></tr>
+<tr><td>۲</td><td>ساختار پوشه‌ها و فایل‌ها — چه کسی چه‌کاره است</td></tr>
+<tr><td>۳</td><td>اتاق تنظیمات — <span class="ltr">config/settings.py</span></td></tr>
+<tr><td>۴</td><td>ابزارهای پایه — پوشهٔ <span class="ltr">core/</span></td></tr>
+<tr><td>۵</td><td>لحظهٔ روشن‌شدن سیستم — <span class="ltr">main.py</span></td></tr>
+<tr><td>۶</td><td>مرحلهٔ ۱: انتخاب ارزها (<span class="ltr">universe.py</span>)</td></tr>
+<tr><td>۷</td><td>مرحلهٔ ۲: جمع‌آوری داده از بایننس (<span class="ltr">fetcher.py</span>)</td></tr>
+<tr><td>۸</td><td>مرحلهٔ ۳: پلیس کیفیت داده (<span class="ltr">qc_validator.py</span>)</td></tr>
+<tr><td>۹</td><td>مرحلهٔ ۴: انبار داده — پایگاه‌دادهٔ <span class="ltr">SQLite</span></td></tr>
+<tr><td>۱۰</td><td>خط لولهٔ ماژول A (<span class="ltr">pipeline.py</span>) — پرکردن تاریخچه و چرخهٔ زنده</td></tr>
+<tr><td>۱۱</td><td>مرحلهٔ ۵: ساخت ویژگی‌ها (<span class="ltr">indicators.py</span> و <span class="ltr">features.py</span>)</td></tr>
+<tr><td>۱۲</td><td>مرحلهٔ ۶: معلمِ مدل — برچسب‌زنی (<span class="ltr">labeler.py</span>)</td></tr>
+<tr><td>۱۳</td><td>مرحلهٔ ۷: ساخت دفترچهٔ تمرین (<span class="ltr">processor.py</span>)</td></tr>
+<tr><td>۱۴</td><td>مرحلهٔ ۸: چهار مغز کوچک — مدل‌های یادگیری ماشین (<span class="ltr">ml_models.py</span>)</td></tr>
+<tr><td>۱۵</td><td>قراردادهای بین ماژول‌ها (<span class="ltr">schemas.py</span>)</td></tr>
+<tr><td>۱۶</td><td>مرحلهٔ ۹: قاضی نهایی — موتور تصمیم و ۱۰ قانون (<span class="ltr">decision_engine.py</span>)</td></tr>
+<tr><td>۱۷</td><td>مرحلهٔ ۱۰: اجرای معامله — کاغذی و واقعی</td></tr>
+<tr><td>۱۸</td><td>مرحلهٔ ۱۱: نگهبان ریسک و کلید قرمز (<span class="ltr">risk_guard.py</span>)</td></tr>
+<tr><td>۱۹</td><td>مرحلهٔ ۱۲: دفتر خاطرات سیستم (<span class="ltr">audit_engine.py</span>)</td></tr>
+<tr><td>۲۰</td><td>مرحلهٔ ۱۳: پنل وب و کنترل‌ها (<span class="ltr">web_app.py</span>)</td></tr>
+<tr><td>۲۱</td><td>بک‌تست — امتحان روی گذشته (<span class="ltr">backtester.py</span>)</td></tr>
+<tr><td>۲۲</td><td>یک چرخهٔ ۵ دقیقه‌ای کامل، ثانیه‌به‌ثانیه</td></tr>
+<tr><td>۲۳</td><td>چرخهٔ عمر سیستم و فازها</td></tr>
+<tr><td>۲۴</td><td>دستورهای خط فرمان</td></tr>
+<tr><td>۲۵</td><td>جدول‌های پایگاه داده</td></tr>
+<tr><td>۲۶</td><td>لایه‌های ایمنی — کجا جلوی فاجعه گرفته می‌شود</td></tr>
+<tr><td>۲۷</td><td>محدودیت‌ها و نقاط ضعف واقعی</td></tr>
+<tr><td>۲۸</td><td>واژه‌نامه</td></tr>
+<tr><td>۲۹</td><td>چک‌لیست راه‌اندازی و جمع‌بندی نهایی</td></tr>
+</table>
+</div>
+
+<div class="sec">
+<h2>۰. این پروژه اصلاً چیست؟</h2>
+
+<p>
+این پروژه یک <strong>ربات معامله‌گر خودکار</strong> است. کارش این است که هر ۵ دقیقه یک‌بار
+به بازار ارز دیجیتال (بخش «قراردادهای آتی دائمی» صرافی بایننس) نگاه کند، فکر کند،
+و تصمیم بگیرد که «الان بخرم؟ بفروشم؟ یا دست نگه دارم؟».
+</p>
+
+<div class="box simple">
+فرض کن یک آشپزخانهٔ خیلی بزرگ داری. هر ۵ دقیقه یک جعبه مواد اولیه از بازار می‌رسد.
+یک نفر مواد را بازرسی می‌کند که خراب نباشند، یک نفر آن‌ها را خرد و آماده می‌کند،
+چهار سرآشپز هر کدام یک نظر می‌دهند، یک مدیر همهٔ نظرها را می‌شنود و تصمیم نهایی را می‌گیرد،
+یک نفر غذا را سرو می‌کند، و یک نگهبان همیشه کنار در ایستاده تا اگر آتش‌سوزی شد
+همه‌چیز را خاموش کند. این پروژه دقیقاً همین آشپزخانه است — فقط به‌جای غذا، «معامله» تولید می‌کند.
+</div>
+
+<h3>۰-۱. چند تعریف پایه که باید بدانی</h3>
+
+<table>
+<tr><th width="22%">اصطلاح</th><th>یعنی چه؟</th></tr>
+<tr><td>کندل (Candle)</td>
+    <td>خلاصهٔ قیمت در یک بازهٔ زمانی. هر کندل ۵ دقیقه‌ای ۵ عدد دارد:
+        قیمت باز شدن (<span class="ltr">open</span>)، بالاترین قیمت (<span class="ltr">high</span>)،
+        پایین‌ترین قیمت (<span class="ltr">low</span>)، قیمت بسته شدن (<span class="ltr">close</span>)
+        و حجم معاملات (<span class="ltr">volume</span>).</td></tr>
+<tr><td>لانگ (Long)</td>
+    <td>شرط‌بندی روی بالا رفتن قیمت. می‌خری، گران‌تر می‌فروشی.</td></tr>
+<tr><td>شورت (Short)</td>
+    <td>شرط‌بندی روی پایین آمدن قیمت. در بازار آتی می‌توانی چیزی را که نداری بفروشی
+        و بعداً ارزان‌تر پس بخری.</td></tr>
+<tr><td>اهرم (Leverage)</td>
+    <td>وام گرفتن از صرافی. با ۱۰۰ دلار و اهرم ۵، مثل این است که ۵۰۰ دلار معامله می‌کنی.
+        سود ۵ برابر، ضرر هم ۵ برابر. در این سیستم سقف اهرم <strong>۱۰</strong> است.</td></tr>
+<tr><td>حد سود (TP)</td>
+    <td>قیمتی که اگر بازار به آن رسید، معامله را با سود می‌بندیم.</td></tr>
+<tr><td>حد ضرر (SL)</td>
+    <td>قیمتی که اگر بازار به آن رسید، معامله را با ضرر کم می‌بندیم تا ضرر بزرگ نشود.</td></tr>
+<tr><td>لیکوئید شدن</td>
+    <td>وقتی ضرر آن‌قدر زیاد شود که پول ودیعهٔ تو تمام شود، صرافی به‌زور معامله را می‌بندد
+        و کل آن پول از بین می‌رود.</td></tr>
+<tr><td>فاندینگ (Funding)</td>
+    <td>در بازار آتی دائمی، هر ۸ ساعت یک‌بار یک طرف (لانگ‌ها یا شورت‌ها) به طرف دیگر
+        مبلغ کوچکی می‌پردازد. این یک هزینهٔ واقعی است.</td></tr>
+<tr><td>اسلیپیج (Slippage)</td>
+    <td>فرق بین قیمتی که انتظار داشتی و قیمتی که واقعاً معامله شد. همیشه به ضرر توست.</td></tr>
+<tr><td>کارمزد (Fee)</td>
+    <td>سهم صرافی از هر معامله. اینجا ۰٫۰۵٪ برای سفارش بازار (<span class="ltr">taker</span>)
+        و ۰٫۰۲٪ برای سفارش محدود (<span class="ltr">maker</span>).</td></tr>
+</table>
+
+<h3>۰-۲. سه جملهٔ مهم دربارهٔ فلسفهٔ این کد</h3>
+
+<div class="step"><span class="num">۱</span>
+<strong>هیچ‌وقت روی دادهٔ خراب معامله نکن.</strong> اگر دادهٔ یک ارز مشکوک بود،
+سیستم آن ارز را برای آن چرخه کاملاً کنار می‌گذارد. هرگز عدد جعلی نمی‌سازد.
+</div>
+
+<div class="step"><span class="num">۲</span>
+<strong>هیچ‌وقت از آینده خبر نداشته باش.</strong> همهٔ محاسبات فقط از داده‌های
+«تا همین لحظه» استفاده می‌کنند. این را در متن کد «علّی بودن» یا
+<span class="ltr">causality</span> می‌گویند و مهم‌ترین قانون کل پروژه است.
+</div>
+
+<div class="step"><span class="num">۳</span>
+<strong>هیچ‌وقت خودت شروع نکن.</strong> ربات تا وقتی که آدم دکمهٔ «شروع» را نزند،
+حتی یک معامله هم انجام نمی‌دهد. فقط داده جمع می‌کند و آماده می‌ماند.
+</div>
+
+<div class="box warn">
+این نرم‌افزار <strong>تضمین سودآوری ندارد</strong>. خودِ فایل <span class="ltr">README</span>
+پروژه می‌گوید در تست خارج-از-نمونه (روی دادهٔ ندیده) نرخ برد <strong>۰٪</strong> بوده است.
+مدل‌ها همراه پروژه نمی‌آیند؛ تو باید خودت روی دادهٔ خودت آموزششان بدهی.
+معاملهٔ اهرمی می‌تواند کل سرمایه را نابود کند.
+</div>
+</div>
+
+<div class="sec">
+<h2>۱. نقشهٔ کلی سیستم — شش کارخانه پشت سر هم</h2>
+
+<p>
+کل پروژه به شش بخش تقسیم شده که به آن‌ها «ماژول» می‌گوییم و با حروف
+<strong>A</strong> تا <strong>F</strong> نام‌گذاری شده‌اند. داده مثل یک نوار نقاله
+از A شروع می‌شود و تا E می‌رود، و F همهٔ مسیر را تماشا و ثبت می‌کند.
+</p>
+
+<div class="flow">
+        +-----------------------------------------------------+
+        |   main.py  =  ⁨زمان‌بند ۵ دقیقه‌ای⁩  +  ⁨سرور وب⁩        |
+        +--------------------------+--------------------------+
+                                   |  (⁨یک حلقهٔ رویداد⁩ asyncio)
+  +----------+   +----------+   +--+-------+   +----------+   +----------+
+  | ⁨ماژول⁩ A  |-->| ⁨ماژول⁩ B  |-->| ⁨ماژول⁩ C  |-->| ⁨ماژول⁩ D  |-->| ⁨ماژول⁩ E  |
+  | ⁨داده⁩+QC  |   | ⁨ویژگی⁩ +  |   | ⁨۴ مدل⁩    |   | ⁨موتور⁩    |   | ⁨اجرا⁩ +   |
+  |          |   | ⁨برچسب⁩    |   | ML       |   | ⁨تصمیم⁩    |   | ⁨ریسک⁩     |
+  +----+-----+   +----------+   +----------+   +----+-----+   +----+-----+
+       |                                            |              |
+       +---------------->  SQLite  <----------------+--------------+
+                             ^
+                  +----------+-----------+
+                  |  ⁨ماژول⁩ F: ⁨ثبت وقایع⁩  |
+                  |     +  ⁨پنل وب⁩        |
+                  +----------------------+
+</div>
+
+<table>
+<tr><th width="9%">ماژول</th><th width="24%">پوشه</th><th>مسئولیت (به زبان ساده)</th></tr>
+<tr><td><strong>A</strong></td><td><span class="ltr">module_a_data/</span></td>
+    <td>«مأمور خرید و بازرس». از بایننس داده می‌گیرد، کیفیتش را چک می‌کند،
+        خرابی‌ها را تعمیر می‌کند و در انبار (پایگاه داده) می‌گذارد.</td></tr>
+<tr><td><strong>B</strong></td><td><span class="ltr">module_b_features/</span></td>
+    <td>«آشپز آماده‌سازی». از قیمت خام، ۲۶ عدد معنی‌دار می‌سازد
+        (روند، نوسان، مومنتوم، رژیم بازار) و برای آموزش، جواب‌های درست را هم تولید می‌کند.</td></tr>
+<tr><td><strong>C</strong></td><td><span class="ltr">module_c_ml/ml_models.py</span></td>
+    <td>«چهار سرآشپز». چهار مدل مستقل که هرکدام فقط به یک سؤال جواب می‌دهند:
+        کجا؟ کِی؟ چگونه؟ چقدر؟</td></tr>
+<tr><td><strong>D</strong></td><td><span class="ltr">module_c_ml/decision_engine.py</span></td>
+    <td>«مدیر/قاضی». هیچ هوش مصنوعی ندارد. فقط ۱۰ قانون سفت‌وسخت را یکی‌یکی چک می‌کند.
+        اولین قانونی که رد شود، کار تمام است.</td></tr>
+<tr><td><strong>E</strong></td><td><span class="ltr">module_e_execution/</span></td>
+    <td>«پیشخدمت + نگهبان». سفارش را به صرافی می‌فرستد (یا شبیه‌سازی می‌کند)،
+        و نگهبان ریسک می‌تواند همه‌چیز را متوقف کند.</td></tr>
+<tr><td><strong>F</strong></td><td><span class="ltr">module_f_panel/</span></td>
+    <td>«دفتردار + اتاق کنترل». هر تصمیم را ثبت می‌کند و یک صفحهٔ وب می‌سازد
+        که تو با آن سیستم را می‌بینی و کنترل می‌کنی.</td></tr>
+</table>
+
+<div class="box note">
+ماژول‌ها فقط از طریق «قراردادهای اعتبارسنجی‌شده» با هم حرف می‌زنند
+(کلاس‌های <span class="ltr">Pydantic</span> در فایل <span class="ltr">schemas.py</span>).
+یعنی هیچ ماژولی نمی‌تواند به دیگری داده‌ی بی‌معنی بدهد — چون در همان لحظهٔ ساخت
+داده، قوانین بررسی می‌شوند و اگر خطا باشد برنامه فریاد می‌زند.
+</div>
+</div>
+
+<div class="sec">
+<h2>۲. ساختار پوشه‌ها و فایل‌ها — چه کسی چه‌کاره است</h2>
+
+<p>پروژه ۳۹ فایل دارد. جدول زیر <strong>همهٔ</strong> آن‌ها را با تعداد خط و وظیفه فهرست می‌کند.</p>
+
+<h3>ریشهٔ پروژه</h3>
+<table>
+<tr><th width="26%">فایل</th><th width="9%">خط</th><th>وظیفه</th></tr>
+<tr><td><span class="ltr">main.py</span></td><td>۱۱۳۶</td>
+    <td>ارکستر اصلی. همهٔ ماژول‌ها را می‌سازد، زمان‌بند ۵ دقیقه‌ای و سرور وب را اجرا می‌کند،
+        و چرخهٔ معاملاتی را می‌گرداند. کلاس اصلی: <span class="ltr">TradingSystem</span>.</td></tr>
+<tr><td><span class="ltr">requirements.txt</span></td><td>۳۸</td>
+    <td>فهرست کتابخانه‌های لازم: <span class="ltr">ccxt، pandas، numpy، lightgbm، xgboost،
+        hmmlearn، arch، fastapi، uvicorn، SQLAlchemy، aiosqlite، APScheduler</span>.</td></tr>
+<tr><td><span class="ltr">.env.example</span></td><td>—</td>
+    <td>نمونهٔ فایل تنظیمات. کپی می‌کنی به <span class="ltr">.env</span> و مقدارها را عوض می‌کنی.</td></tr>
+<tr><td><span class="ltr">.gitignore</span></td><td>—</td>
+    <td>می‌گوید کدام فایل‌ها در گیت ذخیره نشوند: <span class="ltr">data/, logs/, artifacts/,
+        *.db, *.joblib, .env</span> — یعنی پایگاه داده، مدل‌ها و کلیدهای API هرگز
+        روی گیت‌هاب نمی‌روند.</td></tr>
+<tr><td><span class="ltr">README.md</span></td><td>—</td>
+    <td>راهنمای انگلیسی پروژه.</td></tr>
+</table>
+
+<h3>پوشهٔ <span class="ltr">config/</span> — تنظیمات</h3>
+<table>
+<tr><th width="26%">فایل</th><th width="9%">خط</th><th>وظیفه</th></tr>
+<tr><td><span class="ltr">settings.py</span></td><td>۴۲۴</td>
+    <td>تمام عددهای قابل تنظیم پروژه در ۱۲ گروه. هیچ فایل دیگری اجازه ندارد
+        عدد جادویی داشته باشد.</td></tr>
+<tr><td><span class="ltr">__init__.py</span></td><td>۷</td><td>فقط برای شناسایی پوشه به‌عنوان پکیج.</td></tr>
+</table>
+
+<h3>پوشهٔ <span class="ltr">core/</span> — ابزارهای مشترک</h3>
+<table>
+<tr><th width="26%">فایل</th><th width="9%">خط</th><th>وظیفه</th></tr>
+<tr><td><span class="ltr">exceptions.py</span></td><td>۷۳</td>
+    <td>۱۲ نوع خطای اختصاصی (خطای داده، خطای مدل، خطای اجرا و ...).</td></tr>
+<tr><td><span class="ltr">logger.py</span></td><td>۱۰۳</td>
+    <td>سیستم ثبت لاگ + یک حافظهٔ حلقوی ۸۰۰ خطی که پنل وب از آن می‌خواند.</td></tr>
+<tr><td><span class="ltr">utils.py</span></td><td>۱۹۲</td>
+    <td>توابع کوچک: کار با زمان، عدد امن، تأخیر نمایی برای تلاش مجدد.</td></tr>
+</table>
+
+<h3>ماژول A — <span class="ltr">module_a_data/</span></h3>
+<table>
+<tr><th width="26%">فایل</th><th width="9%">خط</th><th>وظیفه</th></tr>
+<tr><td><span class="ltr">models.py</span></td><td>۳۲۰</td>
+    <td>قالب‌های سختگیرانهٔ داده: کندل، اسنپ‌شات دفتر سفارش، متریک‌های آتی، گزارش کیفیت.</td></tr>
+<tr><td><span class="ltr">fetcher.py</span></td><td>۵۵۸</td>
+    <td>ارتباط با بایننس از طریق کتابخانهٔ <span class="ltr">ccxt</span> با تلاش مجدد و محدودکنندهٔ همزمانی.</td></tr>
+<tr><td><span class="ltr">qc_validator.py</span></td><td>۷۲۴</td>
+    <td>پلیس کیفیت. ۴ خانواده بررسی + تعمیر خودکار داده.</td></tr>
+<tr><td><span class="ltr">db_models.py</span></td><td>۲۳۴</td>
+    <td>تعریف ۶ جدول پایگاه داده.</td></tr>
+<tr><td><span class="ltr">db_handler.py</span></td><td>۶۷۴</td>
+    <td>همهٔ عملیات خواندن/نوشتن پایگاه داده، کاملاً غیرهمزمان.</td></tr>
+<tr><td><span class="ltr">pipeline.py</span></td><td>۳۲۵</td>
+    <td>هماهنگ‌کنندهٔ ماژول A: گرفتن ← اعتبارسنجی ← تعمیر ← ذخیره.</td></tr>
+<tr><td><span class="ltr">universe.py</span></td><td>۴۸۸</td>
+    <td>کشف و غربال ارزها + ذخیرهٔ انتخاب کاربر.</td></tr>
+</table>
+
+<h3>ماژول B — <span class="ltr">module_b_features/</span></h3>
+<table>
+<tr><th width="26%">فایل</th><th width="9%">خط</th><th>وظیفه</th></tr>
+<tr><td><span class="ltr">indicators.py</span></td><td>۲۶۴</td>
+    <td>اندیکاتورهای پایه از صفر نوشته‌شده: <span class="ltr">ATR، RSI، KAMA، FDI، ADX،
+        Bollinger</span>، رتبهٔ درصدی، z-score، شیب.</td></tr>
+<tr><td><span class="ltr">features.py</span></td><td>۹۸۹</td>
+    <td>ساخت ۲۶ ویژگی نهایی + مدل‌های <span class="ltr">GARCH</span> و <span class="ltr">HMM</span>.</td></tr>
+<tr><td><span class="ltr">labeler.py</span></td><td>۶۱۸</td>
+    <td>«معلم»: با نگاه به آینده جواب درست را می‌سازد (فقط برای آموزش).</td></tr>
+<tr><td><span class="ltr">processor.py</span></td><td>۴۱۶</td>
+    <td>ترکیب همه‌چیز در یک دیتاست تمیز برای آموزش، یا یک ردیف برای پیش‌بینی زنده.</td></tr>
+</table>
+
+<h3>ماژول C و D — <span class="ltr">module_c_ml/</span></h3>
+<table>
+<tr><th width="26%">فایل</th><th width="9%">خط</th><th>وظیفه</th></tr>
+<tr><td><span class="ltr">schemas.py</span></td><td>۳۳۵</td>
+    <td>قراردادهای بین ماژول‌ها. «کمرباریک» سیستم.</td></tr>
+<tr><td><span class="ltr">ml_models.py</span></td><td>۱۱۳۲</td>
+    <td>چهار مدل + زیرسیستم مدیریت آن‌ها (آموزش، ذخیره، بارگذاری، پیش‌بینی).</td></tr>
+<tr><td><span class="ltr">decision_engine.py</span></td><td>۵۵۷</td>
+    <td>موتور تصمیم با ۱۰ قانون. تنها تولیدکنندهٔ سیگنال معاملاتی.</td></tr>
+</table>
+
+<h3>ماژول E — <span class="ltr">module_e_execution/</span></h3>
+<table>
+<tr><th width="26%">فایل</th><th width="9%">خط</th><th>وظیفه</th></tr>
+<tr><td><span class="ltr">models.py</span></td><td>۳۵۹</td>
+    <td>ساختار «موقعیت باز»، وضعیت حساب، گزارش اجرا. ریاضیات سود/زیان اینجاست.</td></tr>
+<tr><td><span class="ltr">risk_guard.py</span></td><td>۴۲۴</td>
+    <td>نگهبان ریسک: ماشین حالت سبز/زرد/قرمز + کلید قرمز.</td></tr>
+<tr><td><span class="ltr">executor.py</span></td><td>۸۳۹</td>
+    <td>اجرای واقعی روی بایننس با پول واقعی.</td></tr>
+<tr><td><span class="ltr">paper_trader.py</span></td><td>۵۵۵</td>
+    <td>اجرای کاغذی (شبیه‌سازی) با همان رابط دقیق.</td></tr>
+<tr><td><span class="ltr">backtester.py</span></td><td>۶۶۴</td>
+    <td>پخش مجدد تاریخچه برای سنجش عملکرد.</td></tr>
+</table>
+
+<h3>ماژول F — <span class="ltr">module_f_panel/</span></h3>
+<table>
+<tr><th width="26%">فایل</th><th width="9%">خط</th><th>وظیفه</th></tr>
+<tr><td><span class="ltr">audit_engine.py</span></td><td>۳۷۵</td>
+    <td>ثبت هر تصمیم (حتی «معامله نکن») در پایگاه داده به‌صورت دسته‌ای.</td></tr>
+<tr><td><span class="ltr">setup_state.py</span></td><td>۱۳۲</td>
+    <td>تعریف فازهای سیستم و نوار پیشرفت راه‌اندازی.</td></tr>
+<tr><td><span class="ltr">web_app.py</span></td><td>۴۴۶</td>
+    <td>سرور <span class="ltr">FastAPI</span>: ۴ صفحهٔ HTML + حدود ۱۵ نقطهٔ API.</td></tr>
+<tr><td><span class="ltr">templates.py</span></td><td>۷۹۲</td>
+    <td>قالب‌های HTML/JS پنل، همه داخل خود فایل پایتون (بدون پوشهٔ static).</td></tr>
+</table>
+</div>
+
+<div class="sec">
+<h2>۳. اتاق تنظیمات — <span class="ltr">config/settings.py</span></h2>
+
+<div class="box simple">
+این فایل مثل «تابلوی کلیدهای برق» یک ساختمان است. همهٔ کلیدها اینجا جمع شده‌اند.
+اگر بخواهی چیزی را عوض کنی، فقط اینجا (یا در فایل <span class="ltr">.env</span>)
+دست می‌زنی — نه در دل کد.
+</div>
+
+<h3>۳-۱. تنظیمات از کجا خوانده می‌شود؟</h3>
+<p>سه لایه، از ضعیف به قوی:</p>
+<ol>
+<li>مقدارهای پیش‌فرض که در خود همین فایل نوشته شده‌اند.</li>
+<li>فایل <span class="ltr">.env</span> در ریشهٔ پروژه.</li>
+<li>متغیرهای محیطی واقعی سیستم‌عامل (قوی‌ترین).</li>
+</ol>
+<p>
+برای تنظیمات تودرتو از دو زیرخط استفاده می‌شود. مثلاً برای تغییر حداقل اطمینان جهت:
+</p>
+<pre>DECISION__MIN_DIRECTION_CONFIDENCE=0.72
+RISK__MAX_LEVERAGE=5</pre>
+
+<h3>۳-۲. دوازده گروه تنظیمات</h3>
+
+<h4>۱) <span class="ltr">ExchangeSettings</span> — اتصال به صرافی</h4>
+<table>
+<tr><th width="34%">کلید</th><th width="14%">پیش‌فرض</th><th>معنی</th></tr>
+<tr><td><span class="ltr">api_key / api_secret</span></td><td>خالی</td><td>کلیدهای بایننس. برای کاغذی لازم نیست.</td></tr>
+<tr><td><span class="ltr">testnet</span></td><td>true</td><td>true یعنی شبکهٔ آزمایشی (پول تقلبی). برای پول واقعی باید false شود.</td></tr>
+<tr><td><span class="ltr">request_timeout_ms</span></td><td>۲۰۰۰۰</td><td>حداکثر ۲۰ ثانیه انتظار برای هر درخواست.</td></tr>
+<tr><td><span class="ltr">max_retries</span></td><td>۵</td><td>هر درخواست ناموفق تا ۵ بار تکرار می‌شود.</td></tr>
+<tr><td><span class="ltr">backoff_base/max_seconds</span></td><td>۱ / ۶۰</td><td>تأخیر بین تلاش‌ها: ۱، ۲، ۴، ۸ ثانیه… تا سقف ۶۰.</td></tr>
+<tr><td><span class="ltr">backoff_jitter</span></td><td>۰٫۲۵</td><td>±۲۵٪ نویز تصادفی روی تأخیر، تا همهٔ درخواست‌ها همزمان دوباره نروند.</td></tr>
+<tr><td><span class="ltr">max_concurrent_requests</span></td><td>۸</td><td>حداکثر ۸ درخواست همزمان — تا بایننس ما را بلاک نکند.</td></tr>
+</table>
+
+<h4>۲) <span class="ltr">DataSettings</span> — داده</h4>
+<table>
+<tr><th width="34%">کلید</th><th width="14%">پیش‌فرض</th><th>معنی</th></tr>
+<tr><td><span class="ltr">timeframe</span></td><td>5m</td><td>تایم‌فریم ثابت ۵ دقیقه.</td></tr>
+<tr><td><span class="ltr">timeframe_ms</span></td><td>۳۰۰۰۰۰</td><td>۵ دقیقه به میلی‌ثانیه. کل سیستم با میلی‌ثانیه کار می‌کند.</td></tr>
+<tr><td><span class="ltr">ohlcv_limit</span></td><td>۱۵۰۰</td><td>حداکثر کندل در هر درخواست (سقف خود بایننس).</td></tr>
+<tr><td><span class="ltr">history_bootstrap_candles</span></td><td>۲۱۰۲۴۰</td><td>عمق تاریخچه = ۲ سال (۲ × ۳۶۵ × ۲۸۸ کندل).</td></tr>
+<tr><td><span class="ltr">drop_unclosed_candle</span></td><td>true</td><td>کندل نیمه‌تمام حذف می‌شود؛ فقط کندل‌های بسته‌شده معتبرند.</td></tr>
+<tr><td><span class="ltr">cycle_second_offset</span></td><td>۱۰</td><td>چرخه در ثانیهٔ ۱۰ هر ۵ دقیقه اجرا می‌شود، نه ثانیهٔ صفر.</td></tr>
+</table>
+<div class="box why">
+چرا ثانیهٔ ۱۰ و نه صفر؟ چون درست در ثانیهٔ ۰۰:۰۰ خود بایننس هنوز مشغول بستن کندل است.
+اگر دقیقاً همان لحظه بپرسی، آخرین کندل را به تو نمی‌دهد و یک ردیف کم می‌آوری.
+۱۰ ثانیه صبر کردن این مشکل را کاملاً حل می‌کند.
+</div>
+
+<h4>۳) <span class="ltr">UniverseSettings</span> — غربال ارزها</h4>
+<table>
+<tr><th width="34%">کلید</th><th width="14%">پیش‌فرض</th><th>معنی</th></tr>
+<tr><td><span class="ltr">target_count</span></td><td>۳۰</td><td>دکمهٔ «پیشنهاد» چند ارز را تیک بزند.</td></tr>
+<tr><td><span class="ltr">min_quote_volume_24h</span></td><td>۵۰ میلیون</td><td>حداقل حجم معاملات ۲۴ ساعته به USDT.</td></tr>
+<tr><td><span class="ltr">max_spread_bps</span></td><td>۶</td><td>حداکثر فاصلهٔ خرید/فروش، برحسب «پایه» (۶ پایه = ۰٫۰۶٪).</td></tr>
+<tr><td><span class="ltr">min_history_days</span></td><td>۹۰</td><td>ارز باید حداقل ۹۰ روز از لیست‌شدنش گذشته باشد.</td></tr>
+<tr><td><span class="ltr">reference_equity</span></td><td>۱۰۰۰</td><td>اندازهٔ حساب مرجع برای غربال «تناسب با سرمایهٔ کوچک».</td></tr>
+<tr><td><span class="ltr">max_granularity_fraction</span></td><td>۰٫۲۵</td><td>هزینهٔ یک «پله» از مقدار سفارش نباید از ۲۵٪ کوچک‌ترین پوزیشن بیشتر باشد.</td></tr>
+<tr><td><span class="ltr">discovery_cache_seconds</span></td><td>۹۰۰</td><td>لیست ارزها ۱۵ دقیقه کش می‌شود.</td></tr>
+<tr><td><span class="ltr">weight_*</span></td><td>۰٫۴۵ / ۰٫۲۵ / ۰٫۲۰ / ۰٫۱۰</td><td>وزن نقدشوندگی، اسپرد، مقرون‌به‌صرفه‌بودن و تاریخچه در امتیازدهی.</td></tr>
+</table>
+
+<h4>۴) <span class="ltr">QCSettings</span> — کنترل کیفیت</h4>
+<table>
+<tr><th width="34%">کلید</th><th width="14%">پیش‌فرض</th><th>معنی</th></tr>
+<tr><td><span class="ltr">max_heal_attempts</span></td><td>۴</td><td>حداکثر ۴ بار تلاش برای تعمیر دادهٔ خراب.</td></tr>
+<tr><td><span class="ltr">heal_backoff_seconds</span></td><td>۲</td><td>تأخیر پایهٔ بین تلاش‌های تعمیر.</td></tr>
+<tr><td><span class="ltr">volume_spike_median_multiple</span></td><td>۵۰</td><td>حجم بیش از ۵۰ برابر میانه = مشکوک.</td></tr>
+<tr><td><span class="ltr">return_mad_zscore_limit</span></td><td>۱۴</td><td>سقف z-score مقاوم برای بازدهی.</td></tr>
+<tr><td><span class="ltr">max_abs_candle_return</span></td><td>۰٫۳۵</td><td>هیچ کندل ۵ دقیقه‌ای نباید بیش از ۳۵٪ حرکت کند.</td></tr>
+<tr><td><span class="ltr">max_zero_volume_ratio</span></td><td>۰٫۲۵</td><td>بیش از ۲۵٪ کندل با حجم صفر = فید مرده.</td></tr>
+<tr><td><span class="ltr">max_lag_bars</span></td><td>۳</td><td>آخرین کندل نباید بیش از ۳ کندل عقب باشد.</td></tr>
+<tr><td><span class="ltr">min_rows_for_statistics</span></td><td>۳۰</td><td>زیر ۳۰ ردیف، آزمون‌های آماری اجرا نمی‌شوند.</td></tr>
+</table>
+
+<h4>۵) <span class="ltr">FeatureSettings</span> — پارامترهای ویژگی‌سازی</h4>
+<table>
+<tr><th width="34%">کلید</th><th width="14%">پیش‌فرض</th><th>معنی</th></tr>
+<tr><td><span class="ltr">kama_window / fast / slow</span></td><td>۱۰ / ۲ / ۳۰</td><td>پنجره و سرعت‌های میانگین متحرک تطبیقی.</td></tr>
+<tr><td><span class="ltr">fdi_window</span></td><td>۳۰</td><td>پنجرهٔ بُعد فراکتالی.</td></tr>
+<tr><td><span class="ltr">atr / rsi / adx_window</span></td><td>۱۴</td><td>پنجره‌های کلاسیک ۱۴ کندلی.</td></tr>
+<tr><td><span class="ltr">garch_window / refit_every</span></td><td>۵۰۰ / ۵۰</td><td>GARCH روی ۵۰۰ کندل اخیر، هر ۵۰ کندل دوباره برازش می‌شود.</td></tr>
+<tr><td><span class="ltr">hmm_states / window / refit_every</span></td><td>۴ / ۱۰۰۰ / ۱۰۰</td><td>۴ رژیم بازار، پنجرهٔ ۱۰۰۰ کندلی، برازش مجدد هر ۱۰۰ کندل.</td></tr>
+<tr><td><span class="ltr">hmm_seed</span></td><td>۴۲</td><td>بذر تصادفی ثابت ← نتیجه همیشه تکرارپذیر است.</td></tr>
+<tr><td><span class="ltr">rank_window</span></td><td>۲۸۸</td><td>۲۸۸ کندل ۵ دقیقه‌ای = دقیقاً ۲۴ ساعت.</td></tr>
+<tr><td><span class="ltr">max_feature_workers</span></td><td>۴</td><td>حداکثر ۴ ارز همزمان ویژگی‌سازی شوند.</td></tr>
+</table>
+
+<h4>۶) <span class="ltr">LabelSettings</span> — برچسب‌زنی</h4>
+<table>
+<tr><th width="34%">کلید</th><th width="14%">پیش‌فرض</th><th>معنی</th></tr>
+<tr><td><span class="ltr">tp_atr_multiple</span></td><td>۲٫۰</td><td>حد سود = ۲ برابر ATR.</td></tr>
+<tr><td><span class="ltr">sl_atr_multiple</span></td><td>۱٫۰</td><td>حد ضرر = ۱ برابر ATR. یعنی نسبت پاداش/ریسک هدف ۲:۱.</td></tr>
+<tr><td><span class="ltr">max_holding_bars</span></td><td>۴۸</td><td>حداکثر ۴۸ کندل = ۴ ساعت نگهداری.</td></tr>
+<tr><td><span class="ltr">low/medium/high_risk_mae_ratio</span></td><td>۰٫۳۵ / ۰٫۶۰ / ۰٫۸۵</td><td>مرزهای طبقه‌بندی «درد مسیر» معامله.</td></tr>
+<tr><td><span class="ltr">extreme/high_volatility_percentile</span></td><td>۰٫۹۵ / ۰٫۸۰</td><td>صدک نوسان برای تشدید ردهٔ ریسک.</td></tr>
+<tr><td><span class="ltr">discard_very_high_risk</span></td><td>true</td><td>معاملات با ریسک خیلی بالا به «معامله نکن» تبدیل می‌شوند.</td></tr>
+</table>
+
+<h4>۷) <span class="ltr">MLSettings</span> — یادگیری ماشین</h4>
+<table>
+<tr><th width="34%">کلید</th><th width="14%">پیش‌فرض</th><th>معنی</th></tr>
+<tr><td><span class="ltr">model_dir</span></td><td><span class="ltr">artifacts/models</span></td><td>محل ذخیرهٔ فایل‌های مدل.</td></tr>
+<tr><td><span class="ltr">booster</span></td><td>lightgbm</td><td>الگوریتم: LightGBM (یا XGBoost).</td></tr>
+<tr><td><span class="ltr">n_estimators</span></td><td>۴۰۰</td><td>تعداد درخت‌ها.</td></tr>
+<tr><td><span class="ltr">learning_rate</span></td><td>۰٫۰۵</td><td>سرعت یادگیری (کم = محتاط).</td></tr>
+<tr><td><span class="ltr">max_depth / num_leaves</span></td><td>۶ / ۶۳</td><td>عمق و پیچیدگی درخت‌ها.</td></tr>
+<tr><td><span class="ltr">subsample / colsample</span></td><td>۰٫۸۵</td><td>هر درخت ۸۵٪ ردیف‌ها و ۸۵٪ ستون‌ها را می‌بیند (ضدِ حفظ‌کردن).</td></tr>
+<tr><td><span class="ltr">validation_fraction</span></td><td>۰٫۲</td><td>۲۰٪ انتهایی داده برای آزمون کنار گذاشته می‌شود.</td></tr>
+<tr><td><span class="ltr">purge_bars</span></td><td>۶۰</td><td>۶۰ کندل بین آموزش و آزمون حذف می‌شود (خیلی مهم — بخش ۱۳).</td></tr>
+<tr><td><span class="ltr">early_stopping_rounds</span></td><td>۵۰</td><td>اگر ۵۰ دور پیاپی بهتر نشد، آموزش را قطع کن.</td></tr>
+</table>
+
+<h4>۸) <span class="ltr">DecisionSettings</span> — آستانه‌های موتور تصمیم</h4>
+<table>
+<tr><th width="34%">کلید</th><th width="14%">پیش‌فرض</th><th>معنی</th></tr>
+<tr><td><span class="ltr">min_direction_confidence</span></td><td>۰٫۷۰</td><td>مدل جهت باید حداقل ۷۰٪ مطمئن باشد.</td></tr>
+<tr><td><span class="ltr">min_direction_margin</span></td><td>۰٫۱۵</td><td>فاصلهٔ لانگ و شورت حداقل ۱۵ واحد درصد.</td></tr>
+<tr><td><span class="ltr">max_no_trade_probability</span></td><td>۰٫۳۵</td><td>احتمال «معامله نکن» نباید از ۳۵٪ بیشتر شود.</td></tr>
+<tr><td><span class="ltr">min_entry_probability</span></td><td>۰٫۵۵</td><td>مدل زمان‌بندی ورود باید حداقل ۵۵٪ بگوید «الان».</td></tr>
+<tr><td><span class="ltr">min/max_leverage</span></td><td>۱ / ۱۰</td><td>بازهٔ مجاز اهرم.</td></tr>
+<tr><td><span class="ltr">min/max_capital_allocation_pct</span></td><td>۰٫۰۱ / ۰٫۲۰</td><td>بین ۱٪ و ۲۰٪ سرمایه در هر معامله.</td></tr>
+<tr><td><span class="ltr">min_reward_risk_ratio</span></td><td>۱٫۳</td><td>نسبت سود به ضرر حداقل ۱٫۳ باشد.</td></tr>
+<tr><td><span class="ltr">max_volatility_percentile</span></td><td>۰٫۹۷</td><td>در نوسان صدک ۹۷ به بالا، معامله ممنوع.</td></tr>
+<tr><td><span class="ltr">accepted_risk_tiers</span></td><td>LOW, MEDIUM, HIGH</td><td>ردهٔ VERY_HIGH پذیرفته نمی‌شود.</td></tr>
+<tr><td><span class="ltr">max_concurrent_positions</span></td><td>۵</td><td>حداکثر ۵ معاملهٔ باز همزمان.</td></tr>
+<tr><td><span class="ltr">max_positions_per_symbol</span></td><td>۱</td><td>روی هر ارز فقط یک معامله.</td></tr>
+</table>
+
+<h4>۹) <span class="ltr">RiskSettings</span> — نگهبان ریسک</h4>
+<table>
+<tr><th width="34%">کلید</th><th width="14%">پیش‌فرض</th><th>معنی</th></tr>
+<tr><td><span class="ltr">starting_equity</span></td><td>۱۰۰۰</td><td>سرمایهٔ اولیهٔ فرضی.</td></tr>
+<tr><td><span class="ltr">daily_drawdown_yellow / red</span></td><td>۰٫۰۳ / ۰٫۰۵</td><td>افت روزانهٔ ۳٪ = زرد، ۵٪ = قرمز (توقف کامل).</td></tr>
+<tr><td><span class="ltr">total_drawdown_red_pct</span></td><td>۰٫۲۰</td><td>افت ۲۰٪ از اوج = توقف کامل.</td></tr>
+<tr><td><span class="ltr">consecutive_losses_yellow / red</span></td><td>۳ / ۵</td><td>۳ باخت پیاپی = زرد، ۵ باخت = قرمز.</td></tr>
+<tr><td><span class="ltr">api_errors_yellow / red</span></td><td>۳ / ۶</td><td>۶ خطای صرافی در ۵ دقیقه = قرمز.</td></tr>
+<tr><td><span class="ltr">yellow_size_multiplier</span></td><td>۰٫۴</td><td>در حالت زرد، حجم معامله ۴۰٪ می‌شود.</td></tr>
+<tr><td><span class="ltr">max_daily_trades</span></td><td>۴۰</td><td>حداکثر ۴۰ معامله در روز.</td></tr>
+<tr><td><span class="ltr">require_manual_reset</span></td><td>true</td><td>حالت قرمز فقط با دست آدم باز می‌شود.</td></tr>
+</table>
+
+<h4>۱۰) <span class="ltr">ExecutionSettings</span> — اجرا</h4>
+<table>
+<tr><th width="34%">کلید</th><th width="14%">پیش‌فرض</th><th>معنی</th></tr>
+<tr><td><span class="ltr">margin_mode</span></td><td>isolated</td><td>حالت مارجین ایزوله: ضرر هر معامله فقط به ودیعهٔ خودش محدود است.</td></tr>
+<tr><td><span class="ltr">order_type</span></td><td>market</td><td>سفارش بازار (اجرای فوری).</td></tr>
+<tr><td><span class="ltr">taker_fee / maker_fee</span></td><td>۰٫۰۰۰۵ / ۰٫۰۰۰۲</td><td>۰٫۰۵٪ و ۰٫۰۲٪.</td></tr>
+<tr><td><span class="ltr">slippage_bps</span></td><td>۵</td><td>۰٫۰۵٪ لغزش قیمت در شبیه‌سازی.</td></tr>
+<tr><td><span class="ltr">position_monitor_interval_seconds</span></td><td>۵</td><td>هر ۵ ثانیه پوزیشن‌ها چک می‌شوند.</td></tr>
+<tr><td><span class="ltr">reconcile_interval_seconds</span></td><td>۶۰</td><td>هر ۶۰ ثانیه با صرافی تطبیق داده می‌شود.</td></tr>
+<tr><td><span class="ltr">funding_interval_hours</span></td><td>۸</td><td>فاندینگ هر ۸ ساعت.</td></tr>
+<tr><td><span class="ltr">maintenance_margin_rate</span></td><td>۰٫۰۰۵</td><td>نرخ مارجین نگهداری برای محاسبهٔ قیمت لیکوئید.</td></tr>
+<tr><td><span class="ltr">paper_starting_balance</span></td><td>۱۰۰۰</td><td>موجودی مجازی حالت کاغذی.</td></tr>
+</table>
+
+<h4>۱۱) <span class="ltr">WebSettings</span> و ۱۲) <span class="ltr">DatabaseSettings</span></h4>
+<table>
+<tr><th width="34%">کلید</th><th width="14%">پیش‌فرض</th><th>معنی</th></tr>
+<tr><td><span class="ltr">web.host / port</span></td><td>0.0.0.0 / 8000</td><td>پنل روی همهٔ رابط‌ها، پورت ۸۰۰۰.</td></tr>
+<tr><td><span class="ltr">web.api_token</span></td><td>خالی</td><td>اگر پر شود، دستورهای حساس رمز می‌خواهند.</td></tr>
+<tr><td><span class="ltr">db.path</span></td><td><span class="ltr">data/quant.db</span></td><td>یک فایل SQLite. بدون سرور دیتابیس.</td></tr>
+<tr><td><span class="ltr">db.journal_mode</span></td><td>WAL</td><td>حالت WAL: پنل می‌تواند بخواند در حالی که ربات می‌نویسد.</td></tr>
+<tr><td><span class="ltr">db.busy_timeout_ms</span></td><td>۱۰۰۰۰</td><td>اگر فایل قفل بود، ۱۰ ثانیه صبر کن.</td></tr>
+</table>
+
+<h3>۳-۳. اعتبارسنجی‌های خودکار تنظیمات</h3>
+<p>فایل تنظیمات خودش را هم چک می‌کند و اگر ترکیب بی‌معنی باشد، برنامه اصلاً بالا نمی‌آید:</p>
+<ul>
+<li><span class="ltr">min_leverage</span> نمی‌تواند از <span class="ltr">max_leverage</span> بزرگ‌تر باشد.</li>
+<li>آستانهٔ زرد افت سرمایه باید <em>کمتر</em> از آستانهٔ قرمز باشد.</li>
+<li>سطح لاگ باید یکی از پنج مقدار مجاز باشد.</li>
+<li>هنگام ساخت تنظیمات، پوشه‌های <span class="ltr">logs/</span>، <span class="ltr">artifacts/models</span>
+    و پوشهٔ پایگاه داده بلافاصله ساخته می‌شوند تا بعداً هیچ عملیات فایلی شکست نخورد.</li>
+</ul>
+<p class="small">
+تابع <span class="ltr">get_settings()</span> با <span class="ltr">@lru_cache</span> نگه داشته شده،
+یعنی تنظیمات در کل عمر برنامه فقط یک‌بار خوانده می‌شود و همه از همان یک نسخه استفاده می‌کنند.
+</p>
+</div>
+
+<div class="sec">
+<h2>۴. ابزارهای پایه — پوشهٔ <span class="ltr">core/</span></h2>
+
+<div class="box simple">
+اینجا جعبه‌ابزار مشترک است: یک ساعت، یک دفترچهٔ یادداشت، و یک لیست از انواع «داد زدن»
+وقتی چیزی خراب می‌شود.
+</div>
+
+<h3>۴-۱. <span class="ltr">exceptions.py</span> — انواع خطا</h3>
+<p>
+به‌جای اینکه همه‌جا فقط بگوییم «خطا شد»، ۱۲ نوع خطای مشخص تعریف شده تا بشود دقیق
+واکنش نشان داد. همه از یک پدر مشترک به نام <span class="ltr">QuantSystemError</span> ارث می‌برند
+که می‌تواند «زمینه» (context) هم حمل کند — مثلاً کدام ارز، چند بار تلاش شد.
+</p>
+<table>
+<tr><th width="34%">خطا</th><th>کِی پرتاب می‌شود</th></tr>
+<tr><td><span class="ltr">ConfigurationError</span></td><td>تنظیمات با خودش ناسازگار است.</td></tr>
+<tr><td><span class="ltr">DataFetchError</span></td><td>صرافی بعد از همهٔ تلاش‌ها داده نداد.</td></tr>
+<tr><td><span class="ltr">DataIntegrityError</span></td><td>پلیس کیفیت نتوانست داده را تعمیر کند.</td></tr>
+<tr><td><span class="ltr">InsufficientDataError</span></td><td>تعداد ردیف‌ها برای محاسبه کافی نیست.</td></tr>
+<tr><td><span class="ltr">FeatureEngineeringError</span></td><td>ساخت یک ویژگی به‌طور جبران‌ناپذیر شکست خورد.</td></tr>
+<tr><td><span class="ltr">LabelingError</span></td><td>برچسب‌زن ورودی ناسازگار گرفت.</td></tr>
+<tr><td><span class="ltr">ModelNotLoadedError</span></td><td>پیش‌بینی قبل از بارگذاری مدل.</td></tr>
+<tr><td><span class="ltr">ModelTrainingError</span></td><td>مدل قابل آموزش نبود (مثلاً فقط یک کلاس در داده).</td></tr>
+<tr><td><span class="ltr">DecisionEngineError</span></td><td>ورودی بدشکل به موتور تصمیم.</td></tr>
+<tr><td><span class="ltr">ExecutionError</span></td><td>سفارش ثبت/لغو نشد.</td></tr>
+<tr><td><span class="ltr">KillSwitchEngaged</span></td><td>نگهبان ریسک قرمز است و ریسک جدید ممنوع.</td></tr>
+<tr><td><span class="ltr">DatabaseError</span></td><td>عملیات پایگاه داده شکست خورد.</td></tr>
+</table>
+
+<h3>۴-۲. <span class="ltr">logger.py</span> — دفترچهٔ یادداشت</h3>
+<p>سه مقصد برای هر پیام لاگ:</p>
+<ol>
+<li><strong>ترمینال</strong> — چیزی که روی صفحه می‌بینی.</li>
+<li><strong>فایل چرخشی</strong> — <span class="ltr">logs/quant_system.log</span>، هر فایل تا ۲۵ مگابایت،
+    ۵ فایل پشتیبان نگه داشته می‌شود.</li>
+<li><strong>حافظهٔ حلقوی</strong> — کلاس <span class="ltr">RingBufferHandler</span> آخرین ۸۰۰ خط
+    را در حافظه نگه می‌دارد. پنل وب از همین می‌خواند، پس برای دیدن لاگ زنده نیازی به
+    خواندن فایل از دیسک نیست.</li>
+</ol>
+<p>
+همچنین کتابخانه‌های پرحرف (<span class="ltr">ccxt, urllib3, asyncio, apscheduler, aiosqlite</span>)
+به سطح <span class="ltr">WARNING</span> خفه می‌شوند تا لاگ ما را پر نکنند.
+یک پرچم <span class="ltr">_CONFIGURED</span> تضمین می‌کند تنظیم لاگ فقط یک‌بار انجام شود.
+</p>
+
+<h3>۴-۳. <span class="ltr">utils.py</span> — توابع کوچک اما حیاتی</h3>
+
+<h4>الف) کار با زمان</h4>
+<p>کل سیستم با <strong>میلی‌ثانیه از مبدأ یونیکس، به وقت UTC</strong> کار می‌کند. هیچ منطقهٔ زمانی محلی در کار نیست.</p>
+<table>
+<tr><th width="34%">تابع</th><th>کار</th></tr>
+<tr><td><span class="ltr">utc_now() / utc_now_ms()</span></td><td>زمان فعلی UTC.</td></tr>
+<tr><td><span class="ltr">ms_to_datetime()</span></td><td>میلی‌ثانیه ← تاریخ خوانا.</td></tr>
+<tr><td><span class="ltr">floor_to_timeframe()</span></td>
+    <td>گرد کردن زمان روی شبکهٔ ۵ دقیقه‌ای. چون کندل‌ها همیشه روی مضرب دقیق
+        ۳۰۰٬۰۰۰ باز می‌شوند، این فقط یک عملیات باقیماندهٔ ساده است.</td></tr>
+<tr><td><span class="ltr">last_closed_candle_open_ms()</span></td>
+    <td>زمان باز شدن آخرین کندلی که واقعاً بسته شده است.</td></tr>
+<tr><td><span class="ltr">expected_timestamps()</span></td>
+    <td>لیست همهٔ زمان‌هایی که <em>باید</em> بین دو نقطه وجود داشته باشند —
+        اساس تشخیص «کندل گمشده».</td></tr>
+</table>
+
+<h4>ب) کار با عدد</h4>
+<ul>
+<li><span class="ltr">safe_float()</span> — تبدیل هر چیزی به عدد؛ اگر نشد یا نتیجه
+    <span class="ltr">NaN</span>/بی‌نهایت بود، مقدار پیش‌فرض برمی‌گرداند.
+    این یک سپر مهم در برابر پاسخ‌های عجیب صرافی است.</li>
+<li><span class="ltr">clamp()</span> — محدود کردن عدد در یک بازه.</li>
+<li><span class="ltr">percentile_rank()</span> — چند درصد داده‌ها کمتر یا مساوی این مقدارند.</li>
+<li><span class="ltr">chunked()</span> — تکه‌تکه کردن لیست‌های بزرگ.</li>
+</ul>
+
+<h4>ج) تلاش مجدد هوشمند — قلب پایداری شبکه</h4>
+<p>
+تابع <span class="ltr">backoff_delay(attempt, base, max, jitter)</span> تأخیر را
+<strong>نمایی</strong> زیاد می‌کند: ۱، ۲، ۴، ۸، ۱۶ ثانیه… با سقف، و با ±۲۵٪ نویز تصادفی.
+</p>
+<div class="box why">
+چرا نویز تصادفی؟ فرض کن ۳۰ ارز همزمان خطا خوردند. اگر همه دقیقاً ۲ ثانیهٔ بعد
+دوباره تلاش کنند، همان لحظه یک موج ۳۰تایی به صرافی می‌خورد و باز هم خطا می‌گیرند.
+نویز تصادفی این موج را پخش می‌کند.
+</div>
+<p>
+تابع <span class="ltr">async_retry()</span> این را عملی می‌کند و سه دستهٔ خطا را از هم جدا می‌کند:
+</p>
+<ul>
+<li><span class="ltr">retry_on</span> — خطاهای گذرا (قطعی شبکه، تایم‌اوت، محدودیت نرخ): دوباره تلاش کن.</li>
+<li><span class="ltr">give_up_on</span> — خطاهای دائمی (نماد اشتباه، کلید API نامعتبر): بلافاصله تسلیم شو.</li>
+<li><span class="ltr">asyncio.CancelledError</span> — همیشه بدون دست‌کاری عبور داده می‌شود
+    (این خطای «لغو» است، نه خطای واقعی).</li>
+</ul>
+<div class="box note">
+تفکیک خطاهای گذرا از دائمی خیلی مهم است: تلاش مجدد روی یک «کلید API اشتباه»
+فقط سهمیهٔ درخواست تو را می‌سوزاند و هیچ‌وقت موفق نمی‌شود.
+</div>
+</div>
+
+<div class="sec">
+<h2>۵. لحظهٔ روشن‌شدن سیستم — <span class="ltr">main.py</span></h2>
+
+<p>وقتی دستور زیر را می‌زنی:</p>
+<pre>python main.py</pre>
+<p>این اتفاق‌ها به‌ترتیب می‌افتد:</p>
+
+<h3>۵-۱. گام‌های راه‌اندازی (تابع <span class="ltr">startup()</span>)</h3>
+
+<div class="step"><span class="num">۱</span>
+<strong>خواندن آرگومان‌های خط فرمان</strong> — تابع <span class="ltr">_parse_args()</span>
+تعیین می‌کند کدام دستور اجرا شود: <span class="ltr">run</span> (پیش‌فرض)،
+<span class="ltr">universe</span>، <span class="ltr">bootstrap</span>،
+<span class="ltr">train</span>، <span class="ltr">backtest</span> یا <span class="ltr">cycle</span>.
+</div>
+
+<div class="step"><span class="num">۲</span>
+<strong>ساخت تنظیمات و راه‌اندازی لاگ</strong> — <span class="ltr">get_settings()</span> و
+<span class="ltr">configure_logging()</span>.
+</div>
+
+<div class="step"><span class="num">۳</span>
+<strong>ساخت شیء <span class="ltr">TradingSystem</span></strong> — در سازندهٔ آن، همهٔ اجزای
+شش ماژول یک‌جا ساخته و به هم وصل می‌شوند: پایگاه داده، دریافت‌کنندهٔ داده، اعتبارسنج،
+خط لوله، مدیر ارزها، سرویس ویژگی، پردازشگر دیتاست، زیرسیستم ML، موتور تصمیم،
+نگهبان ریسک، موتور اجرا و موتور ثبت وقایع.
+</div>
+
+<div class="step"><span class="num">۴</span>
+<strong>آماده‌سازی پایگاه داده</strong> — <span class="ltr">database.initialize()</span>:
+فایل <span class="ltr">data/quant.db</span> ساخته می‌شود، حالت WAL فعال می‌شود و
+۶ جدول اگر نبودند ساخته می‌شوند.
+</div>
+
+<div class="step"><span class="num">۵</span>
+<strong>روشن کردن موتور ثبت وقایع</strong> — یک تسک پس‌زمینه که هر ۲ ثانیه صف را خالی می‌کند.
+</div>
+
+<div class="step"><span class="num">۶</span>
+<strong>بازیابی وضعیت نگهبان ریسک</strong> — <span class="ltr">risk_guard.load()</span>.
+اگر در اجرای قبلی سیستم «قرمز» شده بود، همان الان دوباره قرمز می‌شود.
+<em>این خیلی مهم است:</em> ری‌استارت کردن برنامه راهِ فرار از توقف اضطراری نیست.
+</div>
+
+<div class="step"><span class="num">۷</span>
+<strong>بارگذاری فهرست بازارهای بایننس</strong> — <span class="ltr">fetcher.load_markets()</span>.
+فقط بازارهای «خطی» (USDT-M) بارگذاری می‌شوند، نه اسپات و نه معکوس.
+</div>
+
+<div class="step"><span class="num">۸</span>
+<strong>بارگذاری چهار مدل از دیسک</strong> — اگر فایلی نبود، پیام می‌دهد که در مرحلهٔ
+راه‌اندازی آموزش داده خواهند شد.
+</div>
+
+<div class="step"><span class="num">۹</span>
+<strong>خواندن انتخاب ارزهای ذخیره‌شده</strong> از پایگاه داده.
+</div>
+
+<div class="step"><span class="num">۱۰</span>
+<strong>ثبت تابع «تخلیهٔ اضطراری»</strong> در نگهبان ریسک، و روشن کردن موتور اجرا.
+</div>
+
+<div class="box why">
+چرا مرحلهٔ راه‌اندازی این‌قدر سریع و «تحمل‌کنندهٔ خطای شبکه» طراحی شده؟
+چون پنل وب باید بالا بیاید <em>حتی وقتی صرافی در دسترس نیست</em> — تا اپراتور
+بتواند ببیند مشکل چیست. کارهای سنگین (دانلود تاریخچه و آموزش) بعداً در پس‌زمینه انجام می‌شوند.
+</div>
+
+<h3>۵-۲. زمان‌بند ۵ دقیقه‌ای</h3>
+<p>تابع <span class="ltr">_schedule()</span> یک کار زمان‌بندی‌شده ثبت می‌کند:</p>
+<pre>CronTrigger(minute="0,5,10,...,55", second=10, timezone="UTC")</pre>
+<table>
+<tr><th width="30%">پارامتر</th><th>معنی</th></tr>
+<tr><td><span class="ltr">max_instances=1</span></td><td>هرگز دو چرخه همزمان اجرا نشوند.</td></tr>
+<tr><td><span class="ltr">coalesce=True</span></td><td>اگر چند اجرا عقب افتاد، فقط یکی اجرا شود نه همه.</td></tr>
+<tr><td><span class="ltr">misfire_grace_time=90</span></td><td>تا ۹۰ ثانیه تأخیر قابل قبول است؛ بیشتر از آن، آن نوبت رد می‌شود.</td></tr>
+</table>
+<p>
+علاوه بر این، خودِ تابع <span class="ltr">trading_cycle()</span> یک قفل دارد:
+اگر چرخهٔ قبلی هنوز تمام نشده، چرخهٔ جدید <strong>رد می‌شود</strong> (نه اینکه در صف بماند).
+</p>
+
+<h3>۵-۳. اجرای همزمان پنل و زمان‌بند</h3>
+<p>
+تابع <span class="ltr">run_forever()</span> دو کار را همزمان روی یک حلقهٔ رویداد اجرا می‌کند:
+سرور <span class="ltr">uvicorn</span> (پنل وب) و زمان‌بند. با
+<span class="ltr">asyncio.wait(..., FIRST_COMPLETED)</span> منتظر می‌ماند تا یکی از این دو
+تمام شود یا سیگنال خاموشی برسد.
+</p>
+
+<h3>۵-۴. خاموشی تمیز</h3>
+<p>سیگنال‌های <span class="ltr">SIGINT</span> (Ctrl+C) و <span class="ltr">SIGTERM</span> گرفته می‌شوند
+و خاموشی <em>به ترتیب معکوس</em> انجام می‌شود:</p>
+<ol>
+<li>پرچم معامله خاموش می‌شود.</li>
+<li>تسک راه‌اندازی (اگر در حال اجراست) لغو می‌شود.</li>
+<li>زمان‌بند متوقف می‌شود.</li>
+<li>موتور اجرا متوقف می‌شود (<strong>پوزیشن‌های باز خودکار بسته نمی‌شوند</strong>).</li>
+<li>صف ثبت وقایع کاملاً روی دیسک خالی می‌شود.</li>
+<li>سرویس ویژگی‌سازی خاموش می‌شود.</li>
+<li>اتصال به صرافی بسته می‌شود.</li>
+<li>اتصال به پایگاه داده بسته می‌شود.</li>
+</ol>
+
+<h3>۵-۵. خط لولهٔ خودکار راه‌اندازی (<span class="ltr">run_setup</span>)</h3>
+<p>بعد از بالا آمدن، یک تسک پس‌زمینه شروع می‌شود که سه حالت دارد:</p>
+
+<div class="flow">
+  ⁨اگر هیچ ارزی انتخاب نشده باشد⁩
+        |
+        +--> ⁨فاز⁩ AWAITING_UNIVERSE  (⁨منتظر می‌ماند؛ تو باید در پنل ارز تیک بزنی⁩)
+
+  ⁨اگر ارز انتخاب شده باشد⁩
+        |
+        +--> ⁨مرحلهٔ ۱⁩: _setup_collect()   ⁨دانلود تاریخچه⁩
+        |
+        +--> ⁨مرحلهٔ ۲⁩: _setup_train()     ⁨آموزش ۴ مدل⁩
+        |
+        +--> ⁨فاز⁩ READY   (⁨آماده⁩ — ⁨ولی هنوز معامله نمی‌کند⁩)
+</div>
+
+<h4>جزئیات <span class="ltr">_setup_collect()</span></h4>
+<ul>
+<li>فاز به <span class="ltr">COLLECTING_DATA</span> می‌رود و نوار پیشرفت شروع می‌شود.</li>
+<li><span class="ltr">pipeline.bootstrap_history()</span> صدا زده می‌شود با یک تابع callback
+    که هر بار یک ارز تمام شد، نوار پیشرفت را جلو می‌برد.</li>
+<li>بعد از پایان، تعداد کندل‌های ذخیره‌شدهٔ هر ارز شمرده می‌شود.</li>
+<li>ارزی که کمتر از <strong>۵۰۰ کندل</strong> دارد «غیرقابل استفاده» علامت می‌خورد.</li>
+<li>اگر <em>هیچ</em> ارزی به ۵۰۰ کندل نرسید، خطا داده می‌شود: احتمالاً اتصال به صرافی مشکل دارد.</li>
+</ul>
+
+<h4>جزئیات <span class="ltr">_setup_train()</span></h4>
+<p>آموزش <strong>رد می‌شود</strong> اگر هر سه شرط برقرار باشد:</p>
+<ol>
+<li>هر چهار مدل روی دیسک موجود و بارگذاری شده باشند،</li>
+<li>لیست ارزهای انتخابی با لیستی که مدل‌ها روی آن آموزش دیده‌اند یکسان باشد،</li>
+<li>کاربر آموزش اجباری نخواسته باشد.</li>
+</ol>
+<div class="box why">
+چرا تغییر لیست ارزها باعث آموزش مجدد اجباری می‌شود؟ چون مدل روی یک «مقطع عرضی» خاص
+از بازار برازش شده. اگر ارزها عوض شوند، آن مدل دیگر دربارهٔ این بازار حرف نمی‌زند.
+لیست ارزهای آموزش در کلید <span class="ltr">trained_universe</span> پایگاه داده ذخیره می‌شود.
+</div>
+<p>در غیر این صورت: ساخت دیتاست ← آموزش ۴ مدل ← ذخیرهٔ نتایج و آمار.</p>
+
+<h3>۵-۶. مسلح کردن معامله (<span class="ltr">start_trading</span>)</h3>
+<p>سیستم قبل از مسلح شدن ۵ شرط را چک می‌کند و اگر هرکدام رد شود، خطا می‌دهد:</p>
+<table>
+<tr><th width="8%">#</th><th>شرط</th></tr>
+<tr><td>۱</td><td>حالت باید «paper» یا «live» باشد.</td></tr>
+<tr><td>۲</td><td>فاز فعلی باید اجازهٔ مسلح شدن بدهد (یعنی راه‌اندازی تمام شده باشد).</td></tr>
+<tr><td>۳</td><td>نگهبان ریسک نباید قرمز باشد.</td></tr>
+<tr><td>۴</td><td><strong>برای حالت واقعی:</strong> هر چهار مدل باید مدل واقعی آموزش‌دیده باشند،
+        نه قاعدهٔ جایگزین.</td></tr>
+<tr><td>۵</td><td>حداقل یک ارز باید انتخاب شده باشد.</td></tr>
+</table>
+<p>
+اگر حالت عوض شود (کاغذی ← واقعی)، تابع <span class="ltr">_switch_engine()</span> ابتدا
+<strong>همهٔ پوزیشن‌های موتور قبلی را می‌بندد</strong>، بعد موتور جدید را می‌سازد.
+</p>
+<div class="box why">
+چرا؟ چون یک پوزیشن کاغذی هیچ معادلی روی صرافی ندارد و برعکس. اگر حین تعویض موتور
+پوزیشنی باقی بماند، تا ابد بدون مدیریت رها می‌شود.
+</div>
+</div>
+
+<div class="sec">
+<h2>۶. مرحلهٔ ۱: انتخاب ارزها — <span class="ltr">universe.py</span></h2>
+
+<div class="box simple">
+فرض کن می‌خواهی تیم فوتبال بسازی. ۴۰۰ بازیکن جلوی تو هستند. چهار آزمون می‌گیری:
+قد، سرعت، سابقه، و اینکه لباس تیم اندازه‌اش بشود. هر بازیکنی که در یکی رد شد،
+کنار می‌رود — و روی برگه‌اش دقیقاً می‌نویسی <em>در کدام آزمون</em> رد شد.
+این فایل دقیقاً همین کار را با ارزها می‌کند.
+</div>
+
+<h3>۶-۱. کشف ارزها (<span class="ltr">discover()</span>)</h3>
+<p>فقط با <strong>دو درخواست</strong> به بایننس:</p>
+<ol>
+<li><span class="ltr">load_markets()</span> — فهرست کامل بازارها با مشخصات فنی هرکدام.</li>
+<li><span class="ltr">fetch_tickers()</span> — قیمت لحظه‌ای، بهترین خرید/فروش و حجم ۲۴ ساعته
+    برای همه در یک درخواست.</li>
+</ol>
+<p>سپس فیلتر اولیه: یک بازار فقط وقتی «قرارداد دائمی USDT-M» شمرده می‌شود که</p>
+<pre>swap == True  and  linear == True  and  active == True
+and  settle == "USDT"  and  quote == "USDT"  and  not expiry</pre>
+<p>
+نتیجه ۱۵ دقیقه در حافظه کش می‌شود
+(<span class="ltr">discovery_cache_seconds = 900</span>) چون مشخصات بازار
+دقیقه‌به‌دقیقه عوض نمی‌شود.
+</p>
+
+<h3>۶-۲. چهار غربال</h3>
+
+<h4>غربال ۱: نقدشوندگی</h4>
+<p>حجم معاملات ۲۴ ساعته باید ≥ ۵۰ میلیون USDT باشد.</p>
+<div class="box why">
+در یک بازار کم‌عمق، خود سفارش تو قیمت را جابه‌جا می‌کند. با اهرم ۱۰،
+تو عملاً به خودت ضرر می‌زنی قبل از اینکه تحلیل فرصت درست‌بودن داشته باشد.
+</div>
+
+<h4>غربال ۲: اسپرد (فاصلهٔ خرید/فروش)</h4>
+<p>فرمول: <span class="ltr">((ask - bid) / mid) × 10000</span> ≤ ۶ پایه.</p>
+<div class="box why">
+در یک استراتژی ۵ دقیقه‌ای، اسپرد در <em>هر</em> رفت‌وبرگشت پرداخت می‌شود.
+اسپرد ۱۵ پایه، یک معاملهٔ ۲:۱ را قبل از شروع می‌بلعد.
+</div>
+<p class="small">
+نکتهٔ ظریف: اگر اسپرد صفر گزارش شود، یعنی تیکر اصلاً دفتر سفارش نداشته.
+کد این را <em>قبول</em> می‌کند تا نبودِ داده به‌جای دادهٔ بد تفسیر نشود.
+</p>
+
+<h4>غربال ۳: قدمت</h4>
+<p>
+بایننس تاریخ لیست‌شدن هر قرارداد را در فیلد <span class="ltr">onboardDate</span> می‌دهد،
+پس این غربال هیچ درخواست اضافه‌ای لازم ندارد. حداقل ۹۰ روز.
+</p>
+<div class="box why">
+زیر ۹۰ روز، اصلاً به‌اندازهٔ کافی کندل ۵ دقیقه‌ای وجود ندارد که مدل چیزی یاد بگیرد.
+</div>
+
+<h4>غربال ۴: تناسب با سرمایهٔ کوچک — مهم‌ترین و کم‌یاب‌ترین غربال</h4>
+<p>ابتدا «کوچک‌ترین پوزیشن ممکن» حساب می‌شود:</p>
+<pre>smallest = reference_equity × min_capital_allocation_pct × min_leverage
+         = 1000 × 0.01 × 1 = 10 USDT</pre>
+<p>سپس دو شرط:</p>
+<table>
+<tr><th width="22%">شرط</th><th>معنی</th></tr>
+<tr><td>قابل خرید بودن</td>
+    <td>حداقل ارزش سفارش صرافی (بزرگ‌ترِ حداقل مقدار × قیمت، و حداقل ارزش)
+        نباید از ۱۰ USDT بیشتر باشد.</td></tr>
+<tr><td>دانه‌بندی</td>
+    <td>هزینهٔ یک پلهٔ مقدار (<span class="ltr">amount_step × price</span>)
+        نباید از ۲۵٪ آن ۱۰ USDT (یعنی ۲٫۵ USDT) بیشتر باشد.</td></tr>
+</table>
+<div class="box simple">
+مثال بیت‌کوین: پلهٔ مقدار ۰٫۰۰۱ بیت‌کوین است. اگر بیت‌کوین ۹۵٬۰۰۰ دلار باشد،
+یک پله ۹۵ دلار می‌شود. تو می‌خواستی ۱۰ دلار معامله کنی، ولی کوچک‌ترین قدمی که
+می‌توانی برداری ۹۵ دلار است! مثل اینکه بخواهی ۱۰۰ گرم شکر بخری ولی کوچک‌ترین
+بسته ۱ کیلو باشد. پس بیت‌کوین — با تمام نقدشوندگی عالی‌اش — برای یک حساب کوچک
+<strong>غیرقابل استفاده</strong> است و رد می‌شود.
+</div>
+<p>
+نکتهٔ ظریف در تابع <span class="ltr">_amount_step()</span>: کتابخانهٔ ccxt گاهی
+<span class="ltr">precision.amount</span> را به‌صورت «اندازهٔ پله» (۰٫۰۰۱) و گاهی
+به‌صورت «تعداد رقم اعشار» (۳) می‌دهد. کد هر دو حالت را تشخیص می‌دهد:
+عدد صحیحِ ≥۱ یعنی تعداد رقم اعشار و به <span class="ltr">10^-n</span> تبدیل می‌شود.
+</p>
+
+<h3>۶-۳. امتیازدهی و رتبه‌بندی (<span class="ltr">_apply_scores</span>)</h3>
+<p>چهار معیار نرمال‌سازی و با وزن ترکیب می‌شوند:</p>
+<table>
+<tr><th width="30%">معیار</th><th width="12%">وزن</th><th>نحوهٔ محاسبه</th></tr>
+<tr><td>نقدشوندگی</td><td>۰٫۴۵</td><td><span class="ltr">log10(volume)</span> سپس نرمال‌سازی min-max</td></tr>
+<tr><td>اسپرد</td><td>۰٫۲۵</td><td>نرمال‌سازی معکوس (کمتر = بهتر)</td></tr>
+<tr><td>مقرون‌به‌صرفه بودن</td><td>۰٫۲۰</td><td><span class="ltr">log10(granularity)</span> معکوس</td></tr>
+<tr><td>قدمت</td><td>۰٫۱۰</td><td>روزهای لیست‌شدن، سقف ۱۰۹۵ روز (۳ سال)</td></tr>
+</table>
+<div class="box why">
+چرا لگاریتم؟ چون حجم ۲۴ ساعته چهار مرتبهٔ بزرگی تفاوت دارد (از ۵۰ میلیون تا ۵۰ میلیارد).
+بدون لگاریتم، فقط یکی دو ارز برتر امتیاز می‌گرفتند و بقیه صفر می‌شدند.
+</div>
+<p>در پایان، لیست ابتدا بر اساس «واجد شرایط بودن» و سپس بر اساس امتیاز مرتب می‌شود.</p>
+
+<h3>۶-۴. ذخیرهٔ انتخاب (<span class="ltr">save_selection</span>)</h3>
+<ol>
+<li>هر نماد در برابر لیست بازارهای کشف‌شده اعتبارسنجی می‌شود. نماد اشتباه یا
+    قرارداد حذف‌شده <strong>همین‌جا</strong> رد می‌شود، نه در چرخهٔ بعدی.</li>
+<li>اگر کاربر عمداً یک ارز ردشده را تیک بزند، سیستم <em>احترام می‌گذارد</em>
+    ولی یک هشدار در لاگ می‌نویسد.</li>
+<li>اگر لیست خالی باشد، خطا داده می‌شود.</li>
+<li>مقایسه با انتخاب قبلی برای تعیین <span class="ltr">changed</span> — که آموزش مجدد را اجباری می‌کند.</li>
+<li>ذخیره در کلید <span class="ltr">universe_selection</span> پایگاه داده همراه با زمان و نام اپراتور.</li>
+</ol>
+
+<h3>۶-۵. پیشنهاد خودکار (<span class="ltr">suggest</span>)</h3>
+<p>
+فقط ارزهای <strong>واجد شرایط</strong> را بر اساس امتیاز مرتب می‌کند و <span class="ltr">N</span> تای
+اول را برمی‌گرداند. اگر تعداد کافی نبود، لیست کوتاه‌تر برمی‌گردد —
+<em>هرگز</em> با ارزهای ردشده پر نمی‌شود.
+</p>
+</div>
+
+<div class="sec">
+<h2>۷. مرحلهٔ ۲: جمع‌آوری داده از بایننس — <span class="ltr">fetcher.py</span></h2>
+
+<div class="box simple">
+این فایل «مأمور خرید» است. می‌رود به مغازه (بایننس)، جنس می‌خرد، و اگر مغازه شلوغ بود
+یا در بسته بود، چند بار دیگر با فاصلهٔ بیشتر برمی‌گردد. ولی اگر مغازه بگوید
+«این جنس اصلاً وجود ندارد»، بی‌خودی برنمی‌گردد.
+</div>
+
+<h3>۷-۱. آماده‌سازی اتصال</h3>
+<p>
+یک شیء <span class="ltr">ccxt.async_support.binance</span> ساخته می‌شود با
+کلیدها، تایم‌اوت، محدودکنندهٔ نرخ داخلی، و <span class="ltr">defaultType="future"</span>.
+</p>
+<h4>یک ترفند مهم: محدود کردن به بازارهای خطی</h4>
+<pre>exchange.options["fetchMarkets"] = ["linear"]   # ⁨یا⁩ {"types": ["linear"]}</pre>
+<div class="box why">
+ccxt به‌صورت پیش‌فرض بازارهای اسپات، خطی <em>و</em> معکوس را بارگذاری می‌کند —
+چند مگابایت داده و مقدار زیادی از سهمیهٔ درخواست که این سیستم اصلاً استفاده نمی‌کند.
+بدتر: در حالت آزمایشی، بخش اسپات از یک دامنهٔ <em>کاملاً جدا</em>
+(<span class="ltr">testnet.binance.vision</span>) سرو می‌شود، و یک ربات فیوچرز
+به دلیلی که هیچ ربطی به فیوچرز ندارد بالا نمی‌آید.
+کد شکل قدیمی (لیست) و جدید (دیکشنری) این تنظیم را هر دو پشتیبانی می‌کند.
+</div>
+
+<h3>۷-۲. لایهٔ محافظ همهٔ درخواست‌ها (<span class="ltr">_call</span>)</h3>
+<p>هیچ درخواستی مستقیم ارسال نمی‌شود؛ همه از این تابع عبور می‌کنند که:</p>
+<ol>
+<li>یک <span class="ltr">Semaphore</span> می‌گیرد (حداکثر ۸ درخواست همزمان).</li>
+<li>با <span class="ltr">async_retry</span> تا ۵ بار با تأخیر نمایی تلاش می‌کند.</li>
+<li>خطاها را دسته‌بندی می‌کند.</li>
+<li>شمارندهٔ <span class="ltr">consecutive_errors</span> را به‌روز می‌کند
+    (نگهبان ریسک از آن استفاده می‌کند).</li>
+</ol>
+<table>
+<tr><th width="26%">دسته</th><th>شامل</th><th width="20%">واکنش</th></tr>
+<tr><td>گذرا</td>
+    <td><span class="ltr">NetworkError, RequestTimeout, ExchangeNotAvailable,
+        DDoSProtection, RateLimitExceeded, OnMaintenance, TimeoutError</span></td>
+    <td>تلاش مجدد</td></tr>
+<tr><td>دائمی</td>
+    <td><span class="ltr">AuthenticationError, PermissionDenied, BadSymbol, ArgumentsRequired</span></td>
+    <td>تسلیم فوری</td></tr>
+<tr><td>سایر خطای صرافی</td><td><span class="ltr">ExchangeError</span></td><td>تسلیم با گزارش</td></tr>
+</table>
+
+<h3>۷-۳. دریافت کندل‌ها</h3>
+
+<h4>الف) <span class="ltr">fetch_ohlcv()</span> — یک صفحه</h4>
+<ul>
+<li>حداکثر ۱۵۰۰ کندل در یک درخواست.</li>
+<li>هر ردیف خام به کلاس <span class="ltr">OHLCVCandle</span> تبدیل می‌شود.
+    اگر ردیفی ساختار شکسته داشت، <strong>حذف</strong> می‌شود (نه اینکه کل درخواست شکست بخورد) —
+    و پلیس کیفیت بعداً حفرهٔ ایجادشده را می‌بیند و تعمیر می‌کند.</li>
+<li>کندل هنوز بسته‌نشده حذف می‌شود:
+    اگر <span class="ltr">timestamp + 300000 &gt; now</span> باشد، آن کندل نیمه‌تمام است.</li>
+<li>نتیجه بر اساس زمان مرتب می‌شود.</li>
+</ul>
+
+<h4>ب) <span class="ltr">fetch_ohlcv_range()</span> — یک بازهٔ طولانی با صفحه‌بندی</h4>
+<p>
+برای گرفتن ۲ سال تاریخچه (۲۱۰٬۲۴۰ کندل) باید حدود ۱۴۰ صفحه گرفت.
+حلقه از <span class="ltr">start_ms</span> شروع می‌کند و هر بار مکان‌نما را به
+<span class="ltr">آخرین کندل + 5m</span> می‌برد. سه محافظ در برابر حلقهٔ بی‌نهایت:
+</p>
+<ul>
+<li>صفحهٔ خالی ← توقف.</li>
+<li>سقف تعداد صفحات (<span class="ltr">max_pages</span>) محاسبه‌شده از طول بازه.</li>
+<li>اگر مکان‌نما جلو نرفت <em>و</em> هیچ کندل جدیدی نیامد ← توقف.</li>
+</ul>
+<p>
+کندل‌ها در یک دیکشنری با کلید زمان جمع می‌شوند، پس <strong>تکراری غیرممکن است</strong>.
+</p>
+
+<h3>۷-۴. دفتر سفارش (<span class="ltr">fetch_order_book</span>)</h3>
+<p>
+عمق ۲۰ سطح گرفته می‌شود و بلافاصله به آمار خلاصه تبدیل می‌شود
+(کل دفتر ذخیره نمی‌شود): بهترین خرید، بهترین فروش، حجم ۱۰ سطح هر طرف.
+از آن‌ها این‌ها محاسبه می‌شود:
+</p>
+<table>
+<tr><th width="26%">کمیت</th><th>فرمول</th></tr>
+<tr><td>قیمت میانی</td><td><span class="ltr">(bid + ask) / 2</span></td></tr>
+<tr><td>اسپرد</td><td><span class="ltr">ask - bid</span></td></tr>
+<tr><td>اسپرد نسبی</td><td><span class="ltr">(spread / mid) × 10000</span> پایه</td></tr>
+<tr><td>عدم توازن</td><td><span class="ltr">(bid_vol - ask_vol) / (bid_vol + ask_vol)</span> در بازهٔ ۱- تا ۱+</td></tr>
+<tr><td>ریزقیمت</td><td><span class="ltr">(bid×ask_vol + ask×bid_vol) / (bid_vol+ask_vol)</span></td></tr>
+</table>
+<p>
+اگر دفتر خالی یا «متقاطع» بود (خرید ≥ فروش، که نشانهٔ اسنپ‌شات کهنه است)،
+تابع <span class="ltr">None</span> برمی‌گرداند — نه یک عدد اشتباه.
+</p>
+
+<h3>۷-۵. متریک‌های قرارداد آتی (<span class="ltr">fetch_futures_metrics</span>)</h3>
+<p>شش درخواست <strong>موازی</strong> با <span class="ltr">asyncio.gather</span>:</p>
+<table>
+<tr><th width="34%">داده</th><th>در صورت شکست</th></tr>
+<tr><td>نرخ فاندینگ + قیمت مارک/شاخص</td><td>۰٫۰</td></tr>
+<tr><td>بهرهٔ باز (Open Interest)</td><td>۰٫۰</td></tr>
+<tr><td>نسبت لانگ/شورت کل حساب‌ها</td><td>۱٫۰ (کاملاً متعادل)</td></tr>
+<tr><td>نسبت لانگ/شورت معامله‌گران برتر</td><td>۱٫۰</td></tr>
+<tr><td>نسبت خرید/فروش تیکرها</td><td>۱٫۰</td></tr>
+<tr><td>حجم لیکوئیدیشن</td><td>(۰٫۰ ، ۰٫۰)</td></tr>
+</table>
+<div class="box why">
+هر زیر-درخواست جداگانه محافظت شده است. نقاط انتهایی
+<span class="ltr">futures/data</span> بایننس معروف به بی‌ثباتی‌اند، و
+<strong>ارزش متوقف کردن معامله را ندارند</strong>. پس شکست یکی، فقط همان یک فیلد را
+به مقدار خنثی تبدیل می‌کند، نه اینکه کل چرخه را از بین ببرد.
+</div>
+<p class="small">
+یک محافظ اضافه: اگر نرخ فاندینگ بزرگ‌تر از ۵٪ گزارش شد، صفر می‌شود —
+چون قالب <span class="ltr">Pydantic</span> چنین مقداری را رد می‌کند و کل بسته را از بین می‌برد.
+</p>
+
+<h3>۷-۶. قالب‌های سختگیرانهٔ داده (<span class="ltr">models.py</span>)</h3>
+<p>
+اینجا <strong>اولین خط دفاعی</strong> است. یک کندل در همان لحظهٔ ساخته‌شدن این قوانین را چک می‌کند:
+</p>
+<pre>high >= low
+high >= max(open, close)
+low  <= min(open, close)
+all prices > 0
+volume >= 0
+timestamp >= 1262304000000   # 2010-01-01 : ⁨کف سلامت عقل⁩</pre>
+<div class="box note">
+تنظیم <span class="ltr">frozen=True</span> یعنی کندل پس از ساخت
+<strong>غیرقابل تغییر</strong> است. هیچ‌جای کد نمی‌تواند مخفیانه قیمتی را عوض کند.
+و <span class="ltr">extra="forbid"</span> یعنی هیچ فیلد ناشناخته‌ای پذیرفته نمی‌شود.
+</div>
+<p>
+کلاس <span class="ltr">MarketDataBundle</span> خروجی نهایی ماژول A برای هر ارز است:
+کندل‌ها + دفتر سفارش + متریک‌های آتی + گزارش کیفیت + زمان دریافت.
+متد <span class="ltr">to_dataframe()</span> آن را به جدول pandas با
+شاخص زمانی UTC تبدیل می‌کند — دقیقاً چیزی که ماژول B انتظار دارد.
+</p>
+</div>
+
+<div class="sec">
+<h2>۸. مرحلهٔ ۳: پلیس کیفیت داده — <span class="ltr">qc_validator.py</span></h2>
+
+<div class="box simple">
+این آقا بازرس است. جعبهٔ میوه که رسید، دانه‌دانه نگاه می‌کند: میوهٔ گندیده هست؟
+جای خالی هست؟ یک میوه دو بار شمرده شده؟ میوه‌ای از فردا آمده؟!
+اگر مشکلی دید، فقط همان قسمت خراب را دوباره سفارش می‌دهد. اگر بعد از ۴ بار
+باز هم درست نشد، کل جعبه را برای این نوبت کنار می‌گذارد — <strong>ولی هرگز
+میوهٔ پلاستیکی جایش نمی‌گذارد</strong>.
+</div>
+
+<h3>۸-۱. چهار خانوادهٔ بررسی</h3>
+
+<h4>خانوادهٔ ۱: یکپارچگی زمانی</h4>
+<table>
+<tr><th width="30%">بررسی</th><th width="14%">شدت</th><th>توضیح</th></tr>
+<tr><td>هم‌ترازی با شبکه</td><td>بحرانی</td>
+    <td>هر زمان باید مضرب دقیق ۳۰۰٬۰۰۰ میلی‌ثانیه باشد.</td></tr>
+<tr><td>تکراری</td><td>بحرانی</td><td>دو کندل با یک زمان باز شدن.</td></tr>
+<tr><td>نامرتب</td><td>هشدار</td>
+    <td>کندل‌ها به‌هم‌ریخته آمده‌اند. خودکار مرتب می‌شوند و فقط یادداشت می‌شود.</td></tr>
+<tr><td>زمان آینده</td><td>بحرانی</td><td>کندلی که تاریخش از حالا جلوتر است.</td></tr>
+<tr><td>کندل گمشده</td><td>بحرانی</td>
+    <td>محاسبهٔ شبکهٔ کامل بین اولین و آخرین کندل و پیدا کردن نقاط غایب.
+        <strong>لیست دقیق زمان‌های گمشده</strong> برگردانده می‌شود.</td></tr>
+<tr><td>کهنگی</td><td>بحرانی / اطلاع</td>
+    <td>اگر آخرین کندل بیش از ۳ کندل عقب باشد ← بحرانی؛ ۱ تا ۳ کندل ← فقط اطلاع.</td></tr>
+</table>
+
+<h4>خانوادهٔ ۲: منطق قیمت</h4>
+<p>
+همان قوانین <span class="ltr">high ≥ max(o,c) ≥ min(o,c) ≥ low</span> و مثبت بودن
+و متناهی بودن (نه <span class="ltr">NaN</span> نه بی‌نهایت). این‌ها در قالب
+Pydantic هم چک می‌شوند، پس اگر اینجا نقض شوند یعنی داده از مسیر دیگری وارد شده —
+باز هم بحرانی محسوب می‌شود.
+</p>
+
+<h4>خانوادهٔ ۳: منطق حجم</h4>
+<ul>
+<li>حجم منفی ← بحرانی.</li>
+<li>بیش از ۲۵٪ کندل‌ها حجم صفر ← بحرانی (یعنی فید مرده است، نه بازار آرام).</li>
+<li>حجمی بیش از ۵۰ برابر میانهٔ حجم‌های مثبت ← فقط هشدار
+    (چون گاهی واقعاً یک انفجار حجمی واقعی رخ می‌دهد).</li>
+</ul>
+
+<h4>خانوادهٔ ۴: ناهنجاری‌های آماری — قسمت هوشمندانه</h4>
+<p>ابتدا بازدهی لگاریتمی محاسبه می‌شود: <span class="ltr">diff(log(close))</span>. سپس دو آزمون:</p>
+<ol>
+<li><strong>سقف مطلق:</strong> هیچ کندل ۵ دقیقه‌ای نباید بیش از ۳۵٪ حرکت کند ← بحرانی.</li>
+<li><strong>z-score مقاوم بر پایهٔ MAD:</strong>
+<pre>median = median(log_returns)
+MAD    = median( |log_returns - median| )
+sigma  = 1.4826 × MAD
+z      = |log_returns - median| / sigma
+if z > 14  ->  WARNING</pre>
+</li>
+</ol>
+<div class="box why">
+<strong>چرا MAD و نه انحراف معیار معمولی؟</strong> این نکتهٔ کلیدی است.
+فرض کن ۱۰۰ کندل داری که همه ۰٫۱٪ حرکت کرده‌اند، و یک کندل خراب که ۴۰٪ پریده.
+اگر انحراف معیار حساب کنی، <em>خود همان کندل خراب</em> انحراف معیار را آن‌قدر بزرگ می‌کند
+که دیگر «غیرعادی» به‌نظر نمی‌رسد و از دست تو فرار می‌کند!
+میانهٔ انحراف مطلق (MAD) نقطهٔ شکست ۵۰٪ دارد: تا وقتی کمتر از نصف داده‌ها خراب نشده‌اند،
+MAD به بدنهٔ سالم داده چسبیده می‌ماند. ضریب ۱٫۴۸۲۶ فقط برای این است که
+MAD را به مقیاس سیگمای توزیع نرمال تبدیل کند.
+</div>
+<p class="small">
+جزئیات ظریف: کندل‌هایی که در آزمون سقف مطلق گیر افتاده‌اند از آزمون MAD حذف می‌شوند
+(<span class="ltr">soft_mask &= ~hard_mask</span>) تا یک کندل دو بار گزارش نشود.
+</p>
+
+<h3>۸-۲. تعمیر خودکار (<span class="ltr">validate_and_heal</span>)</h3>
+
+<div class="flow">
+  ⁨اعتبارسنجی⁩
+      |
+      +-- ⁨قبول شد⁩?  --> ⁨بله⁩ --> ⁨تمام، برگرد⁩
+      |
+      ⁨نه⁩
+      |
+      +-- ⁨آیا قابل تعمیر است⁩? --> ⁨نه⁩ --> ⁨پرتاب⁩ DataIntegrityError
+      |
+      ⁨بله⁩
+      |
+      +--> ⁨صبر با تأخیر نمایی⁩ (⁨۲، ۴، ۸، ۱۶ ثانیه⁩)
+      +--> ⁨محاسبهٔ پنجرهٔ آسیب‌دیده⁩  _heal_window()
+      +--> ⁨فقط همان پنجره را دوباره از صرافی بگیر⁩
+      +--> ⁨ادغام⁩: ⁨کندل‌های قدیمی داخل پنجره دور ریخته می‌شوند⁩
+      +--> ⁨دوباره اعتبارسنجی کن⁩ (⁨حداکثر ۴ بار⁩)
+      |
+      +--> ⁨اگر باز هم خراب بود⁩ --> DataIntegrityError --> ⁨ارز این چرخه رد می‌شود⁩
+</div>
+
+<h4>محاسبهٔ پنجرهٔ تعمیر</h4>
+<p>
+همهٔ زمان‌های مشکوک (کندل‌های گمشده + زمان‌های پیوست‌شده به مشکلات بحرانی) جمع می‌شوند،
+کمینه و بیشینه‌شان گرفته می‌شود و <strong>یک کندل از هر طرف حاشیه</strong> اضافه می‌شود
+تا کندل‌های مرزی هم تازه شوند.
+</p>
+
+<h4>ادغام (<span class="ltr">_merge_blocks</span>)</h4>
+<p>
+همهٔ کندل‌های قدیمی <em>داخل</em> پنجرهٔ آسیب‌دیده دور ریخته می‌شوند و نسخهٔ تازهٔ صرافی
+جایگزین می‌شود. کندل‌های بیرون پنجره حفظ می‌شوند تا عمق تاریخچه از دست نرود.
+</p>
+<div class="box why">
+چرا کندل قدیمی داخل پنجره حذف می‌شود؟ چون اگر فقط «اضافه» می‌کردیم، یک کندل با
+قیمت خراب که زمانش تکراری نبود، از تعمیر جان سالم به در می‌برد.
+نسخهٔ تازهٔ صرافی همیشه مرجع است.
+</div>
+
+<h3>۸-۳. حالت «تاریخی» — یک تمایز حیاتی</h3>
+<p>
+وقتی داریم ۲ سال تاریخچه دانلود می‌کنیم، رفتار سختگیرانه فاجعه‌بار است.
+پس تابع اعتبارسنجی یک پارامتر <span class="ltr">historical=True</span> دارد که
+چهار نوع مشکل را از «بحرانی» به «هشدار» تنزل می‌دهد:
+</p>
+<table>
+<tr><th width="34%">کد مشکل</th><th>چرا در تاریخچه طبیعی است</th></tr>
+<tr><td><span class="ltr">EXCESSIVE_ZERO_VOLUME</span></td>
+    <td>آلت‌کوین‌های کم‌عمق در سال‌های اول واقعاً کندل‌های بدون معامله دارند.</td></tr>
+<tr><td><span class="ltr">RETURN_OUTLIER</span></td>
+    <td>پامپ و کرش‌های واقعی در تاریخ کریپتو وجود داشته‌اند.</td></tr>
+<tr><td><span class="ltr">STALE_DATA</span></td>
+    <td>وقتی داری بازهٔ گذشته را می‌گیری، طبیعتاً «کهنه» است.</td></tr>
+<tr><td><span class="ltr">MISSING_CANDLES</span></td>
+    <td>صرافی در گذشته واقعاً قطعی داشته است.</td></tr>
+</table>
+<div class="box warn">
+فقط خرابی‌های <strong>ساختاری</strong> (منطق OHLC شکسته، قیمت غیرمثبت، زمان ناهم‌تراز،
+تکراری، تاریخ آینده) در حالت تاریخی هم بحرانی می‌مانند.
+در چرخهٔ <em>زنده</em> هیچ تنزلی وجود ندارد و همهٔ قوانین سفت و سخت‌اند —
+چون یک کندل خرابِ <em>همین‌الان</em> باید جلوی معامله را بگیرد.
+</div>
+<p class="small">
+این تمایز نتیجهٔ یک باگ واقعی است: مسیر سختگیرانهٔ قدیمی، پنجره‌های عظیم را
+چهار بار دوباره دانلود می‌کرد و در نهایت <em>هیچ‌چیز</em> ذخیره نمی‌کرد.
+(کامیت‌های <span class="ltr">aaa13c5</span> و <span class="ltr">f545744</span>)
+</p>
+
+<h3>۸-۴. بررسی‌های جانبی</h3>
+<p>
+دفتر سفارش و متریک‌های آتی هم بررسی می‌شوند، ولی <strong>همهٔ مشکلاتشان فقط هشدار است</strong>:
+نبودِ دفتر سفارش باعث می‌شود ویژگی‌های ریزساختار خنثی شوند، نه اینکه چرخه متوقف شود.
+</p>
+</div>
+
+<div class="sec">
+<h2>۹. مرحلهٔ ۴: انبار داده — پایگاه دادهٔ <span class="ltr">SQLite</span></h2>
+
+<div class="box simple">
+همهٔ داده‌ها در یک فایل به اسم <span class="ltr">data/quant.db</span> ذخیره می‌شوند.
+مثل یک دفتر بزرگ با ۶ بخش. هیچ سرور دیتابیس جداگانه‌ای لازم نیست —
+همین یک فایل کافی است، که برای یک سرور مجازی کوچک ایده‌آل است.
+</div>
+
+<h3>۹-۱. شش جدول (<span class="ltr">db_models.py</span>)</h3>
+<table>
+<tr><th width="24%">جدول</th><th>محتوا</th></tr>
+<tr><td><span class="ltr">ohlcv</span></td>
+    <td>کندل‌های تأییدشده. کلید یکتا: (نماد، تایم‌فریم، زمان).</td></tr>
+<tr><td><span class="ltr">order_book_snapshots</span></td>
+    <td>آمار خلاصهٔ دفتر سفارش. کلید یکتا: (نماد، زمان).</td></tr>
+<tr><td><span class="ltr">futures_metrics</span></td>
+    <td>فاندینگ، بهرهٔ باز، نسبت‌ها، لیکوئیدیشن‌ها.</td></tr>
+<tr><td><span class="ltr">audit_logs</span></td>
+    <td>هر تصمیم با ۳۰+ ستون: تصویر ویژگی‌ها، خروجی هر چهار مدل، قانون فعال‌شده.</td></tr>
+<tr><td><span class="ltr">trades</span></td>
+    <td>معاملات کاغذی و واقعی از باز شدن تا بسته شدن.</td></tr>
+<tr><td><span class="ltr">equity_curve</span></td>
+    <td>منحنی سرمایه، یک نقطه در هر چرخه.</td></tr>
+<tr><td><span class="ltr">system_state</span></td>
+    <td>ذخیره‌گاه کلید/مقدار پایدار: وضعیت نگهبان ریسک، انتخاب ارزها،
+        لیست ارزهای آموزش، موجودی کاغذی.</td></tr>
+</table>
+
+<h3>۹-۲. سه تصمیم مهندسی مهم</h3>
+
+<h4>الف) همه‌چیز غیرهمزمان است</h4>
+<p>
+حتی یک فراخوانی همزمان به پایگاه داده وجود ندارد. یعنی چرخهٔ ۵ دقیقه‌ای و پنل وب
+هرگز پشت دیسک منتظر نمی‌مانند.
+</p>
+
+<h4>ب) نوشتن ایدمپوتنت (تکرارپذیر بدون عارضه)</h4>
+<pre>INSERT ... ON CONFLICT (symbol, timeframe, timestamp) DO UPDATE SET ...</pre>
+<p>
+اجرای دوباره یک چرخه یا ذخیرهٔ مجدد یک بلوک تعمیرشده، <strong>هرگز</strong> ردیف تکراری نمی‌سازد.
+</p>
+
+<h4>ج) دو باگ واقعی که اینجا رفع شده‌اند</h4>
+<table>
+<tr><th width="30%">مشکل</th><th>راه‌حل</th></tr>
+<tr><td>سقف پارامترهای SQLite</td>
+    <td>یک بک‌فیل عمیق ۱۰۰ هزار کندل را یک‌جا می‌داد؛ با ۸ ستون یعنی ۸۰۰ هزار پارامتر
+        و شکست کامل. حالا در تکه‌های <strong>۱۰۰۰ ردیفی</strong> نوشته می‌شود.
+        (کامیت <span class="ltr">e67425d</span>)</td></tr>
+<tr><td>«database is locked»</td>
+    <td>SQLite فقط یک نویسنده در لحظه قبول می‌کند. وقتی بک‌فیل روی ۳۰ ارز پخش شده بود
+        و همزمان چرخهٔ ۵ دقیقه‌ای هم می‌نوشت، تراکنش‌ها به هم می‌خوردند.
+        حالا یک <span class="ltr">asyncio.Lock</span> درون‌پروسه‌ای همهٔ تراکنش‌های
+        نوشتن را سریال می‌کند. (کامیت <span class="ltr">d2c5c49</span>)</td></tr>
+</table>
+
+<h3>۹-۳. تنظیمات <span class="ltr">PRAGMA</span></h3>
+<table>
+<tr><th width="34%">تنظیم</th><th>چرا</th></tr>
+<tr><td><span class="ltr">journal_mode=WAL</span></td>
+    <td>حالت «ثبت پیشاپیش»: پنل وب می‌تواند بخواند در حالی که ربات می‌نویسد.</td></tr>
+<tr><td><span class="ltr">busy_timeout=10000</span></td>
+    <td>اگر فایل قفل بود، ۱۰ ثانیه صبر کن به‌جای اینکه فوراً خطا بدهی.
+        این روی <em>هر</em> اتصال استخر اعمال می‌شود، نه فقط اولی.</td></tr>
+<tr><td><span class="ltr">synchronous=NORMAL</span></td>
+    <td>تعادل بین سرعت و ایمنی داده.</td></tr>
+<tr><td><span class="ltr">foreign_keys=ON</span></td><td>یکپارچگی ارجاعی.</td></tr>
+</table>
+
+<h3>۹-۴. بهینه‌سازی مسیر خواندن</h3>
+<p>برای گرفتن «۳۰۰۰ کندل آخر»، کد این کار را می‌کند:</p>
+<pre>SELECT ... ORDER BY timestamp DESC LIMIT 3000
+-- ⁨استفاده از ایندکس، سپس در حافظه مرتب می‌شود⁩</pre>
+<div class="box why">
+اگر <span class="ltr">ORDER BY timestamp ASC</span> می‌نوشتیم و بعد LIMIT می‌زدیم،
+کندل‌های <em>قدیمی‌ترین</em> برمی‌گشتند. و اگر می‌خواستیم آخری‌ها را از مرتب‌سازی صعودی
+بگیریم، دیتابیس مجبور می‌شد کل جدول (میلیون‌ها ردیف) را اسکن کند.
+مرتب‌سازی نزولی + LIMIT یک «جست‌وجوی ایندکس» است، نه اسکن جدول.
+</div>
+
+<h3>۹-۵. متدهای اصلی</h3>
+<table>
+<tr><th width="38%">متد</th><th>کار</th></tr>
+<tr><td><span class="ltr">upsert_candles()</span></td><td>درج/به‌روزرسانی دسته‌ای کندل‌ها.</td></tr>
+<tr><td><span class="ltr">load_ohlcv_dataframe()</span></td><td>خواندن کندل‌ها به‌صورت جدول pandas با شاخص زمانی UTC.</td></tr>
+<tr><td><span class="ltr">latest / earliest_candle_timestamp()</span></td>
+    <td>جدیدترین و قدیمی‌ترین کندل ذخیره‌شده — پایهٔ بک‌فیل هوشمند.</td></tr>
+<tr><td><span class="ltr">candle_count()</span></td><td>شمارش کندل‌های یک ارز.</td></tr>
+<tr><td><span class="ltr">insert_audit_logs()</span></td><td>درج دسته‌ای رکوردهای ثبت وقایع در یک تراکنش.</td></tr>
+<tr><td><span class="ltr">insert_trade() / update_trade()</span></td><td>ثبت باز شدن و بسته شدن معامله.</td></tr>
+<tr><td><span class="ltr">set_state() / get_state()</span></td><td>ذخیره‌گاه کلید/مقدار پایدار (JSON).</td></tr>
+<tr><td><span class="ltr">purge_audit_logs()</span></td><td>حذف رکوردهای قدیمی‌تر از N روز.</td></tr>
+</table>
+</div>
+
+<div class="sec">
+<h2>۱۰. خط لولهٔ ماژول A — <span class="ltr">pipeline.py</span></h2>
+
+<p>این فایل تنها چیزی است که <span class="ltr">main.py</span> از ماژول A لازم دارد بشناسد. دو کار می‌کند.</p>
+
+<h3>۱۰-۱. پر کردن تاریخچه (<span class="ltr">bootstrap_history</span>)</h3>
+<p>
+برای هر ارز، ابتدا محاسبه می‌شود که چه چیزی <em>کم است</em>:
+</p>
+<pre>end           = last_closed_candle_open_ms()
+default_start = end - (210240 × 5m)
+newest        = latest_candle_timestamp(symbol)
+oldest        = earliest_candle_timestamp(symbol)
+# ⁨هدف⁩: ⁨پوشش ۲ سال گذشته⁩</pre>
+<p>سپس <strong>دو</strong> بازهٔ احتمالی ساخته می‌شود:</p>
+<table>
+<tr><th width="30%">بازه</th><th>شرط</th><th>هدف</th></tr>
+<tr><td>تاریخچهٔ قدیمی‌تر</td>
+    <td><span class="ltr">oldest - 5m ≥ default_start</span></td>
+    <td>از <span class="ltr">default_start</span> تا قبل از قدیمی‌ترین کندل موجود.</td></tr>
+<tr><td>دنبالهٔ رو به جلو</td>
+    <td><span class="ltr">newest + 5m ≤ end</span></td>
+    <td>از بعد از جدیدترین کندل موجود تا حالا.</td></tr>
+</table>
+<div class="box warn">
+<strong>یک باگ مهم که رفع شده:</strong> نسخهٔ قدیمی فقط «دنبالهٔ رو به جلو» را می‌گرفت.
+یعنی اگر جدولت ۱۰۰۰ کندل داشت و بعد هدف را به ۲ سال زیاد می‌کردی،
+هیچ‌وقت عمیق‌تر نمی‌شد — تا ابد کم‌عمق می‌ماند. حالا هر دو سمت پوشش داده می‌شود.
+(کامیت <span class="ltr">d7e7c9f</span>)
+</div>
+<p>
+هر بازه جداگانه دانلود، با حالت <strong>تاریخی</strong> اعتبارسنجی، و ذخیره می‌شود.
+اگر QC مشکل ساختاری پیدا کند، هشدار داده می‌شود ولی <em>کندل‌های سالم باز هم ذخیره می‌شوند</em>.
+</p>
+<p>
+همهٔ ارزها با <span class="ltr">asyncio.gather</span> موازی پردازش می‌شوند،
+اما تحت یک <span class="ltr">Semaphore</span>. شکست یک ارز، بقیه را متوقف نمی‌کند.
+</p>
+
+<h3>۱۰-۲. چرخهٔ زنده (<span class="ltr">run_cycle</span>)</h3>
+<p>برای هر ارز، تابع <span class="ltr">_process_symbol()</span> این‌ها را انجام می‌دهد:</p>
+<div class="step"><span class="num">۱</span>
+سه درخواست <strong>موازی</strong>: کندل‌ها، دفتر سفارش، متریک‌های آتی
+(با <span class="ltr">return_exceptions=True</span> تا شکست یکی بقیه را نکشد).
+</div>
+<div class="step"><span class="num">۲</span>
+اگر کندل‌ها شکست خوردند ← این ارز <span class="ltr">None</span> برمی‌گرداند و حذف می‌شود.
+اگر فقط دفتر سفارش یا متریک شکست خورد ← هشدار و ادامه با مقدار <span class="ltr">None</span>.
+</div>
+<div class="step"><span class="num">۳</span>
+عبور از پلیس کیفیت با تعمیر خودکار.
+</div>
+<div class="step"><span class="num">۴</span>
+بررسی‌های جانبی و ساخت گزارش کیفیت غنی‌شده.
+</div>
+<div class="step"><span class="num">۵</span>
+ذخیره در پایگاه داده.
+</div>
+<div class="step"><span class="num">۶</span>
+برگرداندن یک <span class="ltr">MarketDataBundle</span>.
+</div>
+<p>
+در پایان، فقط ارزهایی که <span class="ltr">is_valid</span> هستند در دیکشنری خروجی می‌مانند.
+<strong>ارزی که رد شده، اصلاً در خروجی نیست</strong> — پس ماژول‌های بعدی حتی نمی‌بینندش.
+</p>
+
+<h3>۱۰-۳. تابع <span class="ltr">required_lookback_bars()</span></h3>
+<p>حداقل تاریخچه‌ای که ماژول B لازم دارد:</p>
+<pre>max(garch_window=500, hmm_window=1000, rank_window=288,
+    fdi_window=30, kama_slow=30, atr_window=14) + 50
+= 1050 bars</pre>
+<p>یعنی برای هر ارز، دست‌کم حدود ۱۰۵۰ کندل (حدود ۳٫۶ روز) لازم است تا ویژگی‌ها گرم شوند.</p>
+</div>
+
+<div class="sec">
+<h2>۱۱. مرحلهٔ ۵: ساخت ویژگی‌ها — <span class="ltr">indicators.py</span> و <span class="ltr">features.py</span></h2>
+
+<div class="box simple">
+تا اینجا فقط چهار عدد خام داریم: باز، بالا، پایین، بسته. ولی مدل با عدد خام
+چیزی یاد نمی‌گیرد. باید از این چهار عدد، سؤال‌های معنی‌دار بسازیم:
+«روند بالاست یا پایین؟» «بازار الان آرام است یا دیوانه؟» «حجم غیرعادی است؟»
+هر جواب یک «ویژگی» است. در پایان <strong>۲۶ ویژگی</strong> ساخته می‌شود.
+</div>
+
+<div class="box warn">
+<strong>قانون طلایی این بخش:</strong> مقدار هر ویژگی در کندل <span class="ltr">t</span>
+فقط و فقط می‌تواند از داده‌های کندل <span class="ltr">t</span> و قبل‌تر ساخته شود.
+هیچ پنجرهٔ متمرکز (<span class="ltr">center=True</span>)، هیچ پرکردن رو به عقب
+(<span class="ltr">backward fill</span>)، هیچ <span class="ltr">shift(-k)</span>.
+این «علّی بودن» نام دارد و نقض آن، تنها اشتباهی است که یک بک‌تست سودآور را
+به یک سیستم زیان‌ده در دنیای واقعی تبدیل می‌کند.
+</div>
+
+<h3>۱۱-۱. اندیکاتورهای پایه (<span class="ltr">indicators.py</span>)</h3>
+<p class="small">
+همه از صفر با NumPy/pandas نوشته شده‌اند. کتابخانهٔ <span class="ltr">ta-lib</span>
+عمداً استفاده نشده چون یک افزونهٔ C کامپایل‌شده لازم دارد که روی یک VPS کوچک دردسر است.
+</p>
+
+<h4>محدودهٔ واقعی (True Range) و ATR</h4>
+<pre>TR  = max( high - low, |high - prev_close|, |low - prev_close| )
+ATR = wilder_smooth(TR, window)
+# ⁨هموارسازی وایلدر⁩ = ⁨میانگین نمایی با⁩ alpha = 1/window</pre>
+<div class="box simple">
+ATR یعنی «معمولاً این ارز در ۵ دقیقه چقدر تکان می‌خورد؟»
+اگر ATR بیت‌کوین ۱۰۰ دلار و ATR یک آلت‌کوین ۰٫۰۰۱ دلار باشد، هر دو
+ممکن است به یک اندازه «پرنوسان» باشند نسبت به قیمت خودشان.
+ATR واحد سنجش نوسان است و همهٔ حد سود و ضررها بر مبنای آن ساخته می‌شوند.
+</div>
+
+<h4>RSI (شاخص قدرت نسبی)</h4>
+<p>
+سودها و ضررهای هر کندل جدا می‌شوند، هر کدام با روش وایلدر هموار می‌شوند،
+و نسبتشان به عدد ۰ تا ۱۰۰ تبدیل می‌شود. کد حالت‌های خاص را هم می‌پوشاند:
+اگر هیچ ضرری نبوده ← ۱۰۰؛ اگر هیچ سودی نبوده ← ۰ (به‌جای بی‌نهایت).
+</p>
+
+<h4>KAMA — میانگین متحرک تطبیقی کافمن</h4>
+<pre>ER     = |close_t - close_{t-n}| / sum(|close_i - close_{i-1}|)
+SC     = ( ER × (2/(fast+1) - 2/(slow+1)) + 2/(slow+1) )²
+KAMA_t = KAMA_{t-1} + SC × (close_t - KAMA_{t-1})
+# ER = ⁨نسبت کارایی ،⁩ SC = ⁨ثابت هموارسازی⁩</pre>
+<div class="box simple">
+«نسبت کارایی» (ER) می‌پرسد: «برای رسیدن از A به B، مسیر مستقیم رفتی یا زیگزاگ؟»
+اگر مستقیم رفته باشد (روند تمیز)، ER نزدیک ۱ می‌شود و KAMA تقریباً چسبیده به قیمت حرکت می‌کند.
+اگر زیگزاگ رفته باشد (بازار درهم)، ER نزدیک ۰ می‌شود و KAMA صاف و بی‌حرکت می‌ماند.
+یعنی KAMA خودش می‌فهمد کِی باید حساس باشد و کِی نباید فریب نویز را بخورد.
+</div>
+<p class="small">
+این بازگشتی است و نمی‌شود کاملاً برداری‌اش کرد، پس با یک حلقهٔ NumPy با پیچیدگی
+<span class="ltr">O(n)</span> نوشته شده — که به‌مراتب سریع‌تر از
+<span class="ltr">rolling.apply</span> است.
+</p>
+
+<h4>FDI — شاخص بُعد فراکتالی</h4>
+<pre># ⁨در هر پنجره قیمت‌ها به بازهٔ صفر تا یک نرمال می‌شوند⁩
+path_length = sum( sqrt( dy² + (1/n)² ) )
+FDI         = 1 + ( ln(path_length) + ln(2) ) / ln(2n)</pre>
+<table>
+<tr><th width="20%">مقدار FDI</th><th>معنی</th></tr>
+<tr><td>حدود ۱٫۰</td><td>خط صاف — روند خالص و تمیز.</td></tr>
+<tr><td>حدود ۱٫۵</td><td>گشت تصادفی — هیچ ساختار قابل بهره‌برداری نیست.</td></tr>
+<tr><td>حدود ۲٫۰</td><td>مسیر تمام صفحه را پر کرده — بازار درهم و پرنوسان.</td></tr>
+</table>
+<div class="box simple">
+تصور کن یک مورچه از گوشهٔ چپ کاغذ به گوشهٔ راست می‌رود. اگر مستقیم برود،
+یک «خط» است (بُعد ۱). اگر آن‌قدر بالا و پایین برود که تمام کاغذ را سیاه کند،
+دیگر خط نیست، «سطح» است (بُعد ۲). FDI دقیقاً همین را اندازه می‌گیرد.
+</div>
+<p>
+از FDI یک ویژگی دودویی هم ساخته می‌شود:
+<span class="ltr">fdi_trending = (fdi &lt; 1.5)</span> — یعنی «آیا بازار روند دارد؟»
+</p>
+<p class="small">
+محاسبه با <span class="ltr">sliding_window_view</span> کاملاً برداری است.
+پنجرهٔ کاملاً صاف (بدون تغییر قیمت) به‌عنوان گشت تصادفی (۱٫۵) در نظر گرفته می‌شود.
+</p>
+
+<h4>ADX و DI</h4>
+<p>
+<span class="ltr">+DM</span> و <span class="ltr">-DM</span> از حرکت سقف و کف محاسبه می‌شوند،
+با ATR نرمال شده و هموار می‌شوند تا <span class="ltr">+DI</span> و <span class="ltr">-DI</span> بدهند.
+ADX قدرت روند (بدون توجه به جهت) را می‌سنجد. ویژگی
+<span class="ltr">di_spread = (+DI - -DI)/100</span> جهت روند را می‌دهد.
+</p>
+
+<h4>باندهای بولینگر</h4>
+<p>
+میانگین متحرک ± ۲ انحراف معیار. سه خروجی: خط میانی، عرض باند نسبی،
+و موقعیت قیمت داخل باند (٪b). <em>در مجموعهٔ نهایی ویژگی‌های مدل استفاده نمی‌شود</em>
+ولی محاسبه می‌شود.
+</p>
+
+<h4>تبدیل‌های ایستا (Stationary)</h4>
+<table>
+<tr><th width="34%">تابع</th><th>کار</th></tr>
+<tr><td><span class="ltr">rolling_percentile_rank()</span></td>
+    <td>«این مقدار نسبت به ۲۸۸ کندل گذشتهٔ خودش چقدر بزرگ است؟» خروجی بین ۰ و ۱.</td></tr>
+<tr><td><span class="ltr">rolling_zscore()</span></td>
+    <td>چند انحراف معیار از میانگین متحرک فاصله دارد.</td></tr>
+<tr><td><span class="ltr">slope()</span></td>
+    <td>تغییر N کندلی تقسیم بر سطح فعلی — قابل مقایسه بین بیت‌کوین و پپه.</td></tr>
+</table>
+<div class="box why">
+چرا «رتبهٔ درصدی» به‌جای مقدار خام؟ چون درخت‌های تصمیم روی مقدارهای مطلقِ
+غیرایستا تعمیم نمی‌دهند. اگر مدل یاد بگیرد «حجم بالای ۵ میلیون یعنی خطر»،
+شش ماه بعد که کل بازار ۱۰ برابر شده، آن قانون بی‌معنی است.
+اما «حجم در صدک ۹۵ خودش» همیشه معنی یکسانی دارد.
+پنجرهٔ ۲۸۸ کندلی دقیقاً ۲۴ ساعت است.
+</div>
+
+<h3>۱۱-۲. ویژگی‌های پیشرفته (<span class="ltr">features.py</span>)</h3>
+
+<h4>الف) بازدهی و مومنتوم</h4>
+<pre>log_return_1  = log(close).diff(1)     # ⁨۵ دقیقه⁩
+log_return_3  = log(close).diff(3)     # ⁨۱۵ دقیقه⁩
+log_return_12 = log(close).diff(12)    # ⁨۱ ساعت⁩
+momentum_rank = rolling_percentile_rank(log_return_12, 288)</pre>
+
+<h4>ب) بستر روند</h4>
+<pre>kama_distance = (close - KAMA) / close     # ⁨فاصله از میانگین تطبیقی⁩
+kama_slope    = slope(KAMA, 5)             # ⁨جهت روند⁩
+adx                                        # ⁨قدرت روند⁩
+di_spread     = (+DI - -DI) / 100          # ⁨سمت روند⁩</pre>
+
+<h4>ج) بستر تایم‌فریم بالاتر — جایی که بیشترِ لبهٔ جهتی از آن می‌آید</h4>
+<p>
+همه از روی همان سری ۵ دقیقه‌ای ساخته می‌شوند (۱۲ کندل = ۱ ساعت، ۴۸ کندل = ۴ ساعت).
+<strong>هیچ نمونه‌برداری مجددی انجام نمی‌شود</strong>، پس علّی بودن حفظ می‌شود.
+</p>
+<table>
+<tr><th width="34%">ویژگی</th><th>معنی</th></tr>
+<tr><td><span class="ltr">htf_ema_slope_1h</span></td><td>شیب میانگین نمایی ۱ ساعته، نرمال‌شده با قیمت.</td></tr>
+<tr><td><span class="ltr">htf_ema_slope_4h</span></td><td>شیب میانگین نمایی ۴ ساعته.</td></tr>
+<tr><td><span class="ltr">htf_close_vs_ema_4h</span></td><td>فاصلهٔ قیمت فعلی از میانگین ۴ ساعته.</td></tr>
+<tr><td><span class="ltr">htf_return_4h</span></td><td>بازدهی لگاریتمی ۴۸ کندلی.</td></tr>
+<tr><td><span class="ltr">htf_trend_align</span></td>
+    <td><span class="ltr">sign(slope_1h) × sign(slope_4h)</span>:
+        <strong>۱+</strong> هر دو صعودی، <strong>۱-</strong> هر دو نزولی،
+        <strong>۰</strong> اختلاف نظر.</td></tr>
+</table>
+<div class="box simple">
+مثل این است که وقتی داری در یک کوچه راه می‌روی، سرت را بلند کنی و ببینی
+کل خیابان به کدام سمت شیب دارد. یک ربات ۵ دقیقه‌ای که فقط ۵ دقیقهٔ بعدی را می‌بیند،
+مثل کسی است که با چشم روی زمین راه می‌رود.
+</div>
+
+<h4>د) نوسان</h4>
+<pre>atr_pct  = ATR / close                          # ⁨ویژگی مدل⁩
+atr_rank = rolling_percentile_rank(atr_pct, 288) # ⁨فقط برای برچسب‌زن⁩</pre>
+
+<h4>ه) حجم</h4>
+<pre>volume_zscore = rolling_zscore(volume, 288)
+volume_trend  = mean(volume, 12) / mean(volume, 96) - 1</pre>
+
+<h4>و) GARCH — پیش‌بینی نوسان فردا</h4>
+<div class="box simple">
+GARCH یک قانون ساده دارد: «نوسان خوشه‌ای است». روز شلوغ بعد از روز شلوغ می‌آید،
+روز آرام بعد از روز آرام. پس با نگاه به نوسان دیروز، می‌شود نوسان فردا را حدس زد.
+</div>
+<p>رابطهٔ بازگشتی GARCH(1,1):</p>
+<pre>sigma²_{t+1} = omega + alpha × eps²_t + beta × sigma²_t</pre>
+<p>روش کار در کد:</p>
+<ol>
+<li>مدل هر <strong>۵۰ کندل</strong> روی پنجرهٔ <strong>۵۰۰ کندل اخیر</strong> دوباره برازش می‌شود.</li>
+<li>بین دو برازش، همان رابطهٔ بالا با بازدهی‌های واقعی جلو برده می‌شود —
+    که هم علّی است و هم ارزان.</li>
+<li>خروجی در کندل <span class="ltr">t</span> پیش‌بینی <strong>یک قدم جلوتر</strong> است،
+    که طبق تعریف در لحظهٔ <span class="ltr">t</span> معلوم است.</li>
+<li>بازدهی‌ها ×۱۰۰ می‌شوند (کتابخانهٔ <span class="ltr">arch</span> با درصد بهتر کار می‌کند)
+    و نتیجه دوباره تقسیم می‌شود.</li>
+</ol>
+<p><strong>محافظت‌ها:</strong></p>
+<ul>
+<li>اگر پارامترها بی‌معنی باشند (<span class="ltr">omega ≤ 0</span> یا
+    <span class="ltr">alpha + beta ≥ 1</span> که یعنی مدل غیرایستا است)، برازش رد می‌شود
+    و برازش قبلی نگه داشته می‌شود.</li>
+<li>اگر کتابخانهٔ <span class="ltr">arch</span> نصب نباشد یا برازش شکست بخورد،
+    به نوسان EWMA (سبک RiskMetrics) تنزل پیدا می‌کند.</li>
+</ul>
+<div class="box why">
+چرا تنزل به EWMA به‌جای برگرداندن <span class="ltr">NaN</span>؟
+چون یک ویژگیِ ضعیف‌تر قابل بازیابی است، اما یک حفرهٔ <span class="ltr">NaN</span>
+باعث می‌شود آن ردیف کاملاً حذف شود و ممکن است کل ارز از دور خارج شود.
+</div>
+
+<h4>ز) HMM — تشخیص رژیم بازار</h4>
+<div class="box simple">
+بازار «حالت»های مختلفی دارد: گاوی (صعودی)، خرسی (نزولی)، پرنوسان، و راکد.
+مدل مارکوف پنهان سعی می‌کند بفهمد بازار الان در کدام حالت است —
+بدون اینکه کسی به او گفته باشد این حالت‌ها چه هستند.
+</div>
+<p><strong>سه کانال مشاهده</strong> که به مدل داده می‌شود:</p>
+<table>
+<tr><th width="30%">کانال</th><th>چه چیزی را جدا می‌کند</th></tr>
+<tr><td>بازدهی علامت‌دار</td><td>جهت (گاوی از خرسی)</td></tr>
+<tr><td><span class="ltr">log(high/low)</span></td><td>نوسان و اره‌شدگی</td></tr>
+<tr><td>حجم نسبی</td><td>میزان مشارکت</td></tr>
+</table>
+
+<h4>دو نکتهٔ فنی حیاتی در پیاده‌سازی HMM</h4>
+
+<div class="step"><span class="num">۱</span>
+<strong>فقط فیلتر رو به جلو (آلفا)، نه ویتربی و نه هموارسازی.</strong>
+<p>
+الگوریتم‌های معمول HMM (مثل ویتربی یا forward-backward) برای تعیین حالت در لحظهٔ
+<span class="ltr">t</span> از داده‌های <span class="ltr">t+1</span> تا انتها هم استفاده می‌کنند.
+این یعنی <strong>نگاه کردن به آینده</strong>. کد اینجا فقط بازگشت آلفا را در فضای لگاریتمی
+اجرا می‌کند که فقط از <span class="ltr">x_1</span> تا <span class="ltr">x_t</span> استفاده می‌کند.
+</p>
+</div>
+
+<div class="step"><span class="num">۲</span>
+<strong>نگاشت به یک تاکسونومی پایدار.</strong>
+<p>
+کتابخانهٔ <span class="ltr">hmmlearn</span> به حالت‌ها شماره‌های <em>دلخواه</em> می‌دهد،
+و این شماره‌ها در هر برازش مجدد عوض می‌شوند! پس شمارهٔ خام کاملاً بی‌معنی است.
+تابع <span class="ltr">_canonical_state_map()</span> از روی میانگین‌های انتشار،
+حالت‌ها را به چهار رژیم ثابت نگاشت می‌کند:
+</p>
+<ul>
+<li>حالتی که بیشترین میانگین <em>دامنه</em> را دارد ← <strong>پرنوسان</strong> (۲).</li>
+<li>از بقیه، بیشترین میانگین <em>بازدهی</em> ← <strong>روند گاوی</strong> (۰).</li>
+<li>از بقیه، کمترین میانگین بازدهی ← <strong>روند خرسی</strong> (۱).</li>
+<li>باقی‌مانده ← <strong>راکد</strong> (۳).</li>
+</ul>
+</div>
+<div class="box why">
+بدون این نگاشت، ویژگی «رژیم» در هر برازش معنی‌اش عوض می‌شد و مدل فقط نویز یاد می‌گرفت.
+</div>
+
+<p>شش ویژگی از HMM بیرون می‌آید:</p>
+<table>
+<tr><th width="34%">ویژگی</th><th>معنی</th></tr>
+<tr><td><span class="ltr">hmm_regime</span></td><td>رژیم غالب فعلی (۰ تا ۳، یا ۱- قبل از گرم شدن).</td></tr>
+<tr><td><span class="ltr">hmm_prob_bull</span></td><td>احتمال فیلترشدهٔ رژیم گاوی.</td></tr>
+<tr><td><span class="ltr">hmm_prob_bear</span></td><td>احتمال رژیم خرسی.</td></tr>
+<tr><td><span class="ltr">hmm_prob_high_vol</span></td><td>احتمال رژیم پرنوسان.</td></tr>
+<tr><td><span class="ltr">hmm_prob_sideways</span></td><td>احتمال رژیم راکد.</td></tr>
+<tr><td><span class="ltr">hmm_regime_age</span></td>
+    <td>چند کندل است که رژیم فعلی ادامه دارد، تقسیم بر ۴۸ و با سقف ۵.</td></tr>
+</table>
+<p class="small">
+تابع چگالی گاوسی قطری دستی پیاده‌سازی شده تا فیلتر به جزئیات داخلی
+<span class="ltr">hmmlearn</span> که بین نسخه‌ها عوض می‌شوند وابسته نباشد.
+همچنین توابع <span class="ltr">_log_sum_exp</span> و <span class="ltr">_log_matmul</span>
+برای پایداری عددی در فضای لگاریتمی نوشته شده‌اند.
+</p>
+
+<h4>ح) ریزساختار — محاسبه می‌شود ولی وارد مدل نمی‌شود</h4>
+<p>
+دفتر سفارش و متریک‌های آتی با <span class="ltr">merge_asof(direction="backward")</span>
+به کندل‌ها چسبانده می‌شوند. جهت «backward» یعنی هر کندل فقط با اسنپ‌شاتی جفت می‌شود
+که زمانش <em>کمتر یا مساوی</em> زمان خودش است — همان اصل علّی بودن.
+</p>
+<div class="box warn">
+<strong>چرا این ویژگی‌ها به مدل داده نمی‌شوند؟</strong>
+چون بایننس هیچ فید تاریخی عمیقی از دفتر سفارش یا لیکوئیدیشن ارائه نمی‌دهد.
+یعنی در دیتاست آموزشی که از تاریخچه ساخته می‌شود، این ستون‌ها همه
+<em>ثابت</em> هستند. اگر مدل روی ستون ثابت آموزش ببیند و بعد در زنده
+مقدار متغیر بگیرد، یک انحراف آموزش/سرویس ایجاد می‌شود که به مدل ضربه می‌زند.
+پس این‌ها فقط برای <strong>نمایش در پنل</strong> و <strong>قواعد جایگزین مدل‌ها</strong> نگه داشته می‌شوند.
+</div>
+
+<h3>۱۱-۳. قرارداد نهایی: ۲۶ ویژگی مدل</h3>
+<p>
+ثابت <span class="ltr">FEATURE_COLUMNS</span> یک تاپل مرتب است.
+<strong>ترتیب بخشی از قرارداد است</strong>: مدل ذخیره‌شده ویژگی‌ها را دقیقاً با همین چیدمان
+انتظار دارد، چون درخت‌ها ویژگی‌ها را با شماره (نه با اسم) می‌شناسند.
+</p>
+<table>
+<tr><th width="20%">دسته</th><th width="12%">تعداد</th><th>ویژگی‌ها</th></tr>
+<tr><td>روند / جهت</td><td>۴</td>
+    <td><span class="ltr">kama_distance, kama_slope, adx, di_spread</span></td></tr>
+<tr><td>ساختار</td><td>۲</td><td><span class="ltr">fdi, fdi_trending</span></td></tr>
+<tr><td>مومنتوم</td><td>۵</td>
+    <td><span class="ltr">rsi, log_return_1, log_return_3, log_return_12, momentum_rank</span></td></tr>
+<tr><td>تایم‌فریم بالاتر</td><td>۵</td>
+    <td><span class="ltr">htf_ema_slope_1h, htf_ema_slope_4h, htf_close_vs_ema_4h,
+        htf_return_4h, htf_trend_align</span></td></tr>
+<tr><td>نوسان</td><td>۲</td><td><span class="ltr">atr_pct, garch_volatility</span></td></tr>
+<tr><td>رژیم</td><td>۶</td>
+    <td><span class="ltr">hmm_regime, hmm_prob_bull, hmm_prob_bear, hmm_prob_high_vol,
+        hmm_prob_sideways, hmm_regime_age</span></td></tr>
+<tr><td>حجم</td><td>۲</td><td><span class="ltr">volume_zscore, volume_trend</span></td></tr>
+<tr><th colspan="2">مجموع</th><th>۲۶ ویژگی</th></tr>
+</table>
+<p class="small">
+نکته: در کد ثابت <span class="ltr">_ARTIFACT_VERSION = "2.0.0"</span> این قرارداد
+۲۶ ویژگی‌ای را علامت‌گذاری می‌کند. اگر فایل مدل ذخیره‌شده نسخهٔ دیگری داشته باشد،
+هنگام بارگذاری <strong>رد می‌شود</strong> و مدل مجبور به آموزش دوباره است.
+(در توضیحات کد گاهی عدد ۲۱ ذکر شده که مربوط به یک نسخهٔ میانی بوده؛
+مقدار واقعی فعلی ۲۶ است.)
+</p>
+
+<h3>۱۱-۴. اجرای بدون بلوکه کردن (<span class="ltr">FeatureService</span>)</h3>
+<p>
+ساخت ویژگی کار سنگین CPU است. اگر روی حلقهٔ اصلی رویداد اجرا شود، پنل وب هنگ می‌کند.
+پس به‌صورت پیش‌فرض با <span class="ltr">asyncio.to_thread</span> به یک نخ کارگر
+منتقل می‌شود (pandas و NumPy در کرنل‌های عددی سنگین GIL را آزاد می‌کنند، پس
+واقعاً موازی می‌شود). برای بک‌تست‌های عریض می‌شود
+<span class="ltr">use_process_pool=True</span> گذاشت.
+</p>
+<p>
+متد <span class="ltr">build_many()</span> چند ارز را همزمان پردازش می‌کند و
+ارزی که شکست بخورد فقط لاگ می‌شود و از نتیجه حذف می‌شود — کل چرخه از بین نمی‌رود.
+</p>
+</div>
+
+<div class="sec">
+<h2>۱۲. مرحلهٔ ۶: معلمِ مدل — برچسب‌زنی (<span class="ltr">labeler.py</span>)</h2>
+
+<div class="box simple">
+مدل باید یاد بگیرد. ولی از روی چه چیزی؟ ما باید به او بگوییم
+«در این لحظه، جواب <em>درست</em> این بود». برای این کار به گذشته برمی‌گردیم،
+از هر نقطه یک معاملهٔ فرضی باز می‌کنیم، و می‌بینیم چه شد.
+</div>
+
+<div class="box warn">
+این <strong>تنها فایلی</strong> است که اجازه دارد به آینده نگاه کند —
+چون دارد «جواب صحیح» را می‌سازد. به همین دلیل کد آن را
+<strong>هرگز</strong> در مسیر پیش‌بینی زنده وارد نمی‌کند.
+فایل <span class="ltr">processor.py</span> این جدایی را با دو تابع کاملاً مجزا تضمین می‌کند.
+</div>
+
+<h3>۱۲-۱. شبیه‌سازی سه‌مانعی (Triple Barrier)</h3>
+<p>در هر کندل، <strong>دو</strong> معاملهٔ فرضی همزمان باز می‌شود: یک لانگ و یک شورت.</p>
+<pre>tp_distance = 2.0 × ATR     # ⁨فاصلهٔ حد سود⁩
+sl_distance = 1.0 × ATR     # ⁨فاصلهٔ حد ضرر⁩
+horizon     = 48 bars       # ⁨افق ۴ ساعته⁩</pre>
+<p>سه «مانع» وجود دارد و اولین مانعی که لمس شود، معامله را می‌بندد:</p>
+<table>
+<tr><th width="26%">مانع</th><th>نتیجه</th></tr>
+<tr><td>حد سود (بالا/پایین)</td><td><span class="ltr">TAKE_PROFIT</span> — برنده</td></tr>
+<tr><td>حد ضرر (پایین/بالا)</td><td><span class="ltr">STOP_LOSS</span> — بازنده</td></tr>
+<tr><td>مانع زمانی (۴۸ کندل)</td><td><span class="ltr">EXPIRED</span> — با قیمت پایان افق بسته می‌شود</td></tr>
+</table>
+
+<h3>۱۲-۲. سه انتخاب طراحی که برچسب‌ها را صادقانه نگه می‌دارند</h3>
+
+<div class="step"><span class="num">۱</span>
+<strong>بدترین ترتیب ممکن داخل کندل.</strong>
+<p>
+دادهٔ ۵ دقیقه‌ای نمی‌گوید که اول سقف آمد یا اول کف. اگر یک کندل <em>هم</em> حد سود
+و <em>هم</em> حد ضرر را لمس کرده باشد، کد فرض می‌کند <strong>حد ضرر اول خورده</strong>.
+</p>
+<pre>stop_first = sl_any & (~tp_any | (first_sl &lt;= first_tp))</pre>
+<div class="box why">
+هر فرض دیگری، «برندهٔ خیالی» می‌سازد. اگر خوش‌بین باشی، بک‌تستت زیبا می‌شود
+و حساب واقعی‌ات خالی.
+</div>
+</div>
+
+<div class="step"><span class="num">۲</span>
+<strong>خروج در قیمت مانع، نه قیمت بسته‌شدن.</strong>
+معاملهٔ حل‌شده دقیقاً در قیمت مانع بسته می‌شود؛ فقط معاملهٔ منقضی‌شده در
+قیمت پایان افق ارزش‌گذاری می‌شود.
+</div>
+
+<div class="step"><span class="num">۳</span>
+<strong>«درد مسیر» اندازه‌گیری می‌شود، نه نادیده گرفته.</strong>
+<p>
+بیشترین حرکت خلاف جهت (MAE) در طول مسیر ثبت و به‌صورت کسری از فاصلهٔ حد ضرر بیان می‌شود.
+</p>
+<div class="box simple">
+دو معامله هر دو با سود بسته شده‌اند. ولی یکی از اول تا آخر در سود بوده،
+و آن یکی سه ساعت روی لبهٔ حد ضرر می‌لرزیده. این دو معامله
+<strong>یکی نیستند</strong> — و ستون «ردهٔ ریسک» دقیقاً همین را می‌گوید.
+</div>
+</div>
+
+<h3>۱۲-۳. اجرای برداری و کارآمد</h3>
+<p>
+شبیه‌سازی با <span class="ltr">sliding_window_view</span> و
+<span class="ltr">np.minimum.accumulate / np.maximum.accumulate</span> انجام می‌شود،
+یعنی کل تاریخچه در چند عبور آرایه‌ای حل می‌شود، نه با حلقهٔ دوگانهٔ پایتون.
+کار در تکه‌های ۲۰٬۰۰۰ ردیفی انجام می‌شود تا مصرف حافظه محدود بماند.
+</p>
+<p class="small">
+مقیاس مانع: اول ATR، اگر گرم نشده بود پیش‌بینی GARCH ضربدر قیمت،
+و در نهایت ۰٫۲۵٪ قیمت به‌عنوان کف منطقی.
+</p>
+
+<h3>۱۲-۴. انتخاب برچسب نهایی (<span class="ltr">_classify</span>)</h3>
+<ol>
+<li>یک سمت فقط وقتی «برنده» است که <strong>حد سودش</strong> معامله را حل کرده باشد.</li>
+<li>اگر هر دو سمت برنده باشند (بازار اره‌ای که هر دو طرف را در افق زده)،
+    سمتی که <strong>زودتر</strong> حل شده برنده است؛ در صورت تساوی، سمتی که
+    <strong>درد کمتری</strong> داشته.</li>
+<li>ردهٔ ریسک برنده از روی MAE محاسبه و با رژیم نوسان تشدید می‌شود.</li>
+<li>اگر رده به <span class="ltr">VERY_HIGH</span> رسید، برچسب به
+    <span class="ltr">NO_TRADE</span> تبدیل می‌شود.</li>
+</ol>
+
+<h4>جدول ردهٔ ریسک</h4>
+<table>
+<tr><th width="34%">نسبت MAE</th><th>ردهٔ پایه</th></tr>
+<tr><td>≤ ۰٫۳۵</td><td><span class="ltr">LOW</span></td></tr>
+<tr><td>۰٫۳۵ تا ۰٫۶۰</td><td><span class="ltr">MEDIUM</span></td></tr>
+<tr><td>۰٫۶۰ تا ۰٫۸۵</td><td><span class="ltr">HIGH</span></td></tr>
+<tr><td>&gt; ۰٫۸۵</td><td><span class="ltr">VERY_HIGH</span></td></tr>
+</table>
+<p>سپس تشدید بر اساس نوسان:</p>
+<ul>
+<li>صدک نوسان ≥ ۰٫۹۵ ← مستقیماً <span class="ltr">VERY_HIGH</span>.</li>
+<li>صدک نوسان ≥ ۰٫۸۰ ← یک پله بالاتر.</li>
+</ul>
+<div class="box why">
+چرا نوسان رده را بالا می‌برد؟ چون همان مقدار «درد» در بازاری که کندل بعدی‌اش
+می‌تواند سه برابر بزرگ‌تر باشد، به‌مراتب خطرناک‌تر است.
+</div>
+
+<h3>۱۲-۵. سه کلاس هدف، نه پنج کلاس</h3>
+<div class="box note">
+در نسخهٔ قبلی این پروژه، هدف جهت پنج کلاس داشت
+(<span class="ltr">LONG_LOW_RISK, LONG_HIGH_RISK, SHORT_LOW_RISK, ...</span>).
+مشکل: سطل‌های <span class="ltr">*_HIGH_RISK</span> خیلی کوچک و پر از نویز بودند
+و یادگیری جهت را به‌شدت سخت می‌کردند. حالا هدف جهت فقط
+<strong>سه کلاس متوازن</strong> دارد: <span class="ltr">LONG</span>،
+<span class="ltr">SHORT</span>، <span class="ltr">NO_TRADE</span> — و اطلاعات ریسک
+به‌صورت جداگانه در ستون <span class="ltr">risk_tier</span> و هدف مدل ریسک حمل می‌شود.
+(کامیت <span class="ltr">912d0f6</span>)
+</div>
+
+<h3>۱۲-۶. اهداف هر چهار مدل</h3>
+<table>
+<tr><th width="20%">مدل</th><th width="28%">ستون هدف</th><th>چگونه ساخته می‌شود</th></tr>
+<tr><td>جهت</td><td><span class="ltr">label</span> / <span class="ltr">label_index</span></td>
+    <td>سه کلاس LONG / SHORT / NO_TRADE.</td></tr>
+<tr><td>ورود</td><td><span class="ltr">entry_quality</span></td>
+    <td>دودویی: ۱ فقط وقتی سمت انتخابی برنده شده <em>و</em>
+        هیچ‌وقت بیش از ۰٫۳۵ فاصلهٔ حد ضرر عقب نرفته.
+        این دقیقاً سؤال «الان وارد شوم یا یک کندل صبر کنم» است.</td></tr>
+<tr><td>خروج</td><td><span class="ltr">target_tp_pct</span><br>
+        <span class="ltr">target_sl_pct</span><br>
+        <span class="ltr">target_trailing_pct</span></td>
+    <td>از هندسهٔ واقعی حرکت معامله: بهترین قیمتی که در افق به آن رسیده
+        (×۰٫۹ برای جا گذاشتن برای لغزش) و گرمایی که تا آن نقطه تحمل شده (×۱٫۱۵).
+        حد ضرر هرگز کمتر از نصف فاصلهٔ نوسان‌محور نمی‌شود.
+        تریلینگ = نصف حد سود.</td></tr>
+<tr><td>ریسک</td><td><span class="ltr">target_risk_score</span></td>
+    <td><span class="ltr">(1 - MAE) × (0.5 + 0.5 × (1 - صدک نوسان))</span>،
+        محدود به بازهٔ ۰ تا ۱.</td></tr>
+</table>
+
+<h3>۱۲-۷. ستون <span class="ltr">label_is_valid</span></h3>
+<p>
+۴۸ کندل آخرِ هر ارز قابل شبیه‌سازی نیستند (چون آینده‌شان هنوز نیامده).
+این ستون آن‌ها را <span class="ltr">False</span> علامت می‌زند و پردازشگر آن‌ها را
+از دیتاست آموزشی حذف می‌کند.
+</p>
+</div>
+
+<div class="sec">
+<h2>۱۳. مرحلهٔ ۷: ساخت دفترچهٔ تمرین — <span class="ltr">processor.py</span></h2>
+
+<p>این فایل دو <strong>در ورودی کاملاً جدا</strong> دارد، و این جدایی عمدی است:</p>
+<table>
+<tr><th width="34%">تابع</th><th>حالت</th><th>برچسب‌زن؟</th></tr>
+<tr><td><span class="ltr">build_training_dataset()</span></td><td>تاریخی/آموزش</td>
+    <td>بله — با نگاه به آینده</td></tr>
+<tr><td><span class="ltr">build_inference_payload()</span></td><td>زنده</td>
+    <td><strong>خیر</strong> — اصلاً وارد این مسیر نمی‌شود</td></tr>
+</table>
+
+<h3>۱۳-۱. مسیر آموزش</h3>
+<div class="step"><span class="num">۱</span>
+برای هر ارز: خواندن کندل‌ها + متریک‌های آتی + دفتر سفارش از پایگاه داده.
+</div>
+<div class="step"><span class="num">۲</span>
+ساخت ویژگی‌ها (روی نخ کارگر).
+</div>
+<div class="step"><span class="num">۳</span>
+اجرای برچسب‌زن (روی نخ کارگر).
+</div>
+<div class="step"><span class="num">۴</span>
+افزودن ستون <span class="ltr">symbol</span> و ادغام همهٔ ارزها در یک جدول واحد.
+</div>
+<div class="step"><span class="num">۵</span>
+<strong>مرتب‌سازی کل جدول بر اساس زمان</strong> (نه بر اساس ارز).
+</div>
+<div class="box why">
+چرا همهٔ ارزها با هم و مرتب بر اساس زمان؟ چون آن‌وقت تقسیم آموزش/آزمون
+یک تقسیم <em>واقعی خارج-از-زمان</em> است. اگر هر ارز جدا تقسیم می‌شد،
+مدل می‌توانست از رفتار بیت‌کوین در آینده برای پیش‌بینی گذشتهٔ اتریوم تقلب کند.
+</div>
+<div class="step"><span class="num">۶</span>
+پاک‌سازی: حذف ردیف‌های <span class="ltr">label_is_valid == False</span>،
+تبدیل بی‌نهایت به <span class="ltr">NaN</span>، حذف ردیف‌هایی که هر ویژگی یا برچسبشان
+<span class="ltr">NaN</span> است (این‌ها همان ردیف‌های «گرم‌شدن» پنجره‌های متحرک هستند).
+</div>
+<div class="step"><span class="num">۷</span>
+جدا کردن به: ماتریس ویژگی، هدف جهت، هدف ورود، اهداف خروج، هدف ریسک، و ابرداده.
+</div>
+
+<h3>۱۳-۲. تقسیم پاک‌سازی‌شده — مهم‌ترین جزئیات آماری پروژه</h3>
+<pre>rows        = total_rows
+split_point = rows × (1 - 0.2)
+train_end   = split_point - 60   # ⁨این ۶۰ ردیف کاملاً حذف می‌شوند⁩
+train       = rows[0 : train_end]
+validation  = rows[split_point : end]</pre>
+
+<div class="flow">
+  |<---------------- ⁨آموزش⁩ ---------------->|  ⁨حذف⁩  |<--- ⁨آزمون⁩ --->|
+  0                                   train_end   split         rows
+                                       \___ ⁨۶۰ ردیف پاک‌سازی⁩ ___/
+</div>
+
+<div class="box why">
+<strong>چرا آن ۶۰ ردیف حذف می‌شوند؟</strong> این نکته را اکثر پروژه‌ها اشتباه می‌کنند.
+برچسبِ هر ردیف از <em>آیندهٔ</em> آن ردیف ساخته شده (تا ۴۸ کندل جلوتر).
+پس برچسبِ آخرین ردیف‌های بلوک آموزش، با <em>قیمت‌های</em> بلوک آزمون هم‌پوشانی دارد.
+اگر این ردیف‌ها بمانند، مدل به‌طور غیرمستقیم جواب امتحان را دیده و
+نمرهٔ آزمون به‌طور ساختاری خوش‌بینانه می‌شود.
+حذف ۶۰ ردیف (بیشتر از ۴۸ کندل افق) این نشت را می‌بندد.
+</div>
+
+<h3>۱۳-۳. مسیر زنده</h3>
+<ol>
+<li>عمق لازم محاسبه می‌شود:
+    <span class="ltr">max(500, 1000, 288) + 100 + 120 = 1220</span> کندل.</li>
+<li>ویژگی‌ها ساخته می‌شوند (بدون هیچ برچسبی).</li>
+<li>ردیف‌هایی که هنوز <span class="ltr">NaN</span> دارند حذف می‌شوند.</li>
+<li><strong>یک بررسی حیاتی:</strong> اگر آخرین ردیف <em>کامل</em> با آخرین ردیف
+    <em>موجود</em> فرق داشته باشد، یعنی ویژگی‌های جدیدترین کندل هنوز گرم نشده‌اند.
+    در این حالت آن ارز <strong>رد می‌شود</strong>.</li>
+</ol>
+<div class="box why">
+چرا این بررسی؟ چون در غیر این صورت مدل روی یک کندل کهنه (مثلاً ۳ کندل قبل)
+تصمیم می‌گرفت و آن را به قیمت الان اعمال می‌کرد. این یک نوع سکتهٔ خاموش است.
+</div>
+<p>
+خروجی یک <span class="ltr">InferencePayload</span> است: نماد، زمان، قیمت بسته،
+یک ردیف ویژگی، و یک «تصویر لحظه‌ای» خوانا برای دفتر ثبت وقایع
+(شامل رژیم HMM، نوسان GARCH، شیب KAMA، FDI، ATR، ADX، RSI، عدم توازن دفتر سفارش،
+اسپرد، نرخ فاندینگ، z-score حجم و قیمت).
+</p>
+</div>
+
+<div class="sec">
+<h2>۱۴. مرحلهٔ ۸: چهار مغز کوچک — <span class="ltr">ml_models.py</span></h2>
+
+<div class="box simple">
+به‌جای یک مدل غول‌پیکر که همه‌چیز را با هم تصمیم بگیرد، چهار متخصص داریم.
+هر کدام فقط <strong>یک</strong> سؤال بلد است و از وجود بقیه خبر ندارد.
+مثل یک تیم پزشکی: یکی می‌گوید بیماری چیست، یکی می‌گوید الان عمل کنیم یا فردا،
+یکی می‌گوید چه دارویی، و یکی می‌گوید چقدر دوز.
+</div>
+
+<table>
+<tr><th width="12%">مدل</th><th width="20%">سؤال</th><th width="18%">نوع</th><th>خروجی</th></tr>
+<tr><td><strong>۱</strong> جهت</td><td>بازار <em>کجا</em> می‌رود؟</td>
+    <td>طبقه‌بند سه‌کلاسه</td><td>توزیع احتمال روی LONG / SHORT / NO_TRADE</td></tr>
+<tr><td><strong>۲</strong> ورود</td><td><em>الان</em> یا یک کندل صبر کنم؟</td>
+    <td>طبقه‌بند دودویی</td><td>احتمال + بله/خیر</td></tr>
+<tr><td><strong>۳</strong> خروج</td><td>معامله <em>چگونه</em> مدیریت شود؟</td>
+    <td>سه رگرسیون</td><td>درصد حد سود، حد ضرر، فعال‌سازی تریلینگ</td></tr>
+<tr><td><strong>۴</strong> ریسک</td><td><em>چقدر</em> پول و اهرم؟</td>
+    <td>رگرسیون + منطق قطعی</td><td>اهرم ۰ تا ۱۰ + درصد تخصیص سرمایه</td></tr>
+</table>
+
+<h3>۱۴-۱. زیرساخت مشترک (<span class="ltr">BaseModelHead</span>)</h3>
+
+<h4>الگوریتم</h4>
+<p>
+پیش‌فرض <strong>LightGBM</strong> است (با گزینهٔ XGBoost). این‌ها «درخت‌های تصمیم تقویت‌شدهٔ گرادیانی»
+هستند: صدها درخت کوچک که هر کدام خطای درخت‌های قبلی را کمی اصلاح می‌کند.
+</p>
+<p>پارامترهای ضدِ حفظ‌کردن:</p>
+<ul>
+<li><span class="ltr">subsample=0.85</span> — هر درخت فقط ۸۵٪ ردیف‌ها را می‌بیند.</li>
+<li><span class="ltr">colsample_bytree=0.85</span> — هر درخت فقط ۸۵٪ ستون‌ها را می‌بیند.</li>
+<li><span class="ltr">min_child_samples=40</span> — هر برگ حداقل ۴۰ نمونه داشته باشد.</li>
+<li><span class="ltr">reg_lambda=1.0</span> — جریمهٔ پیچیدگی.</li>
+<li><span class="ltr">class_weight="balanced"</span> — اگر یک کلاس کم‌تعداد باشد،
+    وزنش بالا می‌رود تا مدل آن را نادیده نگیرد.</li>
+</ul>
+
+<h4>توقف زودهنگام</h4>
+<p>
+اگر ۵۰ دور پیاپی روی بلوک آزمون بهتر نشد، آموزش قطع می‌شود.
+یک نکتهٔ ظریف مهندسی: LightGBM نسخهٔ ۴٫۷ نام پارامترها را از
+<span class="ltr">eval_set</span> به <span class="ltr">eval_X / eval_y</span> تغییر داد.
+کد با <span class="ltr">inspect.signature</span> امضای تابع را بررسی می‌کند و
+با هر دو نسل کتابخانه کار می‌کند.
+</p>
+
+<h4>هم‌ترازی ویژگی‌ها (<span class="ltr">_align</span>) — یک سپر حیاتی</h4>
+<p>
+درخت‌ها ویژگی‌ها را با <em>موقعیت</em> می‌شناسند، نه با اسم. اگر ستون‌ها بی‌سروصدا
+جابه‌جا شوند، مدل «مزخرفِ با اطمینان بالا» تولید می‌کند.
+پس قبل از هر پیش‌بینی، ورودی دقیقاً روی چیدمان زمان آموزش
+<span class="ltr">reindex</span> می‌شود، ستون‌های گم‌شده با ۰٫۰ پر و لاگ می‌شوند،
+و بی‌نهایت/<span class="ltr">NaN</span> به ۰ تبدیل می‌شود.
+</p>
+
+<h4>ذخیره و بارگذاری</h4>
+<p>
+هر مدل با <span class="ltr">joblib</span> (فشرده‌سازی سطح ۳) ذخیره می‌شود، همراه با:
+نسخهٔ آرتیفکت، نام مدل، خود مدل، لیست دقیق ستون‌ها، و ابرداده (زمان آموزش،
+تعداد ردیف، معیارها).
+</p>
+<div class="box note">
+تابع <span class="ltr">load_artifact()</span> <strong>هرگز خطا پرتاب نمی‌کند</strong>.
+اگر فایل نبود، خراب بود، یا نسخه‌اش با <span class="ltr">_ARTIFACT_VERSION = "2.0.0"</span>
+نمی‌خواند، فقط <span class="ltr">None</span> برمی‌گرداند و آن مدل به قاعدهٔ جایگزین
+تنزل پیدا می‌کند. یک مدل گم‌شده باید سیستم را به حالت «معامله نکن» ببرد،
+نه اینکه حلقهٔ معاملاتی را بکشد.
+</div>
+
+<h3>۱۴-۲. مدل ۱: جهت (<span class="ltr">DirectionModel</span>)</h3>
+<p>
+یک طبقه‌بند سه‌کلاسه. برچسب‌ها با نگاشت ثابت
+<span class="ltr">LABEL_ORDER = (LONG, SHORT, NO_TRADE)</span> کدگذاری می‌شوند.
+</p>
+<p><strong>معیارهای ارزیابی:</strong> دقت، دقت متوازن (که کلاس‌های کم‌تعداد را هم می‌شمارد)، و log-loss.</p>
+
+<h4>قاعدهٔ جایگزین (وقتی مدل وجود ندارد)</h4>
+<pre>score = 60 × kama_slope + 1.2 × di_spread
+if regime == BULL:  score += 0.25
+if regime == BEAR:  score -= 0.25
+directional = sigmoid(score)            # ⁨بین صفر و یک⁩
+trade_mass  = 0.45 × (0.35 + 0.65 × fdi_trending)
+long     = trade_mass × directional
+short    = trade_mass × (1 - directional)
+no_trade = 1 - long - short</pre>
+<div class="box simple">
+در بازار درهم (FDI بالای ۱٫۵)، ضریب <span class="ltr">trade_mass</span> کوچک می‌شود
+و حداقل ۵۵٪ احتمال روی «کاری نکن» می‌ماند. یعنی قاعدهٔ جایگزین
+عمداً محتاط است. و هر خروجی آن با برچسب <span class="ltr">HEURISTIC</span> مهر می‌خورد.
+</div>
+
+<h3>۱۴-۳. مدل ۲: ورود (<span class="ltr">EntryModel</span>)</h3>
+<p>
+طبقه‌بند دودویی روی <span class="ltr">entry_quality</span>.
+معیارها: دقت مثبت (precision)، فراخوانی (recall)، و مساحت زیر منحنی ROC.
+اگر احتمال ≥ ۰٫۵۵ باشد، جواب «الان وارد شو» است.
+</p>
+<h4>قاعدهٔ جایگزین</h4>
+<pre>score = 0.5
+score += directional_flow      × 0.15   # ⁨عدم‌توازن دفتر سفارش هم‌جهت⁩
+score += (fdi_trending - 0.5)  × 0.20   # ⁨ساختار روندی⁩
+score -= (spread_rank - 0.5)   × 0.20   # ⁨جریمهٔ اسپرد بالا⁩</pre>
+<p>یعنی: جریان سفارش‌ها هم‌جهت باشد، بازار روند داشته باشد، و اسپرد در دههٔ بالای خودش نباشد.</p>
+
+<h3>۱۴-۴. مدل ۳: خروج (<span class="ltr">ExitModel</span>)</h3>
+<p>
+سه رگرسیون مستقل برای حد سود، حد ضرر، و فعال‌سازی تریلینگ.
+<strong>فقط روی ردیف‌هایی آموزش می‌بیند که واقعاً یک معاملهٔ جهت‌دار انتخاب شده باشد</strong> —
+چون فقط آن ردیف‌ها هندسهٔ معنادار دارند. اگر کمتر از ۱۰۰ ردیف باشد، خطا می‌دهد.
+</p>
+
+<h4>ریل‌های ایمنی (<span class="ltr">_assemble</span>) — روی هر خروجی، چه مدل چه جایگزین</h4>
+<table>
+<tr><th width="34%">قانون</th><th>مقدار</th></tr>
+<tr><td>حد ضرر حداقل نصف ATR</td><td><span class="ltr">_MIN_SL_ATR_FRACTION = 0.5</span></td></tr>
+<tr><td>حد ضرر بین</td><td>۰٫۱۵٪ و ۸٪</td></tr>
+<tr><td>حد سود بین</td><td>۰٫۲٪ و ۱۵٪</td></tr>
+<tr><td>حد سود بین ۱٫۱ و ۶ برابر حد ضرر</td><td><span class="ltr">_MAX_REWARD_RISK = 6.0</span></td></tr>
+<tr><td>فعال‌سازی تریلینگ بین</td><td>۲۵٪ و ۹۵٪ حد سود</td></tr>
+<tr><td>فاصلهٔ تریلینگ</td><td>۶۰٪ حد ضرر</td></tr>
+</table>
+<div class="box why">
+یک رگرسور می‌تواند عدد منفی یا مسخره بدهد؛ صرافی نمی‌تواند آن را قبول کند.
+دو ریل خیلی مهم‌اند: (۱) حد ضرر تنگ‌تر از نصف ATR داخل نویز عادی ۵ دقیقه‌ای است
+و بی‌ربط به درستی تحلیل، خورده می‌شود. (۲) نسبت پاداش/ریسک بالای ۶
+تقریباً همیشه نتیجهٔ فروپاشی رگرسور حد ضرر است، نه یک لبهٔ واقعی.
+</div>
+
+<h4>قاعدهٔ جایگزین</h4>
+<pre>widen = 1 + 0.6 × garch_vol_rank
+if regime == HIGH_VOLATILITY: widen × 1.35
+if regime == SIDEWAYS:        widen × 0.85
+stop_loss   = atr_pct × 1.0 × widen
+take_profit = atr_pct × 2.0 × widen</pre>
+
+<h3>۱۴-۵. مدل ۴: ریسک (<span class="ltr">RiskModel</span>)</h3>
+<p>
+یک رگرسور «امتیاز فرصت» بین ۰ و ۱ می‌دهد. سپس یک منطق <strong>کاملاً قطعی</strong>
+(نه یادگیری ماشین) آن را به اهرم و تخصیص سرمایه تبدیل می‌کند.
+</p>
+
+<h4>وتوهای سخت — قبل از هر محاسبه‌ای</h4>
+<ol>
+<li>اگر صدک نوسان ≥ ۰٫۹۷ ← اهرم ۰، پایان. (بازار خیلی دیوانه است.)</li>
+<li>اگر اطمینان جهت &lt; ۰٫۷۰ ← اهرم ۰، پایان.</li>
+</ol>
+
+<h4>فرمول اندازه‌گیری</h4>
+<pre>confidence_factor = clamp( (confidence - 0.70) / (1 - 0.70), 0, 1 )
+volatility_factor = 1 - garch_vol_rank²
+tier_factor       = LOW:1.0  MEDIUM:0.75  HIGH:0.5  else:0.6
+
+composite  = risk_score × (0.35 + 0.65 × confidence_factor)
+                        × volatility_factor
+                        × tier_factor
+
+leverage   = floor(composite × 10)          # ⁨اهرم⁩
+allocation = 0.01 + (0.20 - 0.01) × composite   # ⁨تخصیص سرمایه⁩</pre>
+<div class="box simple">
+یعنی: هر چه مدل مطمئن‌تر، بازار آرام‌تر، و ریسک مسیر کمتر باشد،
+هم اهرم بیشتر می‌شود و هم پول بیشتری وارد می‌شود.
+اگر ضرب این‌ها آن‌قدر کوچک شود که اهرم به ۰ برسد، معامله لغو می‌شود.
+</div>
+<p class="small">
+نکتهٔ ظریف: اطمینان روی بازهٔ <em>قابل معامله</em> بازمقیاس می‌شود.
+یعنی سیگنال ۷۰٪ نزدیک کف اندازه می‌گیرد و سیگنال ۱۰۰٪ نزدیک سقف —
+نه اینکه ۷۰٪ مستقیماً یعنی ۷۰٪ سقف.
+</p>
+
+<h4>قاعدهٔ جایگزین</h4>
+<pre>score = 0.4 × direction_confidence
+      + 0.3 × (ADX / 50)
+      + 0.2 × fdi_trending
+      + 0.1 × (1 - garch_vol_rank)</pre>
+
+<h3>۱۴-۶. زیرسیستم مدیریت (<span class="ltr">MLSubsystem</span>)</h3>
+<table>
+<tr><th width="34%">متد</th><th>کار</th></tr>
+<tr><td><span class="ltr">load_all()</span></td><td>بارگذاری هر چهار مدل از دیسک.</td></tr>
+<tr><td><span class="ltr">train_all()</span></td>
+    <td>آموزش هر چهار مدل روی نخ کارگر. شکست یکی، بقیه را متوقف نمی‌کند
+        و در گزارش ثبت می‌شود.</td></tr>
+<tr><td><span class="ltr">infer_sync()</span></td>
+    <td>اجرای هر چهار مدل روی یک ردیف. تابع خالص و مسدودکننده —
+        بک‌تستر مستقیماً از این استفاده می‌کند.</td></tr>
+<tr><td><span class="ltr">infer()</span></td>
+    <td>نسخهٔ غیرهمزمان، روی نخ کارگر.</td></tr>
+<tr><td><span class="ltr">infer_many()</span></td>
+    <td>چند ارز موازی، با جداسازی خطای هر ارز.</td></tr>
+<tr><td><span class="ltr">training_report()</span></td>
+    <td>گزارش کامل: معیارها، ابرداده، و <strong>اهمیت ویژگی‌ها</strong> برای هر مدل.
+        از آنجا که بارگذاری، ابرداده و مدل را برمی‌گرداند، این گزارش
+        بعد از ری‌استارت هم در دسترس است.</td></tr>
+</table>
+<p>
+<strong>ترتیب اجرای پیش‌بینی:</strong> جهت ← ورود (که جهت را می‌گیرد) ← خروج ← ریسک
+(که اطمینان و ردهٔ جهت را می‌گیرد). زمان اجرا با ساعت یکنواخت اندازه‌گیری
+و در <span class="ltr">latency_ms</span> ثبت می‌شود.
+</p>
+</div>
+
+<div class="sec">
+<h2>۱۵. قراردادهای بین ماژول‌ها — <span class="ltr">schemas.py</span></h2>
+
+<div class="box simple">
+تصور کن دو کارخانه با هم کار می‌کنند. یکی جعبه می‌سازد و به دیگری می‌دهد.
+اگر قرار بگذارند «جعبه باید همیشه مربع باشد و کوچک‌تر از ۱ متر»، آن‌وقت
+هیچ‌وقت یک جعبهٔ عجیب به دست کارخانهٔ دوم نمی‌رسد. این فایل همان قرارداد است.
+</div>
+
+<p>
+این فایل «کمرباریک» سیستم است: ماژول C فقط از طریق
+<span class="ltr">ModelInferenceResult</span> با ماژول D حرف می‌زند، و ماژول D فقط
+از طریق <span class="ltr">TradeSignal</span> با ماژول E.
+چون هر فیلد اعتبارسنجی و محدود شده، یک <em>کلاس کامل</em> از باگ‌های
+«مدل مزخرف تولید کرد و ما آن را به صرافی فرستادیم» از نظر ساختاری غیرممکن می‌شود.
+</p>
+
+<h3>۱۵-۱. کلاس‌های خروجی مدل‌ها</h3>
+
+<h4><span class="ltr">DirectionPrediction</span></h4>
+<ul>
+<li>احتمال‌ها اعتبارسنجی می‌شوند: کلاس ناشناخته ممنوع، مقدار منفی ممنوع،
+    و <strong>به‌طور خودکار نرمال می‌شوند</strong> تا جمعشان دقیقاً ۱ شود.</li>
+<li>خواص محاسبه‌شده: <span class="ltr">long_probability</span>،
+    <span class="ltr">short_probability</span>، <span class="ltr">no_trade_probability</span>،
+    <span class="ltr">action</span> (بزرگ‌ترین)، <span class="ltr">confidence</span>،
+    و <span class="ltr">directional_margin</span> (قدر مطلق فاصلهٔ لانگ و شورت).</li>
+</ul>
+
+<h4><span class="ltr">ExitParameters</span></h4>
+<ul>
+<li>هر سه درصد باید مثبت و ≤ ۱ باشند.</li>
+<li>خاصیت <span class="ltr">reward_risk_ratio = TP% / SL%</span>.</li>
+<li>یک اعتبارسنجی: فعال‌سازی تریلینگ نمی‌تواند از حد سود بیشتر باشد
+    (وگرنه هرگز فعال نمی‌شود).</li>
+</ul>
+
+<h4><span class="ltr">RiskAllocation</span></h4>
+<ul>
+<li>اهرم بین ۰ و <strong>۱۰</strong> — <em>این سقف با اعتبارسنجی قالب اعمال می‌شود،
+    نه فقط با تنظیمات</em>. یعنی حتی اگر کسی تنظیمات را دستکاری کند،
+    اهرم ۲۰ از نظر ساختاری غیرممکن است.</li>
+<li>خاصیت <span class="ltr">is_abort</span>: اگر اهرم ۰ یا تخصیص ۰ باشد.</li>
+</ul>
+
+<h3>۱۵-۲. <span class="ltr">TradeSignal</span> — تنها چیزی که ماژول E اجازهٔ عمل روی آن را دارد</h3>
+<p>غیرقابل تغییر (<span class="ltr">frozen</span>). اعتبارسنج هندسه چک می‌کند:</p>
+<table>
+<tr><th width="18%">جهت</th><th>قوانین</th></tr>
+<tr><td>LONG</td>
+    <td>حد سود باید <strong>بالای</strong> قیمت ورود باشد،
+        حد ضرر <strong>زیر</strong> آن، و ماشهٔ تریلینگ <strong>بالای</strong> آن.</td></tr>
+<tr><td>SHORT</td>
+    <td>دقیقاً برعکس.</td></tr>
+<tr><td>NO_TRADE</td><td>اصلاً نمی‌تواند سیگنال بسازد — خطا می‌دهد.</td></tr>
+</table>
+<div class="box why">
+یک لانگ که حد ضررش <em>بالای</em> قیمت ورود باشد، باگی است که در غیر این صورت
+فقط با از دست دادن پول کشف می‌شد. اینجا در همان لحظهٔ ساخت گرفته می‌شود.
+</div>
+<p>توابع کمکی محاسبهٔ اندازه:</p>
+<pre>notional(equity) = equity × capital_allocation_pct × leverage
+margin(equity)   = equity × capital_allocation_pct
+quantity(equity) = notional / reference_price</pre>
+
+<h3>۱۵-۳. <span class="ltr">DecisionResult</span></h3>
+<p>
+هر تصمیم — چه EXECUTE، چه NO_TRADE، چه BLOCKED — یک شیء کامل تولید می‌کند شامل:
+شناسهٔ یکتا، نماد، حکم، قانونی که فعال شد، دلیل خوانا، سیگنال (یا <span class="ltr">None</span>)،
+نتایج مدل، و لیست کامل <span class="ltr">checks</span> که هر قانون و نتیجه‌اش را دارد.
+</p>
+</div>
+
+<div class="sec">
+<h2>۱۶. مرحلهٔ ۹: قاضی نهایی — موتور تصمیم و ۱۰ قانون</h2>
+
+<div class="box simple">
+مدل‌ها فقط «نظر» می‌دهند. این فایل «تصمیم» می‌گیرد.
+و هیچ هوش مصنوعی ندارد — فقط ۱۰ سؤال دارد که یکی‌یکی می‌پرسد.
+اولین سؤالی که جوابش «نه» باشد، همه‌چیز تمام می‌شود و <strong>دقیقاً همان دلیل</strong>
+در دفتر ثبت می‌شود.
+</div>
+
+<h3>۱۶-۱. آبشار ۱۰ قانون</h3>
+
+<table>
+<tr><th width="10%">قانون</th><th width="26%">شناسه</th><th>چه چیزی را چک می‌کند</th></tr>
+<tr><td><strong>R0-a</strong></td><td><span class="ltr">R0_SYSTEM_HALTED</span></td>
+    <td>آیا نگهبان ریسک قرمز است؟ اگر بله ← BLOCKED.</td></tr>
+<tr><td><strong>R0-b</strong></td><td><span class="ltr">R0_TRADING_DISABLED</span></td>
+    <td>آیا اپراتور معامله را مسلح کرده؟</td></tr>
+<tr><td><strong>R0-c</strong></td><td><span class="ltr">R0_PORTFOLIO_FULL</span></td>
+    <td>آیا ۵ پوزیشن باز پر شده؟</td></tr>
+<tr><td><strong>R0-d</strong></td><td><span class="ltr">R0_SYMBOL_ALREADY_OPEN</span></td>
+    <td>آیا روی همین ارز پوزیشن باز داریم؟</td></tr>
+<tr><td><strong>R1-a</strong></td><td><span class="ltr">R1_DIRECTION_IS_NO_TRADE</span></td>
+    <td>آیا خود مدل جهت می‌گوید «معامله نکن»؟</td></tr>
+<tr><td><strong>R1-b</strong></td><td><span class="ltr">R1_DIRECTION_CONFIDENCE_TOO_LOW</span></td>
+    <td>احتمال جهت انتخابی ≥ ۰٫۷۰ است؟</td></tr>
+<tr><td><strong>R2</strong></td><td><span class="ltr">R2_DIRECTIONAL_MARGIN_TOO_THIN</span></td>
+    <td>|احتمال لانگ − احتمال شورت| ≥ ۰٫۱۵ است؟ (مدل بی‌تفاوت نباشد.)</td></tr>
+<tr><td><strong>R3</strong></td><td><span class="ltr">R3_NO_TRADE_MASS_TOO_HIGH</span></td>
+    <td>جرم احتمال «معامله نکن» ≤ ۰٫۳۵ است؟</td></tr>
+<tr><td><strong>R4</strong></td><td><span class="ltr">R4_ENTRY_MODEL_SAYS_WAIT</span></td>
+    <td>مدل زمان‌بندی می‌گوید «الان»؟</td></tr>
+<tr><td><strong>R5</strong></td><td><span class="ltr">R5_REWARD_RISK_BELOW_FLOOR</span></td>
+    <td>نسبت پاداش/ریسک ≥ ۱٫۳ است؟</td></tr>
+<tr><td><strong>R6</strong></td><td><span class="ltr">R6_RISK_MODEL_ABORT</span></td>
+    <td>مدل ریسک اهرم غیرصفر داد؟</td></tr>
+<tr><td><strong>R7</strong></td><td><span class="ltr">R7_RISK_TIER_NOT_ACCEPTED</span></td>
+    <td>ردهٔ ریسک در لیست پذیرفته‌شده هست؟</td></tr>
+<tr><td><strong>R8</strong></td><td><span class="ltr">R8_REGIME_BLOCKED</span></td>
+    <td>رژیم HMM در لیست ممنوعه نیست؟ (پیش‌فرض: لیست ممنوعه خالی است.)</td></tr>
+<tr><td><strong>R9</strong></td><td><span class="ltr">R9_UNTRAINED_MODELS_IN_LIVE_MODE</span></td>
+    <td>در حالت واقعی، هیچ مدلی از قاعدهٔ جایگزین استفاده نکرده باشد.</td></tr>
+<tr><td><strong>R10</strong></td><td><span class="ltr">R10_SIGNAL_CONSTRUCTION_FAILED</span></td>
+    <td>تور ایمنی نهایی: اگر ساخت سیگنال از اعتبارسنجی رد نشد.</td></tr>
+</table>
+
+<div class="box why">
+<strong>چرا قانون R9 حیاتی است؟</strong> قاعدهٔ جایگزین یک حدس مهندسی‌شده است،
+نه یک مدل آموزش‌دیده. اجازه دادن به یک حدس برای ثبت سفارش با پول واقعی و اهرم،
+دقیقاً همان چیزی است که یک اشکال ساده را به یک فاجعهٔ مالی تبدیل می‌کند.
+در حالت کاغذی اجازه داده می‌شود (تا بشود سیستم را تست کرد).
+</div>
+
+<h3>۱۶-۲. ساخت سیگنال</h3>
+<p>وقتی هر ده قانون رد شدند، درصدها به قیمت مطلق تبدیل می‌شوند:</p>
+<pre>LONG :  TP = price × (1 + tp%)   SL = price × (1 - sl%)   trigger = price × (1 + trail%)
+SHORT:  TP = price × (1 - tp%)   SL = price × (1 + sl%)   trigger = price × (1 - trail%)</pre>
+<p>
+سپس تخصیص سرمایه در <span class="ltr">size_multiplier</span> نگهبان ریسک ضرب می‌شود
+(در حالت زرد ۰٫۴). اگر ساخت <span class="ltr">TradeSignal</span> خطا داد،
+تابع <span class="ltr">None</span> برمی‌گرداند و قانون R10 فعال می‌شود.
+</p>
+
+<h3>۱۶-۳. ارزیابی دسته‌ای (<span class="ltr">evaluate_many</span>)</h3>
+<div class="box simple">
+فرض کن ۵ جای خالی برای معامله داری ولی ۱۲ ارز سیگنال داده‌اند.
+کد اول همه را بر اساس <strong>اطمینان مدل</strong> مرتب می‌کند، بعد از بالا شروع می‌کند.
+پس ۵ جای خالی به ۵ قوی‌ترین سیگنال می‌رسد، نه به ۵ ارزی که الفبایی اول بودند.
+</div>
+<p>
+هر بار که یک سیگنال قابل اجرا تولید شود، شمارندهٔ پوزیشن‌های باز
+<em>برای ارزیابی ارز بعدی</em> افزایش می‌یابد. یعنی سقف پرتفوی
+در همان دسته هم رعایت می‌شود.
+</p>
+
+<h3>۱۶-۴. رد شدن‌ها هم به همان اندازه ثبت می‌شوند</h3>
+<p>
+هر قانون که ارزیابی می‌شود، یک ورودی به لیست <span class="ltr">checks</span> اضافه می‌کند
+شامل نام قانون، نتیجه (قبول/رد) و جزئیات عددی. مثلاً:
+</p>
+<pre>{"rule": "R1_DIRECTION_CONFIDENCE_TOO_LOW",
+ "passed": false,
+ "detail": "confidence=0.6800 threshold=0.7000"}</pre>
+<p>
+همین است که شش هفته بعد از یک افت سرمایه، بتوانی دقیقاً بفهمی چه اتفاقی افتاد.
+</p>
+</div>
+
+<div class="sec">
+<h2>۱۷. مرحلهٔ ۱۰: اجرای معامله — کاغذی و واقعی</h2>
+
+<div class="box simple">
+دو «پیشخدمت» داریم که <strong>دقیقاً یک شکل</strong> هستند: یکی غذا را واقعاً می‌برد
+(<span class="ltr">LiveExecutor</span>)، یکی فقط وانمود می‌کند
+(<span class="ltr">PaperTrader</span>). چون شکلشان یکی است، حلقهٔ معاملاتی
+حتی یک خط <span class="ltr">if paper:</span> ندارد.
+</div>
+
+<h3>۱۷-۱. ساختار مشترک: <span class="ltr">Position</span> (<span class="ltr">models.py</span>)</h3>
+<p>
+همین یک کلاس در اجرای واقعی، کاغذی <em>و</em> بک‌تست استفاده می‌شود.
+این عمدی است: ریاضیات یکسانِ سود/زیان، کارمزد، فاندینگ و تریلینگ در هر سه موتور،
+همان چیزی است که نتیجهٔ بک‌تست را با نتیجهٔ واقعی قابل مقایسه می‌کند.
+</p>
+
+<h4>محاسبات کلیدی</h4>
+<pre>direction        = +1 (LONG)  /  -1 (SHORT)
+unrealized_pnl   = (mark_price - entry_price) × quantity × direction
+notional         = quantity × entry_price
+effective_stop() = trailing_stop if trailing_active else stop_loss</pre>
+
+<h4>قیمت لیکوئید (تقریب مارجین ایزوله)</h4>
+<pre>LONG : entry × (1 - 1/leverage + mmr)
+SHORT: entry × (1 + 1/leverage - mmr)      mmr = 0.005</pre>
+<div class="box simple">
+با اهرم ۱۰، قیمت لیکوئید لانگ حدود <span class="ltr">entry × (1 - 0.1 + 0.005)</span>
+یعنی حدود ۹٫۵٪ زیر قیمت ورود است. اگر قیمت آنجا برسد، کل پول ودیعه از بین می‌رود.
+</div>
+
+<h4>تریلینگ استاپ (<span class="ltr">advance_trailing</span>)</h4>
+<ol>
+<li>تا وقتی قیمت به «ماشهٔ تریلینگ» نرسیده، تریلینگ فعال نمی‌شود.</li>
+<li>بعد از فعال شدن، حد ضرر فقط <strong>در جهت سود</strong> حرکت می‌کند
+    (جغجغه‌ای — <span class="ltr">ratchet</span>).</li>
+</ol>
+<div class="box why">
+یک تریلینگ که بتواند شل شود، یک باگ است که بی‌سروصدا ریسک را زیاد می‌کند.
+کد صراحتاً چک می‌کند که سطح جدید بهتر از سطح قبلی باشد، وگرنه
+<span class="ltr">None</span> برمی‌گرداند و هیچ تغییری نمی‌دهد.
+</div>
+
+<h3>۱۷-۲. موتور اجرای واقعی (<span class="ltr">executor.py</span>)</h3>
+<p><strong>فرض عملیاتی: بازار و API دشمن‌اند.</strong></p>
+
+<h4>گام‌های باز کردن یک پوزیشن</h4>
+<div class="step"><span class="num">۱</span>
+<strong>بررسی نگهبان ریسک.</strong> اگر قرمز است ← <span class="ltr">KillSwitchEngaged</span>.
+اگر سقف روزانهٔ معاملات پر شده ← رد.
+</div>
+<div class="step"><span class="num">۲</span>
+<strong>بررسی پوزیشن تکراری.</strong> اگر روی این ارز پوزیشن باز است ← رد.
+</div>
+<div class="step"><span class="num">۳</span>
+<strong>گرفتن وضعیت حساب</strong> از صرافی (موجودی USDT + سود/زیان باز).
+</div>
+<div class="step"><span class="num">۴</span>
+<strong>محاسبه و اعتبارسنجی مقدار</strong> (<span class="ltr">_resolve_quantity</span>):
+مقدار خام محاسبه، سپس با <span class="ltr">amount_to_precision</span> گرد می‌شود،
+سپس در برابر حداقل مقدار و حداقل ارزش صرافی چک می‌شود،
+و آخر اینکه مارجین لازم نباید از سرمایه بیشتر باشد.
+</div>
+<div class="step"><span class="num">۵</span>
+<strong>پیش‌پرواز (<span class="ltr">_preflight</span>).</strong>
+حالت مارجین <span class="ltr">ISOLATED</span> و اهرم <em>همین سیگنال</em>
+صراحتاً روی صرافی تنظیم می‌شوند.
+<div class="box why">
+چرا هر بار؟ چون اگر جلسهٔ قبلی اهرم را روی ۲۰ گذاشته باشد و ما تنظیم نکنیم،
+اندازهٔ پوزیشن بی‌سروصدا دو برابر می‌شود. کد پیام‌های بی‌ضرر بایننس
+(«نیازی به تغییر نیست») را می‌بلعد.
+</div>
+</div>
+<div class="step"><span class="num">۶</span>
+<strong>ارسال سفارش ورود.</strong> پیش‌فرض سفارش بازار. اگر سفارش محدود انتخاب شده باشد،
+تا ۴۵ ثانیه منتظر پر شدن می‌ماند، بعد لغو می‌کند. اگر بخشی پر شده باشد،
+همان بخش نگه داشته می‌شود.
+<div class="box why">
+چرا باقی‌مانده را با سفارش بازار دنبال نمی‌کند؟ چون تعقیب قیمت با یک قیمت بدتر،
+دقیقاً همان‌طور است که یک لبهٔ کوچک به لبهٔ منفی تبدیل می‌شود.
+</div>
+</div>
+<div class="step"><span class="num">۷</span>
+<strong>ثبت سفارش‌های محافظ.</strong> دو سفارش <span class="ltr">reduceOnly</span>:
+<span class="ltr">TAKE_PROFIT_MARKET</span> و <span class="ltr">STOP_MARKET</span>،
+هر دو با <span class="ltr">workingType=MARK_PRICE</span>.
+<div class="box why">
+چرا قیمت مارک و نه آخرین قیمت؟ چون خود بایننس لیکوئیدیشن را با قیمت مارک ارزیابی می‌کند.
+اگر حد ضرر ما با «آخرین قیمت» فعال شود، یک فیتیلهٔ لحظه‌ای که هرگز به مارک نرسیده
+می‌تواند ما را بیرون بیندازد.
+</div>
+</div>
+<div class="step"><span class="num">۸</span>
+<div class="box warn">
+<strong>اگر ثبت سفارش محافظ شکست بخورد، پوزیشن فوراً با سفارش بازار بسته می‌شود.</strong>
+یک پوزیشن اهرمیِ بدون حد ضرر، بدترین حالت ممکن است — بدتر از اینکه اصلاً معامله نکنی.
+</div>
+</div>
+<div class="step"><span class="num">۹</span>
+ثبت پوزیشن در حافظه و در جدول <span class="ltr">trades</span>.
+</div>
+
+<h4>حلقهٔ نظارت (هر ۵ ثانیه)</h4>
+<ul>
+<li>قیمت همهٔ پوزیشن‌ها به‌صورت دسته‌ای گرفته می‌شود.</li>
+<li>بیشینه/کمینهٔ مسیر به‌روزرسانی می‌شود.</li>
+<li>تریلینگ در صورت لزوم جلو می‌رود.</li>
+<li>هر ۶۰ ثانیه یک <strong>تطبیق</strong> با صرافی انجام می‌شود.</li>
+</ul>
+
+<h4>جابه‌جایی تریلینگ روی صرافی</h4>
+<p>
+بایننس تریلینگ با هندسهٔ دلخواه ما را ندارد، پس سفارش قدیمی <strong>لغو</strong>
+و سفارش جدید ثبت می‌شود. ترتیب مهم است: <strong>اول لغو، بعد ثبت</strong>.
+</p>
+<div class="box why">
+چون یک لحظه بدون حد ضرر بودن، امن‌تر از یک لحظه <em>دو</em> حد ضرر داشتن است —
+دو تا حد ضرر یعنی پوزیشن دوبار بسته می‌شود و ناگهان یک پوزیشن معکوس باز می‌کنی!
+اگر ثبت مجدد شکست بخورد، کد پوزیشن را فوراً می‌بندد.
+</div>
+
+<h4>تطبیق (<span class="ltr">reconcile</span>)</h4>
+<p>
+لیست پوزیشن‌های واقعی صرافی خوانده می‌شود. هر چیزی که ما ردیابی می‌کنیم ولی
+صرافی دیگر گزارش نمی‌دهد، یعنی بسته شده (با حد سود، حد ضرر یا لیکوئیدیشن).
+کد سفارش‌های TP و SL را چک می‌کند تا بفهمد <em>کدام‌یک</em> پر شده و
+دلیل بسته شدن را درست ثبت کند. پوزیشن‌های ناشناختهٔ صرافی فقط هشدار می‌گیرند
+(کد آن‌ها را مدیریت نمی‌کند).
+</p>
+
+<h3>۱۷-۳. موتور کاغذی (<span class="ltr">paper_trader.py</span>)</h3>
+<p>
+رابط دقیقاً یکسان، ولی <strong>وانمود نمی‌کند که معاملهٔ شبیه‌سازی‌شده رایگان است</strong>:
+</p>
+<table>
+<tr><th width="24%">هزینه</th><th>نحوهٔ اعمال</th></tr>
+<tr><td>کارمزد</td>
+    <td>ورود و خروج هر دو با نرخ تیکر ۰٫۰۵٪. کارمزد ورود
+        <em>بلافاصله</em> از موجودی کم می‌شود، دقیقاً مثل صرافی.</td></tr>
+<tr><td>لغزش</td>
+    <td>۵ پایه (۰٫۰۵٪) همیشه <strong>به ضرر ما</strong>. ورود لانگ و خروج شورت
+        هر دو «خرید» هستند، پس هر دو به بالا جریمه می‌شوند.</td></tr>
+<tr><td>فاندینگ</td>
+    <td>هر ۸ ساعت، با نرخ فاندینگی که <em>واقعاً</em> ماژول A برای همان ارز ثبت کرده.</td></tr>
+<tr><td>لیکوئیدیشن</td>
+    <td>قبل از حد سود چک می‌شود. هیچ تخفیف لغزشی هم داده نمی‌شود —
+        پوزیشن دقیقاً در قیمت لیکوئید پاک می‌شود و ضرر به اندازهٔ مارجین محدود می‌شود.</td></tr>
+</table>
+
+<h4>ترتیب بررسی موانع — عمداً بدبینانه</h4>
+<div class="flow">
+   ⁨۱⁩. ⁨لیکوئیدیشن⁩?  --> ⁨بله⁩ --> ⁨ببند، کل مارجین رفت⁩
+   ⁨۲⁩. ⁨حد ضرر⁩ (⁨یا تریلینگ⁩)?  --> ⁨بله⁩ --> ⁨ببند با ضرر⁩
+   ⁨۳⁩. ⁨حد سود⁩?  --> ⁨بله⁩ --> ⁨ببند با سود⁩
+</div>
+<div class="box why">
+یک «تیک» قیمتی که می‌توانست چند مانع را همزمان بزند، <strong>همیشه</strong>
+بدترین نتیجه را ثبت می‌کند. هر ترتیب دیگری، نتیجهٔ شبیه‌سازی را
+از واقعیت خوش‌بینانه‌تر می‌کند.
+</div>
+<p class="small">
+موجودی مجازی در کلید <span class="ltr">paper_trader_state</span> پایگاه داده ذخیره می‌شود،
+پس بعد از ری‌استارت از همان‌جا ادامه می‌دهد.
+</p>
+</div>
+
+<div class="sec">
+<h2>۱۸. مرحلهٔ ۱۱: نگهبان ریسک — <span class="ltr">risk_guard.py</span></h2>
+
+<div class="box simple">
+همهٔ بخش‌های دیگر اجازه دارند اشتباه کنند. این یکی با این فرض ساخته شده که
+<strong>حتماً</strong> اشتباه خواهند کرد. مدل‌ها منحرف می‌شوند، صرافی قطع می‌شود،
+و یک زنجیرهٔ باخت دقیقاً شبیه یک استراتژی موفق است — تا لحظه‌ای که حساب خالی شود.
+</div>
+
+<h3>۱۸-۱. ماشین حالت سه‌رنگ</h3>
+<table>
+<tr><th width="14%">حالت</th><th width="24%">معنی</th><th>اثر</th></tr>
+<tr><td style="color:#059669;font-weight:bold">GREEN</td><td>عادی</td><td>اندازهٔ کامل معامله (ضریب ۱٫۰).</td></tr>
+<tr><td style="color:#b45309;font-weight:bold">YELLOW</td><td>هشدار</td>
+    <td>اندازهٔ معامله ×۰٫۴ می‌شود. معامله ادامه دارد ولی محتاطانه.</td></tr>
+<tr><td style="color:#b91c1c;font-weight:bold">RED</td><td>توقف کامل</td>
+    <td>همهٔ سفارش‌ها لغو، همهٔ پوزیشن‌ها بسته، اجرا غیرفعال،
+        و <strong>قفل می‌شود</strong> تا آدم دستی بازش کند.</td></tr>
+</table>
+
+<h3>۱۸-۲. شرایط رفتن به قرمز</h3>
+<table>
+<tr><th width="40%">شرط</th><th>آستانه</th></tr>
+<tr><td>افت سرمایه از ابتدای روز</td><td>≥ ۵٪</td></tr>
+<tr><td>افت از اوج تاریخی سرمایه</td><td>≥ ۲۰٪</td></tr>
+<tr><td>باخت پیاپی</td><td>۵ معامله</td></tr>
+<tr><td>خطای صرافی در پنجرهٔ ۵ دقیقه‌ای</td><td>۶ خطا</td></tr>
+<tr><td>فشار دادن کلید قرمز در پنل</td><td>فوری</td></tr>
+</table>
+
+<h3>۱۸-۳. شرایط زرد</h3>
+<ul>
+<li>افت روزانه ≥ ۳٪، یا</li>
+<li>۳ باخت پیاپی، یا</li>
+<li>۳ خطای صرافی در پنجره.</li>
+</ul>
+<p>زرد <strong>برگشت‌پذیر</strong> است: وقتی شرایط هشدار برطرف شد، خودکار به سبز برمی‌گردد.</p>
+
+<h3>۱۸-۴. پنجرهٔ لغزان خطاها</h3>
+<p>
+خطاهای API با زمانشان در یک صف نگه داشته می‌شوند و فقط خطاهای داخل
+پنجرهٔ ۳۰۰ ثانیه‌ای شمرده می‌شوند.
+</p>
+<div class="box why">
+یک قطعی موقت که خودش رفع شده، نباید تا ابد یک زخم روی سیستم بگذارد.
+ولی یک API واقعاً خراب — دقیقاً وضعیتی که ثبت کورکورانهٔ سفارش خطرناک‌ترین است —
+باید سیستم را متوقف کند. یک تماس موفق، پنجره را پاک می‌کند.
+</div>
+
+<h3>۱۸-۵. قفل ماندگار (Latch)</h3>
+<div class="box warn">
+وقتی نگهبان قرمز می‌شود، وضعیتش <strong>در پایگاه داده نوشته می‌شود</strong>.
+هنگام راه‌اندازی بعدی، متد <span class="ltr">load()</span> آن را می‌خواند و
+دوباره قرمز می‌شود. یعنی یک حلقهٔ کرش (برنامه بیفتد و دوباره بالا بیاید)
+نمی‌تواند بی‌سروصدا معامله را دوباره فعال کند. باز کردن قفل فقط با
+<span class="ltr">POST /api/reset_risk_guard</span> یا دکمهٔ پنل ممکن است.
+</div>
+<p>
+هنگام باز کردن قفل: حالت به سبز، دلیل پاک، زنجیرهٔ باخت صفر، پنجرهٔ خطاها خالی،
+و سرمایهٔ شروع روز روی سرمایهٔ فعلی تنظیم می‌شود. <strong>معامله همچنان
+مسلح نمی‌شود</strong> — باید جداگانه مسلح شود.
+</p>
+
+<h3>۱۸-۶. الگوی فراخوان (Callback)</h3>
+<p>
+موتور اجرا تابع <span class="ltr">emergency_flatten</span> خودش را در نگهبان ثبت می‌کند.
+وقتی نگهبان قرمز می‌شود، همهٔ فراخوان‌های ثبت‌شده را اجرا می‌کند.
+</p>
+<div class="box why">
+چرا فراخوان و نه وابستگی مستقیم؟ چون این‌طوری نگهبان ریسک هیچ اطلاعی از
+جزئیات داخلی ماژول E ندارد. همچنین اگر یک فراخوان خطا بدهد، فقط لاگ می‌شود:
+یک روال تخلیهٔ خراب نباید جلوی <em>خودِ توقف</em> را بگیرد.
+</div>
+
+<h3>۱۸-۷. غلتش روز UTC</h3>
+<p>
+در ساعت ۰۰:۰۰ UTC، شمارنده‌های روزانه صفر می‌شوند: تعداد معاملات، بردها،
+باخت‌ها، سود/زیان محقق‌شده، و سرمایهٔ شروع روز. اگر برنامه در طول شب خاموش بوده،
+این کار هنگام بارگذاری انجام می‌شود.
+</p>
+</div>
+
+<div class="sec">
+<h2>۱۹. مرحلهٔ ۱۲: دفتر خاطرات سیستم — <span class="ltr">audit_engine.py</span></h2>
+
+<div class="box simple">
+شش هفته بعد از یک ضرر، جملهٔ «مدل گفت» هیچ کمکی نمی‌کند.
+ولی این جمله کمک می‌کند: «در ۱۴ مارس ساعت ۰۹:۱۵ به وقت UTC، بیت‌کوین رد شد
+چون اطمینان جهت ۰٫۶۸ در برابر آستانهٔ ۰٫۷۰ بود، با HMM در رژیم ۲ و
+نوسان GARCH در صدک ۹۳.»
+</div>
+
+<h3>۱۹-۱. چه چیزی ثبت می‌شود</h3>
+<p>
+<strong>هر</strong> تصمیم — از جمله <strong>هر NO_TRADE</strong>. چون جالب‌ترین شکست‌ها
+دقیقاً همان‌جا مخفی‌اند. هر رکورد بیش از ۳۰ ستون دارد:
+</p>
+<table>
+<tr><th width="26%">گروه</th><th>ستون‌ها</th></tr>
+<tr><td>شناسه</td>
+    <td>شناسهٔ تصمیم، شناسهٔ چرخه (یکسان برای همهٔ ارزهای یک چرخه)، نماد، زمان کندل، زمان ایجاد.</td></tr>
+<tr><td>حکم</td><td>حکم، اقدام، قانون فعال‌شده، دلیل خوانا.</td></tr>
+<tr><td>تصویر ویژگی</td>
+    <td>رژیم HMM، نوسان GARCH، صدک نوسان، شیب KAMA، FDI، ATR،
+        عدم توازن دفتر سفارش، قیمت بسته.</td></tr>
+<tr><td>خروجی مدل‌ها</td>
+    <td>احتمال لانگ/شورت/عدم معامله، اطمینان، احتمال ورود، اجازهٔ ورود.</td></tr>
+<tr><td>هندسه</td>
+    <td>درصد حد سود/ضرر/تریلینگ، اهرم پیشنهادی، درصد تخصیص سرمایه، ردهٔ ریسک.</td></tr>
+<tr><td>سیستم</td><td>حالت نگهبان ریسک، زمان پاسخ به میلی‌ثانیه.</td></tr>
+<tr><td>محتوای JSON</td>
+    <td>توزیع کامل احتمال‌ها، <strong>منبع هر مدل</strong> (آموزش‌دیده یا جایگزین)،
+        نسبت پاداش/ریسک، دلیل لغو ریسک، نسخهٔ مدل‌ها، و
+        <strong>لیست کامل هر ۱۰ قانون با نتیجه‌شان</strong>.</td></tr>
+</table>
+
+<h3>۱۹-۲. نوشتن بدون بلوکه کردن</h3>
+<div class="flow">
+   ⁨حلقهٔ معاملاتی⁩
+        |
+        |  put_nowait()  (⁨بدون انتظار⁩)
+        v
+   ⁨صف⁩ asyncio (⁨حداکثر ۴۰۰۰ رکورد⁩)
+        |
+        |  ⁨تسک پس‌زمینه، هر ۲ ثانیه⁩
+        v
+   ⁨دسته‌های ۶۴تایی⁩ --> ⁨یک تراکنش⁩ SQLite
+</div>
+<div class="box why">
+از دست دادن یک خط از دفتر بد است. ولی متوقف کردن حلقهٔ معاملاتی پشت دیسک
+<strong>بدتر</strong> است. پس وقتی صف پر می‌شود، قدیمی‌ترین رکورد دور ریخته
+و شمرده می‌شود، و هر ۱۰۰ رکورد از دست‌رفته یک هشدار در لاگ می‌آید.
+</div>
+<p>
+هنگام خاموشی، <span class="ltr">stop(drain=True)</span> صف را کاملاً روی دیسک خالی می‌کند.
+همچنین قبل از خواندن رکوردها برای پنل، یک <span class="ltr">flush()</span> اجباری انجام می‌شود
+تا تازه‌ترین تصمیم‌ها هم دیده شوند.
+</p>
+
+<h3>۱۹-۳. رویدادهای سیستمی</h3>
+<p>
+غیر از تصمیم‌های هر ارز، رویدادهای کلی هم ثبت می‌شوند با نماد <span class="ltr">*</span>:
+</p>
+<table>
+<tr><th width="34%">قانون</th><th>رویداد</th></tr>
+<tr><td><span class="ltr">OPERATOR_ARM</span></td><td>اپراتور معامله را مسلح کرد.</td></tr>
+<tr><td><span class="ltr">OPERATOR_DISARM</span></td><td>اپراتور معامله را متوقف کرد.</td></tr>
+<tr><td><span class="ltr">OPERATOR_UNIVERSE</span></td><td>لیست ارزها ذخیره شد.</td></tr>
+<tr><td><span class="ltr">OPERATOR_KILL_SWITCH</span></td><td>کلید قرمز فشرده شد.</td></tr>
+<tr><td><span class="ltr">OPERATOR_RESET</span></td><td>قفل نگهبان باز شد.</td></tr>
+<tr><td><span class="ltr">QC_ALL_FAILED</span></td><td>هیچ ارزی از کنترل کیفیت رد نشد.</td></tr>
+<tr><td><span class="ltr">FEATURES_COLD</span></td><td>هیچ ارزی ردیف ویژگی گرم تولید نکرد.</td></tr>
+<tr><td><span class="ltr">CYCLE_FAILURE</span></td><td>چرخه با خطا مواجه شد.</td></tr>
+<tr><td><span class="ltr">SETUP_FAILURE</span></td><td>خط لولهٔ راه‌اندازی شکست خورد.</td></tr>
+</table>
+</div>
+
+<div class="sec">
+<h2>۲۰. مرحلهٔ ۱۳: پنل وب — <span class="ltr">web_app.py</span> و <span class="ltr">templates.py</span></h2>
+
+<div class="box simple">
+پنل، «اتاق کنترل» است. با مرورگر به آدرس <span class="ltr">http://آی‌پی‌سرور:8000</span>
+می‌روی و همه‌چیز را می‌بینی و دکمه فشار می‌دهی. هیچ دامنه، هیچ گواهی SSL،
+و هیچ پروکسی لازم نیست — که دقیقاً نکتهٔ مثبت برای یک سرور کوچک است.
+</div>
+
+<h3>۲۰-۱. چهار صفحهٔ HTML</h3>
+<table>
+<tr><th width="18%">آدرس</th><th>محتوا</th></tr>
+<tr><td><span class="ltr">/</span></td>
+    <td><strong>داشبورد:</strong> نوار پیشرفت راه‌اندازی، ۷ کارت وضعیت (فاز، نگهبان ریسک،
+        حالت، سرمایه، افت روزانه، پوزیشن‌های باز، آخرین چرخه)، دکمه‌های کنترل،
+        جدول پوزیشن‌های فعال، سلامت مدل‌ها، گزارش آموزش ML، آخرین تصمیم‌ها،
+        و لاگ زنده.</td></tr>
+<tr><td><span class="ltr">/universe</span></td>
+    <td><strong>انتخاب ارز:</strong> جدول کامل ارزهای بایننس با قیمت، حجم ۲۴ ساعته،
+        تغییر ۲۴ ساعته، اسپرد، حداقل سفارش، هزینهٔ پلهٔ مقدار، حداکثر اهرم،
+        روزهای لیست‌شدن، امتیاز، و وضعیت. با چک‌باکس، فیلتر و دکمهٔ «پیشنهاد».</td></tr>
+<tr><td><span class="ltr">/audit</span></td>
+    <td><strong>دفتر تصمیم‌ها:</strong> ۲۲ ستون شامل همهٔ احتمال‌ها و قانون فعال‌شده،
+        با فیلتر بر اساس نماد و حکم. هر ۱۵ ثانیه تازه می‌شود.</td></tr>
+<tr><td><span class="ltr">/trades</span></td>
+    <td><strong>تاریخچهٔ معاملات:</strong> باز شدن، بسته شدن، اهرم، مقدار، ورود، خروج،
+        کارمزد، فاندینگ، سود/زیان، و دلیل بسته شدن.</td></tr>
+</table>
+
+<h3>۲۰-۲. نقاط API</h3>
+<h4>فقط خواندنی (بدون رمز)</h4>
+<table>
+<tr><th width="34%">مسیر</th><th>خروجی</th></tr>
+<tr><td><span class="ltr">GET /health</span></td><td>بررسی زنده‌بودن پروسه.</td></tr>
+<tr><td><span class="ltr">GET /api/status</span></td>
+    <td>وضعیت کامل: فاز، پیشرفت، حالت، نگهبان ریسک، حساب، پوزیشن‌ها،
+        آمار آخرین چرخه، و سلامت اجزا.</td></tr>
+<tr><td><span class="ltr">GET /api/ml/report</span></td>
+    <td>گزارش آموزش هر چهار مدل + اهمیت ویژگی‌ها + پوشش داده. قابل دانلود به‌صورت JSON.</td></tr>
+<tr><td><span class="ltr">GET /api/audit</span></td><td>رکوردهای دفتر با فیلتر.</td></tr>
+<tr><td><span class="ltr">GET /api/trades</span></td><td>معاملات.</td></tr>
+<tr><td><span class="ltr">GET /api/positions</span></td><td>پوزیشن‌های باز.</td></tr>
+<tr><td><span class="ltr">GET /api/logs</span></td><td>آخرین خطوط لاگ از حافظه.</td></tr>
+<tr><td><span class="ltr">GET /api/universe/available</span></td><td>لیست غربال‌شدهٔ ارزها.</td></tr>
+<tr><td><span class="ltr">GET /api/universe/suggest</span></td><td>بهترین ارزهای واجد شرایط.</td></tr>
+<tr><td><span class="ltr">GET /api/universe/selected</span></td><td>انتخاب فعلی.</td></tr>
+<tr><td><span class="ltr">GET /api/setup/status</span></td><td>پیشرفت جمع‌آوری و آموزش.</td></tr>
+</table>
+
+<h4>تغییردهنده (نیازمند رمز، اگر تنظیم شده باشد)</h4>
+<table>
+<tr><th width="34%">مسیر</th><th>کار</th></tr>
+<tr><td><span class="ltr">POST /api/universe/select</span></td>
+    <td>ذخیرهٔ انتخاب ارزها و شروع خودکار راه‌اندازی.</td></tr>
+<tr><td><span class="ltr">POST /api/setup/start</span></td>
+    <td>اجرای دوبارهٔ جمع‌آوری؛ با <span class="ltr">{"force_retrain": true}</span>
+        آموزش اجباری.</td></tr>
+<tr><td><span class="ltr">POST /api/trading/start</span></td>
+    <td>مسلح کردن با <span class="ltr">{"mode": "paper"|"live"}</span>.</td></tr>
+<tr><td><span class="ltr">POST /api/trading/stop</span></td>
+    <td>خلع سلاح. با <span class="ltr">{"flatten": true}</span> پوزیشن‌ها هم بسته می‌شوند.</td></tr>
+<tr><td><span class="ltr">POST /api/toggle_trading</span></td>
+    <td>مکث/ادامه و/یا تعویض حالت کاغذی↔واقعی.</td></tr>
+<tr><td><span class="ltr">POST /api/kill_switch</span></td>
+    <td>قرمز کردن فوری و بستن همه‌چیز.</td></tr>
+<tr><td><span class="ltr">POST /api/reset_risk_guard</span></td><td>باز کردن قفل قرمز.</td></tr>
+</table>
+
+<h3>۲۰-۳. سه جزئیات مهندسی جالب</h3>
+
+<h4>الف) <span class="ltr">SafeJSONResponse</span> — پنل هرگز سفید نمی‌شود</h4>
+<div class="box why">
+داشبورد هر چند ثانیه <span class="ltr">/api/status</span> را می‌خواند.
+اگر <em>یک</em> عدد غیرمتناهی (<span class="ltr">NaN</span> یا بی‌نهایت) در پاسخ باشد —
+که از یک معیار آموزش خالی یا یک تقسیم در حالت تنزل‌یافته به‌راحتی تولید می‌شود —
+کتابخانهٔ Starlette هنگام رندر خطا می‌دهد و <strong>کل داشبورد سفید می‌شود</strong>.
+این کلاس همه‌چیز را بازگشتی تمیز می‌کند: عدد غیرمتناهی ← <span class="ltr">null</span>،
+اعداد NumPy ← عدد پایتون، <span class="ltr">Decimal</span> و تاریخ ← رشته.
+(کامیت <span class="ltr">05e6504</span>)
+</div>
+
+<h4>ب) <span class="ltr">Protocol</span> به‌جای import مستقیم</h4>
+<p>
+کلاس <span class="ltr">SystemController</span> یک <span class="ltr">Protocol</span> است
+که فقط می‌گوید «هر چیزی که این متدها را داشته باشد». این‌طوری ماژول F
+هیچ‌وقت <span class="ltr">main.py</span> را import نمی‌کند و وابستگی حلقوی
+بین پنل و ارکستر ایجاد نمی‌شود.
+</p>
+
+<h4>ج) قالب‌ها داخل خود پایتون</h4>
+<p>
+همهٔ HTML و JavaScript در دیکشنری <span class="ltr">TEMPLATES</span> در فایل
+<span class="ltr">templates.py</span> است. نه پوشهٔ <span class="ltr">static/</span>،
+نه <span class="ltr">node_modules</span>، نه مرحلهٔ build.
+Tailwind از CDN می‌آید ولی یک CSS درون‌خطی فشرده هم هست تا اگر سرور
+دسترسی اینترنت خروجی نداشت، صفحه باز هم کاملاً خوانا بماند.
+</p>
+<p class="small">
+یک باگ واقعی که رفع شد: کاراکترهای backslash در رشته‌های JavaScript
+هنگام تبدیل به رشتهٔ پایتون بلعیده می‌شدند و باعث <span class="ltr">SyntaxError</span>
+و سفید شدن صفحه می‌شدند. (کامیت <span class="ltr">311e136</span>)
+</p>
+
+<h3>۲۰-۴. وضعیت امنیتی</h3>
+<div class="box warn">
+پنل <strong>برای اینترنت عمومی سخت‌سازی نشده است</strong>.
+اگر <span class="ltr">WEB__API_TOKEN</span> را تنظیم کنی، همهٔ نقاط تغییردهنده
+هدر <span class="ltr">X-API-Token</span> می‌خواهند، ولی نقاط فقط-خواندنی باز می‌مانند.
+پورت را حتماً پشت فایروال، لیست سفید IP، یا تونل SSH بگذار.
+</div>
+
+<h3>۲۰-۵. فازهای سیستم (<span class="ltr">setup_state.py</span>)</h3>
+<table>
+<tr><th width="30%">فاز</th><th>معنی</th></tr>
+<tr><td><span class="ltr">STARTING</span></td><td>در حال بالا آمدن.</td></tr>
+<tr><td><span class="ltr">AWAITING_UNIVERSE</span></td><td>منتظر انتخاب ارز توسط اپراتور.</td></tr>
+<tr><td><span class="ltr">COLLECTING_DATA</span></td><td>در حال دانلود تاریخچه.</td></tr>
+<tr><td><span class="ltr">TRAINING</span></td><td>در حال آموزش مدل‌ها.</td></tr>
+<tr><td><span class="ltr">READY</span></td><td>آماده — ولی هنوز معامله نمی‌کند.</td></tr>
+<tr><td><span class="ltr">PAPER_TRADING</span></td><td>مسلح در حالت کاغذی.</td></tr>
+<tr><td><span class="ltr">LIVE_TRADING</span></td><td>مسلح با پول واقعی.</td></tr>
+<tr><td><span class="ltr">SETUP_FAILED</span></td>
+    <td>راه‌اندازی شکست خورد. <strong>پایانی است</strong> تا اپراتور دوباره تلاش کند —
+        هرگز بی‌سروصدا با مدل‌های کهنه شروع به معامله نمی‌کند.</td></tr>
+</table>
+<p>
+کلاس <span class="ltr">SetupProgress</span> نوار پیشرفت را نگه می‌دارد:
+مرحله، جزئیات، درصد، تعداد ارز انجام‌شده/کل، زمان شروع/پایان، خطا،
+خلاصهٔ داده، و خلاصهٔ آموزش.
+</p>
+</div>
+
+<div class="sec">
+<h2>۲۱. بک‌تست — امتحان روی گذشته (<span class="ltr">backtester.py</span>)</h2>
+
+<div class="box simple">
+بک‌تست یعنی «فیلم بازار را از اول پخش کن و ببین ربات چه می‌کرد».
+ولی خیلی راحت می‌شود در بک‌تست تقلب کرد — و آن‌وقت نتیجهٔ درخشانی می‌گیری
+که در واقعیت تکرار نمی‌شود. این فایل <strong>عمداً</strong> طوری نوشته شده که
+تو را ناامید کند.
+</div>
+
+<h3>۲۱-۱. پنج قانون واقع‌گرایی</h3>
+
+<div class="step"><span class="num">۱</span>
+<strong>پر شدن در «باز شدن کندل بعدی»، نه بسته شدن کندل فعلی.</strong>
+<div class="box why">
+تصمیمی که در لحظهٔ بسته شدن کندل <span class="ltr">t</span> گرفته شده،
+غیرممکن است که <em>داخل</em> همان کندل اجرا شده باشد. پر کردن با
+<span class="ltr">close[t]</span> رایج‌ترین راه ساختن سودهای خیالی است.
+</div>
+</div>
+
+<div class="step"><span class="num">۲</span>
+<strong>بدترین ترتیب داخل کندل.</strong>
+برای یک لانگ، <em>بالاترِ</em> حد ضرر و قیمت لیکوئید در راه پایین اول لمس می‌شود،
+پس همان سطح برنده است. فقط اگر هیچ‌کدام از سطوح نامطلوب لمس نشده باشند،
+حد سود بررسی می‌شود.
+</div>
+
+<div class="step"><span class="num">۳</span>
+<strong>مدل هزینهٔ کامل.</strong>
+کارمزد تیکر روی هر دو پا، لغزش روی هر پر شدن، و فاندینگ در مرزهای واقعی
+۰۰:۰۰، ۰۸:۰۰ و ۱۶:۰۰ UTC با نرخ‌هایی که ماژول A واقعاً ثبت کرده.
+</div>
+
+<div class="step"><span class="num">۴</span>
+<strong>لیکوئیدیشن مارجین ایزوله.</strong>
+در هر کندل چک می‌شود و یک پوزیشن لیکوئیدشده کل مارجینش را از دست می‌دهد،
+نه بیشتر و نه کمتر.
+</div>
+
+<div class="step"><span class="num">۵</span>
+<strong>محدودیت‌های سطح پرتفوی.</strong>
+همان سقف ۵ پوزیشن همزمان و یک پوزیشن در هر ارز که موتور زنده اعمال می‌کند.
+</div>
+
+<h3>۲۱-۲. حلقهٔ شبیه‌سازی</h3>
+<p>برای هر کندل روی خط زمان مشترک، چهار گام:</p>
+<div class="flow">
+  ⁨۱⁩. ⁨حل موانع پوزیشن‌های باز با این کندل⁩
+     (⁨فاندینگ⁩ --> ⁨لیکوئید⁩ --> ⁨حد ضرر⁩ --> ⁨حد سود⁩ --> ⁨جلو بردن تریلینگ⁩)
+
+  ⁨۲⁩. ⁨پر کردن سیگنال‌هایی که کندل⁩ *⁨قبلی⁩* ⁨تولید کرده بود⁩
+     ⁨در قیمت⁩ *⁨باز شدن⁩* ⁨این کندل، با لغزش⁩
+     (⁨سیگنال فقط یک کندل اعتبار دارد؛ اگر نشد، دور ریخته می‌شود⁩)
+
+  ⁨۳⁩. ⁨تولید سیگنال جدید از قیمت⁩ *⁨بسته شدن⁩* ⁨این کندل⁩
+
+  ⁨۴⁩. ⁨ارزش‌گذاری به بازار، ثبت نقطهٔ منحنی سرمایه⁩
+</div>
+<p class="small">
+یک نکتهٔ ظریف: بعد از فعال شدن تریلینگ روی سقف کندل، دوباره <em>کف</em> همان کندل
+در برابر حد ضرر تنگ‌شده تست می‌شود. کندلی که بالا رفت و همه‌اش را پس داد،
+نباید تا کندل بعدی فرار کند.
+</p>
+
+<h3>۲۱-۳. معیارهای خروجی</h3>
+<table>
+<tr><th width="30%">معیار</th><th>معنی</th></tr>
+<tr><td>تعداد معاملات، نرخ برد</td><td>پایه‌ای‌ترین آمار.</td></tr>
+<tr><td>ضریب سود (Profit Factor)</td><td>سود ناخالص ÷ زیان ناخالص. بالای ۱ یعنی سودده.</td></tr>
+<tr><td>امید ریاضی (Expectancy)</td><td>میانگین سود/زیان هر معامله به USDT.</td></tr>
+<tr><td>حداکثر افت سرمایه</td><td>بدترین ریزش از اوج تا کف.</td></tr>
+<tr><td>نسبت شارپ</td><td>بازدهی تقسیم بر نوسان، سالانه‌شده با ۱۰۵٬۱۲۰ کندل در سال.</td></tr>
+<tr><td>نسبت سورتینو</td><td>مثل شارپ ولی فقط نوسان منفی را جریمه می‌کند.</td></tr>
+<tr><td>نسبت کالمار</td><td>بازدهی سالانه ÷ حداکثر افت.</td></tr>
+<tr><td>کارمزد و فاندینگ کل</td><td>هزینهٔ واقعی معامله‌گری.</td></tr>
+<tr><td>تعداد لیکوئیدیشن</td><td>چند بار حساب زده شد.</td></tr>
+</table>
+
+<h3>۲۱-۴. هشدار مهم دربارهٔ نتایج</h3>
+<div class="box warn">
+فایل <span class="ltr">README</span> پروژه با صداقت این عددها را می‌آورد:
+<table style="margin-top:6px">
+<tr><th>سناریو</th><th>معاملات</th><th>نرخ برد</th><th>ضریب سود</th><th>بازدهی</th></tr>
+<tr><td>درون‌نمونه (روی همان داده آموزش دیده)</td><td>۲۷</td><td>۹۲٫۶٪</td><td>۳۱٫۶</td><td>‎+۰٫۵۷٪</td></tr>
+<tr><td><strong>خارج‌نمونه (دادهٔ ندیده)</strong></td><td><strong>۵</strong></td><td><strong>۰٪</strong></td><td><strong>۰٫۰</strong></td><td><strong>−۰٫۰۶٪</strong></td></tr>
+</table>
+<p style="margin-top:6px">
+<strong>همین شکاف، کل نکته است.</strong> اجرای <span class="ltr">backtest</span>
+بلافاصله بعد از <span class="ltr">train</span> <em>بی‌معنی</em> است، چون مدل‌ها
+همان داده را دیده‌اند. قبل از باور کردن هر عددی، یک بازهٔ زمانی که مدل‌ها
+هرگز لمسش نکرده‌اند را کنار بگذار و روی آن تست کن.
+</p>
+</div>
+</div>
+
+<div class="sec">
+<h2>۲۲. یک چرخهٔ ۵ دقیقه‌ای کامل، ثانیه‌به‌ثانیه</h2>
+
+<p>فرض کنیم ساعت <span class="ltr">14:35:10 UTC</span> است و سیستم در حالت کاغذی مسلح است.</p>
+
+<table>
+<tr><th width="10%">مرحله</th><th width="24%">جزء</th><th>چه اتفاقی می‌افتد</th></tr>
+<tr><td><strong>۰</strong></td><td>زمان‌بند</td>
+    <td>APScheduler تابع <span class="ltr">trading_cycle()</span> را صدا می‌زند.
+        اگر چرخهٔ قبلی هنوز در حال اجراست، این نوبت رد می‌شود.</td></tr>
+<tr><td><strong>۱</strong></td><td>قفل چرخه</td>
+    <td>یک شناسهٔ یکتا (UUID) برای چرخه ساخته می‌شود و در همهٔ رکوردها استفاده می‌شود.</td></tr>
+<tr><td><strong>۲</strong></td><td>ماژول A</td>
+    <td>برای هر ۳۰ ارز موازی: گرفتن کندل‌ها + دفتر سفارش + متریک‌های آتی؛
+        عبور از QC؛ تعمیر در صورت نیاز؛ ذخیره در دیتابیس.
+        ارزهای رد شده حذف می‌شوند.</td></tr>
+<tr><td><strong>۳</strong></td><td>دروازهٔ معامله</td>
+    <td>اگر هیچ ارزی از QC رد نشد ← رویداد <span class="ltr">QC_ALL_FAILED</span> و پایان.
+        <strong>اگر معامله مسلح نیست ← اینجا تمام می‌شود.</strong>
+        داده تازه ماند ولی ماژول‌های B تا F اجرا نمی‌شوند.</td></tr>
+<tr><td><strong>۴</strong></td><td>حساب + ریسک</td>
+    <td>وضعیت حساب گرفته می‌شود و به نگهبان ریسک داده می‌شود.
+        نگهبان حالت (سبز/زرد/قرمز) را برمی‌گرداند.</td></tr>
+<tr><td><strong>۵</strong></td><td>ماژول B</td>
+    <td>برای هر ارز باقی‌مانده: خواندن حدود ۱۲۲۰ کندل از دیتابیس،
+        ساخت ۲۶ ویژگی، و استخراج فقط <strong>آخرین ردیف کامل</strong>.
+        اگر آن ردیف کهنه بود، ارز رد می‌شود.</td></tr>
+<tr><td><strong>۶</strong></td><td>ماژول C</td>
+    <td>هر چهار مدل روی هر ردیف اجرا می‌شوند (موازی، روی نخ‌های کارگر).
+        خروجی: یک <span class="ltr">ModelInferenceResult</span> برای هر ارز.</td></tr>
+<tr><td><strong>۷</strong></td><td>ماژول D</td>
+    <td>مرتب‌سازی بر اساس اطمینان، سپس آبشار ۱۰ قانون برای هر ارز.
+        شمارندهٔ پوزیشن‌ها در طول دسته به‌روز می‌شود.</td></tr>
+<tr><td><strong>۸</strong></td><td>ماژول E</td>
+    <td>برای هر تصمیم <span class="ltr">EXECUTE</span>: باز کردن پوزیشن.
+        خطاها ایزوله می‌شوند و کل چرخه را نمی‌کشند.</td></tr>
+<tr><td><strong>۹</strong></td><td>ماژول F</td>
+    <td><strong>هر</strong> تصمیم — اجرا شده یا نشده — در صف دفتر ثبت می‌شود،
+        همراه با جزئیات اجرا در صورت وجود.</td></tr>
+<tr><td><strong>۱۰</strong></td><td>پایان چرخه</td>
+    <td>یک نقطه به منحنی سرمایه اضافه می‌شود، خلاصه لاگ می‌شود،
+        و مدت‌زمان چرخه ثبت می‌شود.</td></tr>
+</table>
+
+<div class="box note">
+<strong>یک تصمیم طراحی مهم:</strong> ماژول A <em>همیشه</em> اجرا می‌شود، حتی وقتی
+معامله خلع سلاح است. چرا؟ چون این‌طوری تاریخچهٔ کندل‌ها همیشه گرم می‌ماند و
+وقتی تو دکمهٔ «شروع» را می‌زنی، <strong>از همان کندل بعدی</strong> کار می‌کند —
+نه اینکه منتظر بمانی ویژگی‌های کند دوباره گرم شوند.
+</div>
+
+<h3>۲۲-۱. به‌طور موازی، در پس‌زمینه</h3>
+<table>
+<tr><th width="30%">تسک</th><th>تناوب</th></tr>
+<tr><td>نظارت بر پوزیشن‌ها</td><td>هر ۵ ثانیه: قیمت‌ها، تریلینگ، بررسی موانع.</td></tr>
+<tr><td>تطبیق با صرافی (فقط زنده)</td><td>هر ۶۰ ثانیه.</td></tr>
+<tr><td>خالی کردن صف دفتر</td><td>هر ۲ ثانیه.</td></tr>
+<tr><td>سرور وب</td><td>همیشه فعال، پاسخ به درخواست‌های مرورگر.</td></tr>
+</table>
+</div>
+
+<div class="sec">
+<h2>۲۳. چرخهٔ عمر سیستم و فازها</h2>
+
+<div class="flow">
+  python main.py
+       |
+       v
+  [STARTING]  --- ⁨پنل وب فوراً بالا می‌آید⁩ ---
+       |
+       +-- ⁨آیا ارزی ذخیره شده؟⁩
+       |
+       ⁨نه                                    بله⁩
+       |                                       |
+       v                                       |
+  [AWAITING_UNIVERSE]                          |
+       |                                       |
+       |  ⁨تو در⁩ /universe ⁨ارز تیک می‌زنی⁩        |
+       |  ⁨و⁩ SAVE ⁨می‌کنی⁩                        |
+       |                                       |
+       +---------------> [COLLECTING_DATA] <---+
+                                |
+                                | (⁨بک‌فیل تا ۲ سال کندل⁩)
+                                v
+                          [TRAINING]
+                                |
+                                | (⁨۴ مدل روی دیتاست ادغام‌شده⁩)
+                                v
+                           [READY]  <---- ⁨هنوز هیچ معامله‌ای نمی‌کند⁩!
+                                |
+              ⁨تو دکمهٔ⁩ START PAPER ⁨یا⁩ GO LIVE ⁨را می‌زنی⁩
+                                |
+                    +-----------+-----------+
+                    v                       v
+            [PAPER_TRADING]  <-------->  [LIVE_TRADING]
+                    |                       |
+                    +---- STOP TRADING -----+
+                                |
+                                v
+                            [READY]
+
+  ⁨هر جای این مسیر، خطا⁩ -->  [SETUP_FAILED]  (⁨پایانی تا تلاش مجدد⁩)
+  ⁨هر جای این مسیر، کلید قرمز⁩ --> ⁨نگهبان⁩ RED --> ⁨همه‌چیز بسته و قفل⁩
+</div>
+
+<h3>۲۳-۱. سه ضامن ایمنی در این چرخه</h3>
+<ol>
+<li><strong>هیچ‌وقت خودکار شروع نمی‌شود.</strong> فاز <span class="ltr">READY</span>
+    یک ایست کامل است. مگر اینکه صریحاً
+    <span class="ltr">AUTOSTART_PAPER_TRADING=true</span> گذاشته باشی.</li>
+<li><strong>حالت واقعی چهار مدل آموزش‌دیده می‌خواهد.</strong> اگر حتی یکی از آن‌ها
+    قاعدهٔ جایگزین باشد، مسلح شدن رد می‌شود.</li>
+<li><strong>شکست راه‌اندازی پایانی است.</strong> سیستم هرگز بی‌سروصدا با مدل‌های
+    کهنه معامله را ادامه نمی‌دهد.</li>
+</ol>
+</div>
+
+<div class="sec">
+<h2>۲۴. دستورهای خط فرمان</h2>
+
+<table>
+<tr><th width="34%">دستور</th><th>کار</th></tr>
+<tr><td><span class="ltr">python main.py</span><br>
+        <span class="ltr">python main.py run</span></td>
+    <td>مسیر اصلی: پنل + راه‌اندازی خودکار + زمان‌بند ۵ دقیقه‌ای.</td></tr>
+<tr><td><span class="ltr">python main.py universe</span></td>
+    <td>چاپ جدول غربال‌شدهٔ ارزها در ترمینال (بدون نیاز به پنل).
+        ستون‌ها: نماد، قیمت، حجم ۲۴ ساعته، اسپرد، حداقل سفارش، هزینهٔ پله،
+        روزهای لیست‌شدن، و وضعیت واجد شرایط بودن.</td></tr>
+<tr><td><span class="ltr">python main.py bootstrap</span></td>
+    <td>فقط دانلود تاریخچهٔ کندل‌ها.</td></tr>
+<tr><td><span class="ltr">python main.py train</span></td>
+    <td>ساخت دیتاست و آموزش هر چهار مدل.</td></tr>
+<tr><td><span class="ltr">python main.py backtest --candles 5000 --equity 1000</span></td>
+    <td>پخش مجدد تاریخچه با معیارهای کامل.</td></tr>
+<tr><td><span class="ltr">python main.py cycle</span></td>
+    <td>اجرای دقیقاً یک چرخه سپس خروج (مفید برای cron یا اشکال‌زدایی).</td></tr>
+<tr><td><span class="ltr">--mode paper|live</span></td>
+    <td>بازنویسی حالت اجرا.</td></tr>
+</table>
+<p class="small">
+دستورهای تک‌شات از ارزهای ذخیره‌شده در پنل استفاده می‌کنند. اگر هیچ‌چیز ذخیره نشده باشد،
+خودکار ارزهای برتر غربال‌شده را انتخاب و ذخیره می‌کنند
+(<span class="ltr">_resolve_cli_universe</span>) تا CLI به‌تنهایی قابل استفاده باشد.
+</p>
+
+<h3>۲۴-۱. راه‌اندازی از صفر</h3>
+<pre>python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env        # ⁨اختیاری⁩
+python main.py</pre>
+<p>سپس در مرورگر: <span class="ltr">http://آی‌پی‌سرور:8000/</span></p>
+</div>
+
+<div class="sec">
+<h2>۲۵. جدول‌های پایگاه داده — نمای کامل</h2>
+
+<h4><span class="ltr">ohlcv</span></h4>
+<p class="kv">
+<span class="ltr">id, symbol, timeframe, timestamp, open, high, low, close, volume, inserted_at</span><br>
+کلید یکتا: (symbol, timeframe, timestamp) &nbsp;•&nbsp; ایندکس: (symbol, timestamp)
+</p>
+
+<h4><span class="ltr">order_book_snapshots</span></h4>
+<p class="kv">
+<span class="ltr">id, symbol, timestamp, best_bid, best_ask, spread, spread_bps,
+bid_volume, ask_volume, imbalance, microprice, levels, inserted_at</span>
+</p>
+
+<h4><span class="ltr">futures_metrics</span></h4>
+<p class="kv">
+<span class="ltr">id, symbol, timestamp, funding_rate, next_funding_time, open_interest,
+open_interest_value, long_short_ratio, top_trader_long_short_ratio, taker_buy_sell_ratio,
+liquidation_buy_volume, liquidation_sell_volume, mark_price, index_price, inserted_at</span>
+</p>
+
+<h4><span class="ltr">audit_logs</span></h4>
+<p class="kv">
+<span class="ltr">id, decision_id, cycle_id, symbol, candle_timestamp, created_at,
+verdict, action, rule_triggered, reason,
+hmm_regime, garch_volatility, garch_vol_percentile, kama_slope, fdi, atr,
+order_book_imbalance, close_price,
+prob_long, prob_short, prob_no_trade, direction_confidence, entry_probability, entry_allowed,
+take_profit_pct, stop_loss_pct, trailing_trigger_pct, recommended_leverage,
+capital_allocation_pct, risk_tier, risk_guard_state, latency_ms, payload(JSON)</span>
+</p>
+
+<h4><span class="ltr">trades</span></h4>
+<p class="kv">
+<span class="ltr">id, decision_id (یکتا), symbol, mode, side, status,
+leverage, quantity, notional, margin,
+entry_price, exit_price, take_profit, stop_loss, trailing_trigger, trailing_stop,
+liquidation_price, fees_paid, funding_paid, realized_pnl,
+max_adverse_excursion, max_favorable_excursion,
+opened_at, closed_at, close_reason, exchange_order_id, payload(JSON)</span>
+</p>
+
+<h4><span class="ltr">equity_curve</span></h4>
+<p class="kv">
+<span class="ltr">id, mode, timestamp, balance, equity, unrealized_pnl,
+open_positions, drawdown_pct, created_at</span>
+</p>
+
+<h4><span class="ltr">system_state</span> — کلید/مقدار JSON</h4>
+<table>
+<tr><th width="34%">کلید</th><th>محتوا</th></tr>
+<tr><td><span class="ltr">universe_selection</span></td>
+    <td>لیست ارزهای انتخابی، زمان، و نام اپراتور.</td></tr>
+<tr><td><span class="ltr">trained_universe</span></td>
+    <td>لیست ارزهایی که مدل‌ها روی آن‌ها آموزش دیده‌اند + زمان + تعداد ردیف.</td></tr>
+<tr><td><span class="ltr">risk_guard_state</span></td>
+    <td>حالت، دلیل توقف، سرمایهٔ شروع روز، اوج سرمایه، زنجیرهٔ باخت، معاملات امروز.</td></tr>
+<tr><td><span class="ltr">paper_trader_state</span></td><td>موجودی مجازی.</td></tr>
+</table>
+</div>
+
+<div class="sec">
+<h2>۲۶. لایه‌های ایمنی — کجا جلوی فاجعه گرفته می‌شود</h2>
+
+<p>
+یک نمای کلی از همهٔ نقاطی که کد عمداً «نه» می‌گوید. این‌ها را
+به‌ترتیب از داده تا پول مرتب کرده‌ام.
+</p>
+
+<table>
+<tr><th width="8%">لایه</th><th width="26%">محل</th><th>چه چیزی را متوقف می‌کند</th></tr>
+<tr><td>۱</td><td><span class="ltr">models.py</span> (Pydantic)</td>
+    <td>کندلی که <span class="ltr">high &lt; low</span> دارد یا قیمت منفی دارد،
+        اصلاً ساخته نمی‌شود.</td></tr>
+<tr><td>۲</td><td><span class="ltr">fetcher.py</span></td>
+    <td>ردیف خراب حذف می‌شود؛ کندل نیمه‌تمام حذف می‌شود؛ دفتر متقاطع
+        <span class="ltr">None</span> برمی‌گردد؛ فاندینگ غیرمنطقی صفر می‌شود.</td></tr>
+<tr><td>۳</td><td><span class="ltr">qc_validator.py</span></td>
+    <td>کندل گمشده، تکراری، ناهم‌تراز، از آینده، کهنه، جهش قیمت، فید مرده.
+        ارز تعمیرناپذیر برای آن چرخه <strong>کاملاً حذف می‌شود</strong>.</td></tr>
+<tr><td>۴</td><td><span class="ltr">features.py</span></td>
+    <td>هیچ ویژگی‌ای اجازهٔ نگاه به آینده ندارد. برازش‌های ناموفق GARCH/HMM
+        به روش‌های ساده‌تر تنزل می‌کنند، نه به <span class="ltr">NaN</span>.</td></tr>
+<tr><td>۵</td><td><span class="ltr">processor.py</span></td>
+    <td>ردیف‌های گرم‌نشده حذف می‌شوند؛ ردیف کهنه در مسیر زنده رد می‌شود؛
+        ۶۰ ردیف بین آموزش و آزمون پاک‌سازی می‌شود.</td></tr>
+<tr><td>۶</td><td><span class="ltr">ml_models.py</span></td>
+    <td>مدل با نسخهٔ ناسازگار بارگذاری نمی‌شود؛ ستون‌ها اجباراً هم‌تراز می‌شوند؛
+        هندسهٔ خروج در ریل‌های سخت محدود می‌شود؛ مدل ریسک وتوی سخت دارد.</td></tr>
+<tr><td>۷</td><td><span class="ltr">schemas.py</span></td>
+    <td>اهرم بالای ۱۰ از نظر ساختاری غیرممکن است؛ حد ضرر در سمت اشتباه
+        رد می‌شود؛ احتمال‌ها نرمال می‌شوند.</td></tr>
+<tr><td>۸</td><td><span class="ltr">decision_engine.py</span></td>
+    <td>۱۰ قانون. هر رد شدن، دلیل دقیق ثبت می‌کند. قاعدهٔ جایگزین
+        اجازهٔ سفارش واقعی ندارد.</td></tr>
+<tr><td>۹</td><td><span class="ltr">executor.py</span></td>
+    <td>مارجین و اهرم قبل از هر سفارش تنظیم می‌شوند؛ سفارش محافظ فوراً ثبت می‌شود
+        و اگر نشد پوزیشن بسته می‌شود؛ تریلینگ اول لغو بعد ثبت.</td></tr>
+<tr><td>۱۰</td><td><span class="ltr">risk_guard.py</span></td>
+    <td>افت روزانه، افت کل، زنجیرهٔ باخت، خرابی API، کلید دستی.
+        قفل ماندگار روی دیسک.</td></tr>
+<tr><td>۱۱</td><td><span class="ltr">main.py</span></td>
+    <td>مسلح شدن پنج شرط دارد؛ تعویض موتور اول تخلیه می‌کند؛
+        چرخهٔ همپوشان رد می‌شود؛ خاموشی مرتب است.</td></tr>
+</table>
+
+<h3>۲۶-۱. چهار جمله‌ای که در کد تکرار شده‌اند</h3>
+<div class="box note">
+<strong>«معامله روی کندل جعلی، بدتر از معامله نکردن است.»</strong>
+هرگز درون‌یابی نمی‌شود.<br><br>
+<strong>«یک پوزیشن اهرمیِ لخت، بدترین حالت ممکن است.»</strong>
+اگر حد ضرر ثبت نشد، پوزیشن بسته می‌شود.<br><br>
+<strong>«یک لحظه بدون حد ضرر امن‌تر از یک لحظه با دو حد ضرر است.»</strong>
+ترتیب لغو و ثبت.<br><br>
+<strong>«از دست دادن یک خط لاگ بد است، متوقف کردن حلقهٔ معاملاتی بدتر.»</strong>
+صف دفتر هرگز بلوکه نمی‌کند.
+</div>
+</div>
+
+<div class="sec">
+<h2>۲۷. محدودیت‌ها و نقاط ضعف واقعی</h2>
+
+<p>
+یک گزارش کامل باید ضعف‌ها را هم بگوید. این‌ها را از خودِ کد و تاریخچهٔ کامیت‌ها استخراج کرده‌ام.
+</p>
+
+<table>
+<tr><th width="30%">موضوع</th><th>توضیح</th></tr>
+<tr><td><strong>سودآوری اثبات نشده</strong></td>
+    <td>عدد خارج‌نمونه در <span class="ltr">README</span> نرخ برد ۰٪ روی ۵ معامله است.
+        نمونه خیلی کوچک است، ولی هیچ شاهدی بر سودآوری هم وجود ندارد.
+        مدل‌های آموزش‌دیده همراه پروژه نمی‌آیند.</td></tr>
+<tr><td><strong>ویژگی‌های ریزساختار بلااستفاده</strong></td>
+    <td>دفتر سفارش، فاندینگ، بهرهٔ باز و لیکوئیدیشن جمع‌آوری و ذخیره می‌شوند
+        ولی به مدل داده نمی‌شوند، چون بایننس تاریخچهٔ عمیقی از آن‌ها نمی‌دهد.
+        یعنی بخشی از داده‌ای که جمع می‌کنی، فقط تزئینی است.</td></tr>
+<tr><td><strong>پنل امن نیست</strong></td>
+    <td>بدون توکن، هر کسی که به پورت ۸۰۰۰ برسد می‌تواند معامله را مسلح کند
+        یا کلید قرمز بزند. نقاط فقط-خواندنی حتی با توکن هم باز می‌مانند.
+        بدون HTTPS.</td></tr>
+<tr><td><strong>SQLite نویسندهٔ تکی</strong></td>
+    <td>با قفل درون‌پروسه‌ای حل شده، ولی اگر دو <em>پروسهٔ</em> جدا همزمان بنویسند
+        (مثلاً <span class="ltr">bootstrap</span> در یک ترمینال و
+        <span class="ltr">run</span> در ترمینال دیگر)، قفل درون‌پروسه‌ای کمکی نمی‌کند.</td></tr>
+<tr><td><strong>عمق تاریخچه در عمل</strong></td>
+    <td>هدف پیش‌فرض ۲ سال است، ولی بایننس همیشه آن‌قدر عمق نمی‌دهد.
+        کد یک نشانگر <span class="ltr">"bootstrap_mode": "windowed-backfill"</span>
+        در گزارش می‌گذارد تا بشود تشخیص داد که «کد جدید اجرا شده ولی صرافی
+        دادهٔ عمیق‌تری نداد» در برابر «کد قدیمی در حال اجراست».</td></tr>
+<tr><td><strong>تناقض جزئی در مستندات</strong></td>
+    <td>در <span class="ltr">README</span> و برخی توضیحات کد گاهی «۲۱ ویژگی»
+        و گاهی «۲۶ ویژگی» ذکر شده. مقدار واقعی در
+        <span class="ltr">FEATURE_COLUMNS</span> برابر <strong>۲۶</strong> است.</td></tr>
+<tr><td><strong>وابستگی به کیفیت مدل</strong></td>
+    <td>کل معماری فرض می‌کند مدل‌ها چیز مفیدی یاد گرفته‌اند. اگر مدل جهت
+        فقط نویز یاد گرفته باشد، همهٔ آن ۱۰ قانون فقط جلوی معاملات را می‌گیرند
+        بدون اینکه لبه‌ای ایجاد کنند.</td></tr>
+<tr><td><strong>بدون تست خودکار</strong></td>
+    <td>هیچ پوشهٔ <span class="ltr">tests/</span> در مخزن وجود ندارد.
+        درستی کد فقط با بازبینی و اجرای دستی تأیید می‌شود.</td></tr>
+<tr><td><strong>لغزش ساده‌سازی‌شده</strong></td>
+    <td>لغزش یک عدد ثابت (۵ پایه) است، نه تابعی از عمق دفتر سفارش و اندازهٔ سفارش.
+        در بازار نازک، لغزش واقعی می‌تواند بسیار بیشتر باشد.</td></tr>
+</table>
+</div>
+
+<div class="sec">
+<h2>۲۸. واژه‌نامه</h2>
+<table>
+<tr><th width="26%">واژه</th><th>معنی</th></tr>
+<tr><td>علّی (Causal)</td>
+    <td>محاسبه‌ای که فقط از داده‌های گذشته و حال استفاده می‌کند، نه آینده.</td></tr>
+<tr><td>سوگیری نگاه به آینده</td>
+    <td>خطای استفاده از اطلاعاتی که در آن لحظه در دسترس نبوده. مرگبارترین اشتباه.</td></tr>
+<tr><td>ایستایی (Stationarity)</td>
+    <td>ویژگی‌ای که معنایش در طول زمان ثابت بماند. «رتبهٔ درصدی» ایستا است،
+        «حجم خام» نیست.</td></tr>
+<tr><td>MAD</td>
+    <td>میانهٔ انحراف مطلق. معیار پراکندگی مقاوم در برابر داده‌های پرت.</td></tr>
+<tr><td>ATR</td><td>میانگین محدودهٔ واقعی — واحد سنجش نوسان یک ارز.</td></tr>
+<tr><td>KAMA</td><td>میانگین متحرک تطبیقی کافمن که سرعتش را با شرایط بازار عوض می‌کند.</td></tr>
+<tr><td>FDI</td><td>شاخص بُعد فراکتالی؛ می‌گوید بازار روند دارد یا درهم است.</td></tr>
+<tr><td>GARCH</td><td>مدل آماری پیش‌بینی نوسان بر پایهٔ خوشه‌ای بودن نوسان.</td></tr>
+<tr><td>HMM</td><td>مدل مارکوف پنهان؛ حالت (رژیم) پنهان بازار را حدس می‌زند.</td></tr>
+<tr><td>فیلتر رو به جلو (آلفا)</td>
+    <td>روش علّی تخمین حالت HMM که فقط از گذشته استفاده می‌کند.</td></tr>
+<tr><td>سه‌مانعی</td>
+    <td>روش برچسب‌زنی با سه مانع: حد سود، حد ضرر، و انقضای زمانی.</td></tr>
+<tr><td>MAE</td>
+    <td>بیشترین حرکت خلاف جهت در طول یک معامله — «درد مسیر».</td></tr>
+<tr><td>MFE</td><td>بیشترین حرکت مطلوب در طول یک معامله.</td></tr>
+<tr><td>پاک‌سازی (Purging)</td>
+    <td>حذف ردیف‌های مرزی بین آموزش و آزمون تا نشت برچسب رخ ندهد.</td></tr>
+<tr><td>تقویت گرادیانی</td>
+    <td>روش یادگیری ماشین با صدها درخت کوچک که خطای هم را اصلاح می‌کنند.</td></tr>
+<tr><td>قاعدهٔ جایگزین (Heuristic)</td>
+    <td>یک قانون دستی ساده که وقتی مدل نیست جایش را می‌گیرد. با
+        <span class="ltr">HEURISTIC</span> مهر می‌شود.</td></tr>
+<tr><td>مارجین ایزوله</td>
+    <td>هر معامله ودیعهٔ خودش را دارد؛ ضررش به بقیهٔ حساب سرایت نمی‌کند.</td></tr>
+<tr><td>reduceOnly</td>
+    <td>سفارشی که فقط می‌تواند پوزیشن را کم کند، نه اینکه پوزیشن جدید باز کند.</td></tr>
+<tr><td>قیمت مارک</td>
+    <td>قیمت منصفانه‌ای که صرافی برای محاسبهٔ لیکوئیدیشن استفاده می‌کند.</td></tr>
+<tr><td>تریلینگ استاپ</td>
+    <td>حد ضرری که با حرکت قیمت به نفع تو، دنبالش می‌آید — ولی هرگز عقب نمی‌رود.</td></tr>
+<tr><td>ایدمپوتنت</td>
+    <td>عملیاتی که تکرارش همان نتیجهٔ یک‌بار اجرا را می‌دهد.</td></tr>
+<tr><td>WAL</td>
+    <td>حالت «ثبت پیشاپیش» SQLite که خواندن و نوشتن همزمان را ممکن می‌کند.</td></tr>
+<tr><td>Semaphore</td>
+    <td>شمارنده‌ای که تعداد عملیات همزمان را محدود می‌کند.</td></tr>
+<tr><td>عقب‌نشینی نمایی</td>
+    <td>افزایش تصاعدی فاصلهٔ بین تلاش‌های مجدد: ۱، ۲، ۴، ۸ ثانیه…</td></tr>
+</table>
+</div>
+
+<div class="sec">
+<h2>۲۹. چک‌لیست راه‌اندازی و جمع‌بندی نهایی</h2>
+
+<h3>۲۹-۱. چک‌لیست گام‌به‌گام</h3>
+
+<div class="step"><span class="num">۱</span>
+<strong>محیط پایتون.</strong> پایتون ۳٫۱۱ یا بالاتر.
+<pre>python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt</pre>
+</div>
+
+<div class="step"><span class="num">۲</span>
+<strong>فایل تنظیمات.</strong>
+<pre>cp .env.example .env</pre>
+مهم‌ترین چیزی که باید عوض کنی:
+<span class="ltr">UNIVERSE__REFERENCE_EQUITY</span> را روی
+<em>اندازهٔ واقعی حساب خودت</em> بگذار. کل غربال «تناسب با سرمایهٔ کوچک»
+به این عدد وابسته است.
+<div class="box warn">
+در فایل <span class="ltr">.env</span> هرگز کامنت را جلوی یک مقدار <em>خالی</em> ننویس.
+<span class="ltr">WEB__API_TOKEN=&nbsp;&nbsp;# my note</span> باعث می‌شود
+کل کامنت به‌عنوان مقدار توکن خوانده شود! کامنت را در خط جدا بنویس.
+(کامیت <span class="ltr">05f399e</span> همین باگ را رفع کرده.)
+</div>
+</div>
+
+<div class="step"><span class="num">۳</span>
+<strong>اجرا.</strong>
+<pre>python main.py</pre>
+سپس در مرورگر <span class="ltr">http://آی‌پی‌سرور:8000/</span> را باز کن.
+</div>
+
+<div class="step"><span class="num">۴</span>
+<strong>انتخاب ارزها.</strong> به صفحهٔ <span class="ltr">/universe</span> برو.
+یا خودت تیک بزن یا دکمهٔ «SUGGEST TOP 30» را بزن. بعد
+«SAVE &amp; START SETUP».
+<div class="box note">
+اگر عمق تاریخچهٔ ۲ سال برایت زیاد است (زمان و دیسک زیاد می‌خواهد)،
+<span class="ltr">DATA__HISTORY_BOOTSTRAP_CANDLES</span> را کم کن:
+<span class="ltr">105120</span> = یک سال، <span class="ltr">26280</span> = سه ماه،
+<span class="ltr">6000</span> ≈ ۲۱ روز.
+</div>
+</div>
+
+<div class="step"><span class="num">۵</span>
+<strong>تماشای راه‌اندازی.</strong> نوار پیشرفت داشبورد را ببین:
+<span class="ltr">COLLECTING_DATA → TRAINING → READY</span>.
+گزارش آموزش ML را در همان صفحه بخوان و ببین هر مدل چه معیارهایی گرفته
+و کدام ویژگی‌ها مهم‌تر بوده‌اند.
+</div>
+
+<div class="step"><span class="num">۶</span>
+<strong>شروع کاغذی.</strong> دکمهٔ <span class="ltr">START PAPER</span>.
+حداقل چند هفته بگذار کار کند و صفحهٔ <span class="ltr">/audit</span> را بخوان.
+جالب‌ترین بخش، دیدن این است که <em>چرا</em> معامله نکرده.
+</div>
+
+<div class="step"><span class="num">۷</span>
+<strong>قبل از پول واقعی.</strong> سه شرط:
+<ul>
+<li><span class="ltr">EXCHANGE__TESTNET=false</span> و کلیدهای واقعی با مجوز فیوچرز.</li>
+<li>هر چهار مدل واقعاً آموزش‌دیده باشند (وگرنه قانون R9 اجازه نمی‌دهد).</li>
+<li>ابتدا روی <strong>تست‌نت فیوچرز</strong>، بعد کاغذی، بعد واقعی با
+    کوچک‌ترین اندازه‌ای که از حداقل‌های صرافی رد می‌شود.</li>
+</ul>
+</div>
+
+<div class="step"><span class="num">۸</span>
+<strong>امنیت.</strong> <span class="ltr">WEB__API_TOKEN</span> را تنظیم کن و
+پورت ۸۰۰۰ را پشت فایروال یا تونل SSH بگذار.
+</div>
+
+<h3>۲۹-۲. جمع‌بندی: کل پروژه در ده جمله</h3>
+<ol>
+<li>هر ۵ دقیقه (ثانیهٔ ۱۰)، یک چرخه اجرا می‌شود.</li>
+<li>برای ۳۰ ارزی که تو انتخاب کرده‌ای، دادهٔ تازه از بایننس گرفته می‌شود.</li>
+<li>یک پلیس کیفیت داده را بررسی و در صورت نیاز تعمیر می‌کند؛
+    دادهٔ تعمیرناپذیر باعث حذف آن ارز در آن چرخه می‌شود.</li>
+<li>از قیمت خام، ۲۶ ویژگی معنی‌دار ساخته می‌شود که <em>هیچ‌کدام</em>
+    به آینده نگاه نمی‌کنند.</li>
+<li>چهار مدل مستقل هر کدام یک نظر می‌دهند: کجا، کِی، چگونه، چقدر.</li>
+<li>یک موتور تصمیم بدون هوش مصنوعی، ۱۰ قانون سفت را چک می‌کند و
+    اولین «نه» را ثبت می‌کند.</li>
+<li>اگر همه‌چیز رد شد، یک سیگنال معاملاتی اعتبارسنجی‌شده ساخته می‌شود.</li>
+<li>موتور اجرا (کاغذی یا واقعی) سفارش را می‌فرستد و <em>بلافاصله</em>
+    حد سود و حد ضرر می‌گذارد.</li>
+<li>یک نگهبان ریسک همه‌چیز را می‌پاید و در صورت لزوم همه‌چیز را می‌بندد و قفل می‌کند.</li>
+<li>هر تصمیم — حتی «معامله نکن» — با دلیل دقیقش در پایگاه داده ثبت می‌شود
+    و در پنل وب قابل مشاهده است.</li>
+</ol>
+
+<div class="box warn">
+<strong>یادآوری آخر.</strong> معاملهٔ اهرمی قراردادهای آتی دائمی، ریسک از دست دادن
+کل سرمایه را دارد. این نرم‌افزار برای اهداف پژوهشی و آموزشی ارائه شده،
+بدون هیچ ضمانتی و بدون هیچ ادعایی مبنی بر سودآوری. مسئولیت هر سرمایه‌ای
+که با آن به خطر می‌اندازی، با خودت است.
+</div>
+
+<hr>
+<p class="small" style="text-align:center; margin-top:20px">
+پایان گزارش &nbsp;•&nbsp; ۲۹ بخش &nbsp;•&nbsp;
+مبتنی بر خواندن کامل هر ۳۹ فایل مخزن
+<span class="ltr">mtmtest2/secret.binance.pj</span>
+</p>
+</div>
+
+</body>
+</html>
